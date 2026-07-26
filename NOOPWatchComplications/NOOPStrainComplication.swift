@@ -155,9 +155,10 @@ struct NOOPStrainView: View {
         // and show no gauge text.
         HStack(spacing: 2) {
             Image(systemName: "bolt.fill")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
             Text(strainText ?? "–")
-                .font(StrandFont.rounded(17, weight: .semibold))
+                .font(StrandFont.rounded(21, weight: .semibold))
+                .minimumScaleFactor(0.6)
         }
             .foregroundStyle(strainText == nil ? StrandPalette.textTertiary : Self.strainBlue)
             .widgetAccentable()

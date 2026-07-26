@@ -144,9 +144,10 @@ struct NOOPSleepView: View {
         // and show no gauge text.
         HStack(spacing: 2) {
             Image(systemName: "bed.double.fill")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
             Text(rest.map(String.init) ?? "–")
-                .font(StrandFont.rounded(17, weight: .semibold))
+                .font(StrandFont.rounded(21, weight: .semibold))
+                .minimumScaleFactor(0.6)
         }
             .foregroundStyle(rest == nil ? StrandPalette.textTertiary : Self.sleepBlue)
             .widgetAccentable()

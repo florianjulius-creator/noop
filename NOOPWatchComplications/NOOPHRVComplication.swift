@@ -171,9 +171,10 @@ struct NOOPHRVView: View {
         // show no gauge text.
         HStack(spacing: 2) {
             Image(systemName: "waveform.path.ecg")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
             Text(hrv.map(String.init) ?? "–")
-                .font(StrandFont.rounded(17, weight: .semibold))
+                .font(StrandFont.rounded(21, weight: .semibold))
+                .minimumScaleFactor(0.6)
         }
             .foregroundStyle(hrv == nil ? StrandPalette.textTertiary : StrandPalette.textPrimary)
             .widgetAccentable()

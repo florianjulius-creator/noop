@@ -254,9 +254,10 @@ struct NOOPChargeView: View {
         // durable identifier.
         HStack(spacing: 2) {
             Image(systemName: "heart.fill")
-                .font(.system(size: 10, weight: .semibold))
+                .font(.system(size: 12, weight: .semibold))
             Text(charge.numberText)
-                .font(StrandFont.rounded(17, weight: .semibold))
+                .font(StrandFont.rounded(21, weight: .semibold))
+                .minimumScaleFactor(0.6)
         }
             .foregroundStyle(chargeTint)
             .widgetAccentable()
