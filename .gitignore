@@ -101,3 +101,6 @@ Strand/Oura/OuraSecrets.xcconfig
 
 # Personal bundle id prefix (BYO; never committed)
 Config/BundleIdSecrets.xcconfig
+
+# Local WHOOP data exports — personal health data, never commit
+whoop-export/
