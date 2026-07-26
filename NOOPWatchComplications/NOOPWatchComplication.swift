@@ -246,17 +246,26 @@ struct NOOPChargeView: View {
         return String(localized: "Charge · \(fresh)")
     }
 
-    // MARK: accessoryCorner — number hugging the corner, "Charge" curved along the bezel
+    // MARK: accessoryCorner — number hugging the corner, a zone-gradient gauge along the bezel
 
     private var corner: some View {
         Text(charge.numberText)
             .font(StrandFont.rounded(17, weight: .semibold))
             .foregroundStyle(chargeTint)
             .widgetAccentable()
-            // The curved label rides the watch-face bezel. When calibrating we say so plainly rather
-            // than leaving a bare dash with no context.
+            // A real, current number earns the curved zone gauge (red → amber → green, the same
+            // colour world every Recovery surface uses) so the corner reads like the iOS ring rather
+            // than a bare digit. Calibrating / stale / missing keep the honest TEXT label — a gauge
+            // fill is a claim about a value we don't have.
             .widgetLabel {
-                Text(cornerLabel)
+                if case .value = charge, !isStale {
+                    Gauge(value: charge.fraction, in: 0...1) { Text("Recovery") }
+                        .tint(Gradient(colors: [StrandPalette.statusCritical,
+                                                StrandPalette.statusWarning,
+                                                StrandPalette.statusPositive]))
+                } else {
+                    Text(cornerLabel)
+                }
             }
             .accessibilityLabel(accessibilityCharge)
     }

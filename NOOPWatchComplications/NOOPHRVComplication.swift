@@ -122,15 +122,24 @@ struct NOOPHRVView: View {
         return StrandPalette.textTertiary
     }
 
-    // MARK: accessoryCircular — the HRV number with an "ms" footnote
+    // MARK: accessoryCircular — HRV ring (0–120 ms axis) with the number + "ms" in the centre
+
+    /// Ring fill on the same fixed 0–120 ms RMSSD axis the Breathe coherence bar uses, so the ring
+    /// reads "how high is my HRV" at a glance without inventing a personal scale the complication
+    /// doesn't have. Values above 120 pin the ring full.
+    private var hrvFraction: Double? {
+        hrv.map { min(Double($0) / 120.0, 1) }
+    }
+
+    /// The HRV accent world: the brand cyan→green. A gradient fill (low = cyan, high = green) gives
+    /// the ring the same premium read as the iOS overview rings.
+    private static let hrvGradient = Gradient(colors: [Color(red: 0.13, green: 0.83, blue: 0.93),
+                                                       Color(red: 0.20, green: 0.83, blue: 0.60)])
 
     private var circular: some View {
-        ZStack {
-            // A quiet full track so the complication reads as a NOOP ring slot without inventing a
-            // fill fraction for a metric that has no 0–100 scale.
-            Circle()
-                .stroke(StrandPalette.textPrimary.opacity(0.10),
-                        style: StrokeStyle(lineWidth: 4, lineCap: .round))
+        Gauge(value: hrvFraction ?? 0, in: 0...1) {
+            EmptyView()
+        } currentValueLabel: {
             VStack(spacing: 0) {
                 Text(hrv.map(String.init) ?? "–")
                     .font(StrandFont.rounded(15, weight: .semibold))
@@ -141,6 +150,8 @@ struct NOOPHRVView: View {
                     .foregroundStyle(StrandPalette.textTertiary)
             }
         }
+        .gaugeStyle(.accessoryCircular)
+        .tint(hrv == nil ? Gradient(colors: [StrandPalette.textTertiary]) : Self.hrvGradient)
         .widgetLabel(circularLabel)
         .widgetAccentable()
         .accessibilityLabel(accessibilityHRV)
@@ -153,15 +164,22 @@ struct NOOPHRVView: View {
         return String(localized: "HRV · \(fresh)")
     }
 
-    // MARK: accessoryCorner — number hugging the corner, label along the bezel
+    // MARK: accessoryCorner — number hugging the corner, an HRV gauge along the bezel
 
     private var corner: some View {
         Text(hrv.map(String.init) ?? "–")
             .font(StrandFont.rounded(17, weight: .semibold))
             .foregroundStyle(hrv == nil ? StrandPalette.textTertiary : StrandPalette.textPrimary)
             .widgetAccentable()
+            // A present value earns the curved gauge (same 0–120 ms axis as the circular ring);
+            // missing / stale keeps the honest text label instead of an empty-claim fill.
             .widgetLabel {
-                Text(cornerLabel)
+                if let fraction = hrvFraction {
+                    Gauge(value: fraction, in: 0...1) { Text("HRV") }
+                        .tint(Self.hrvGradient)
+                } else {
+                    Text(cornerLabel)
+                }
             }
             .accessibilityLabel(accessibilityHRV)
     }
