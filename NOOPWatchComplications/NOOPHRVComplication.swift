@@ -167,8 +167,14 @@ struct NOOPHRVView: View {
     // MARK: accessoryCorner — number hugging the corner, an HRV gauge along the bezel
 
     private var corner: some View {
-        Text(hrv.map(String.init) ?? "–")
-            .font(StrandFont.rounded(17, weight: .semibold))
+        // The ECG glyph identifies this corner as HRV on faces that flatten colours to one tint and
+        // show no gauge text.
+        HStack(spacing: 2) {
+            Image(systemName: "waveform.path.ecg")
+                .font(.system(size: 10, weight: .semibold))
+            Text(hrv.map(String.init) ?? "–")
+                .font(StrandFont.rounded(17, weight: .semibold))
+        }
             .foregroundStyle(hrv == nil ? StrandPalette.textTertiary : StrandPalette.textPrimary)
             .widgetAccentable()
             // A present value earns the curved gauge (same 0–120 ms axis as the circular ring);

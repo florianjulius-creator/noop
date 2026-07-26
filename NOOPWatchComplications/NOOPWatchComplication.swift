@@ -249,8 +249,15 @@ struct NOOPChargeView: View {
     // MARK: accessoryCorner — number hugging the corner, a zone-gradient gauge along the bezel
 
     private var corner: some View {
-        Text(charge.numberText)
-            .font(StrandFont.rounded(17, weight: .semibold))
+        // The heart glyph identifies WHICH Machine metric this corner is — the gauge label carries no
+        // text, and tinted faces flatten every complication to one colour, so the icon is the only
+        // durable identifier.
+        HStack(spacing: 2) {
+            Image(systemName: "heart.fill")
+                .font(.system(size: 10, weight: .semibold))
+            Text(charge.numberText)
+                .font(StrandFont.rounded(17, weight: .semibold))
+        }
             .foregroundStyle(chargeTint)
             .widgetAccentable()
             // A real, current number earns the curved zone gauge (red → amber → green, the same

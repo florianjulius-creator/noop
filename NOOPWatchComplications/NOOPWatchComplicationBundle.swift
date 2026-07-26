@@ -8,7 +8,8 @@ import SwiftUI
 struct NOOPWatchComplicationBundle: WidgetBundle {
     var body: some Widget {
         NOOPChargeComplication()
-        NOOPHRVComplication()
+        NOOPSleepComplication()
         NOOPStrainComplication()
+        NOOPHRVComplication()
     }
 }
