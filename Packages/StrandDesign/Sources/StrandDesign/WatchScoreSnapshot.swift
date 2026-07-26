@@ -35,6 +35,11 @@ public struct WatchScoreSnapshot: Codable, Equatable, Sendable {
     /// sensor; this is just the last value the phone had, used as a fallback / sync indicator.
     public var hr: Int?
 
+    /// Overnight HRV (RMSSD, whole ms) for the anchor day — the same `avgHrv` the Today tile and the
+    /// Home-screen widget read. `nil` when the anchor day has no overnight HRV. Optional + decodes as
+    /// nil when absent so older payloads on the wire stay compatible.
+    public var hrvMs: Int?
+
     /// A one line sleep summary for the glance (e.g. "7h 12m · 81% efficiency"), already formatted by
     /// the phone. Empty string when there is nothing to show.
     public var sleepSummary: String
@@ -54,7 +59,7 @@ public struct WatchScoreSnapshot: Codable, Equatable, Sendable {
                 effort: Double?, effortCalibrating: Bool,
                 rest: Double?, restCalibrating: Bool,
                 hr: Int?, sleepSummary: String, asOf: Date,
-                scoreDay: String? = nil) {
+                scoreDay: String? = nil, hrvMs: Int? = nil) {
         self.charge = charge
         self.chargeCalibrating = chargeCalibrating
         self.effort = effort
@@ -65,6 +70,7 @@ public struct WatchScoreSnapshot: Codable, Equatable, Sendable {
         self.sleepSummary = sleepSummary
         self.asOf = asOf
         self.scoreDay = scoreDay
+        self.hrvMs = hrvMs
     }
 
     // MARK: - Shared app group transport

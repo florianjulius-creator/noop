@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- "The Machine" app icon source. Regenerate the shipped PNGs with:
+     rsvg-convert -w 1024 -h 1024 branding/the-machine-icon.svg > StrandiOS/Resources/Assets.xcassets/AppIcon.appiconset/icon_1024.png
+     rsvg-convert -w 1024 -h 1024 branding/the-machine-icon.svg > NOOPWatch/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png
+     The glyph sits inside the centre ~700px circle so the watchOS circular mask never clips it. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#151b24"/>
+      <stop offset="70%" stop-color="#0b0f15"/>
+      <stop offset="100%" stop-color="#06080b"/>
+    </radialGradient>
+    <linearGradient id="pulse" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="mono" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="55%" stop-color="#2dd4bf"/>
+      <stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Opaque background (Apple icons must not carry alpha). -->
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- Faint flywheel ring: the "machine" at rest behind the monogram. -->
+  <circle cx="512" cy="512" r="330" fill="none" stroke="#22d3ee" stroke-opacity="0.10" stroke-width="10"/>
+  <circle cx="512" cy="512" r="286" fill="none" stroke="#34d399" stroke-opacity="0.07" stroke-width="4"/>
+
+  <!-- ECG pulse running under the monogram. -->
+  <path d="M 120 620 H 380 L 420 560 L 460 680 L 500 620 H 904"
+        fill="none" stroke="url(#pulse)" stroke-opacity="0.5"
+        stroke-width="14" stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- The M. -->
+  <path d="M 292 716 V 332 L 512 552 L 732 332 V 716"
+        fill="none" stroke="url(#mono)"
+        stroke-width="86" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

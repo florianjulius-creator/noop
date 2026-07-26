@@ -106,7 +106,8 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     }
 
     /// Whether the headline content of `next` differs from the last-pushed snapshot. Headline = the
-    /// scores (with their calibrating flags), the sleep summary line, and the day the scores are ABOUT.
+    /// scores (with their calibrating flags), overnight HRV, the sleep summary line, and the day the
+    /// scores are ABOUT.
     /// `hr` and `asOf` are deliberately NOT headline: hr ticks ~1 Hz and `asOf` differs on every build,
     /// so counting either as "changed" would defeat the dedup and re-send identical scores all day.
     /// nil `last` (nothing pushed yet) always counts as changed.
@@ -120,6 +121,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             || last.restCalibrating != next.restCalibrating
             || last.sleepSummary != next.sleepSummary
             || last.scoreDay != next.scoreDay
+            || last.hrvMs != next.hrvMs
     }
 
     /// Build the snapshot off the app state. Pure read; no side effects. Split out so the wiring is easy
@@ -177,7 +179,10 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             asOf: Date(),
             // The day the scores are ABOUT (not when we built this), so the watch can label recency
             // honestly ("Yesterday") even when the build is fresh. nil when there's no anchor day at all.
-            scoreDay: day?.day
+            scoreDay: day?.day,
+            // Overnight HRV off the same anchor row the Home-screen widget reads (WidgetPublish), so
+            // the wrist and the widget can never quote different values for the same day.
+            hrvMs: day?.avgHrv.map { Int($0.rounded()) }
         )
         return snap
     }

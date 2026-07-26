@@ -21,7 +21,8 @@ final class WatchScoreSnapshotTests: XCTestCase {
             restCalibrating: false,
             hr: 58,
             sleepSummary: "7h 12m · 81%",
-            asOf: asOf
+            asOf: asOf,
+            hrvMs: 64
         )
 
         let data = try JSONEncoder().encode(original)
@@ -34,6 +35,7 @@ final class WatchScoreSnapshotTests: XCTestCase {
         XCTAssertEqual(decoded.hr, 58)
         XCTAssertEqual(decoded.sleepSummary, "7h 12m · 81%")
         XCTAssertEqual(decoded.asOf, asOf)
+        XCTAssertEqual(decoded.hrvMs, 64)
         XCTAssertFalse(decoded.chargeCalibrating)
         XCTAssertFalse(decoded.effortCalibrating)
         XCTAssertFalse(decoded.restCalibrating)
@@ -69,6 +71,20 @@ final class WatchScoreSnapshotTests: XCTestCase {
         XCTAssertFalse(decoded.restCalibrating)
         // A missing HR is just absent.
         XCTAssertNil(decoded.hr)
+    }
+
+    func testPayloadWithoutHrvDecodesAsNil() throws {
+        // Wire compatibility: a payload from a phone build that predates `hrvMs` (the key absent
+        // entirely) must decode with hrvMs nil rather than throwing, so a mixed phone/watch update
+        // never breaks the link.
+        let legacyJSON = """
+        {"charge":72,"chargeCalibrating":false,"effort":8.5,"effortCalibrating":false,
+         "rest":81,"restCalibrating":false,"hr":58,"sleepSummary":"7h 12m","asOf":0}
+        """
+        let decoded = try JSONDecoder().decode(WatchScoreSnapshot.self,
+                                               from: Data(legacyJSON.utf8))
+        XCTAssertNil(decoded.hrvMs)
+        XCTAssertEqual(decoded.charge, 72)
     }
 
     func testAppGroupSaveLoadRoundTrips() throws {
