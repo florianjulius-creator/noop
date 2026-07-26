@@ -453,8 +453,8 @@ struct NOOPChargeComplication: Widget {
             NOOPChargeView(entry: entry)
                 .containerBackground(StrandPalette.surfaceBase, for: .widget)
         }
-        .configurationDisplayName("Machine Charge")
-        .description("Your Charge (recovery) on the watch face, with Effort and Rest in the rectangular card.")
+        .configurationDisplayName("Machine Recovery")
+        .description("Your Recovery (Charge) on the watch face, with Effort and Rest in the rectangular card.")
         .supportedFamilies([
             .accessoryCircular,
             .accessoryCorner,

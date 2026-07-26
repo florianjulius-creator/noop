@@ -43,6 +43,8 @@ struct NOOPWidgetView: View {
             rectangular
         case .systemLarge:
             large
+        case .systemMedium:
+            overviewMedium
         default:
             home
         }
@@ -115,17 +117,111 @@ struct NOOPWidgetView: View {
             Spacer(minLength: 0)
             HStack {
                 Label("\(snap.bpm.map(String.init) ?? "–")", systemImage: "waveform.path.ecg")
-                // Medium has room for one more stat (#446); small stays a clean Charge + HR + battery.
-                if family == .systemMedium {
-                    Spacer()
-                    Label("\(snap.effort.map(String.init) ?? "–")", systemImage: "bolt.fill")
-                }
                 Spacer()
                 Label("\(snap.batteryPct.map { "\($0)%" } ?? "–")", systemImage: "battery.50")
             }
             .font(.caption2).foregroundStyle(StrandPalette.textSecondary)
         }
         .padding(12)
+    }
+
+    // MARK: systemMedium — "Today's Overview" three-ring card (WHOOP-style)
+    //
+    // Sleep / Recovery / Strain as three rings over the dark card, with HRV and strap battery in the
+    // header. Strain renders on WHOOP's familiar 0–21 axis (effort is stored 0–100, so ×0.21 for the
+    // display number only; the ring fraction stays effort/100). Missing values draw a dash over an
+    // empty track — never a fabricated number.
+
+    private var overviewMedium: some View {
+        VStack(spacing: 6) {
+            HStack {
+                HStack(spacing: 3) {
+                    Text("HRV").font(.system(size: 11, weight: .semibold)).tracking(0.5)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                    Text(snap.hrv.map(String.init) ?? "–")
+                        .font(.system(size: 12, weight: .bold, design: .rounded))
+                        .foregroundStyle(StrandPalette.textSecondary)
+                }
+                Spacer()
+                Text("MACHINE")
+                    .font(.system(size: 12, weight: .bold))
+                    .tracking(3)
+                    .foregroundStyle(StrandPalette.textTertiary)
+                Spacer()
+                HStack(spacing: 3) {
+                    Image(systemName: batterySymbol).font(.system(size: 11))
+                    Text(snap.batteryPct.map { "\($0)%" } ?? "–")
+                        .font(.system(size: 12, weight: .semibold, design: .rounded))
+                }
+                .foregroundStyle(StrandPalette.textSecondary)
+            }
+            Spacer(minLength: 0)
+            HStack(alignment: .top, spacing: 0) {
+                overviewRing(label: "SLEEP",
+                             text: snap.rest.map(String.init), sub: "%",
+                             fraction: snap.rest.map { Double($0) / 100 },
+                             color: Self.sleepBlue)
+                overviewRing(label: "RECOVERY",
+                             text: snap.recovery.map(String.init), sub: "%",
+                             fraction: snap.recovery.map { Double($0) / 100 },
+                             color: recoveryColor)
+                overviewRing(label: "STRAIN",
+                             text: snap.effort.map { String(format: "%.1f", Double($0) * 0.21) }, sub: nil,
+                             fraction: snap.effort.map { Double($0) / 100 },
+                             color: Self.strainBlue)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    /// WHOOP's widget colour world: slate blue for sleep, signal blue for strain. Recovery reuses the
+    /// zone tint (green / amber / red) so it agrees with every other Recovery surface in the app.
+    private static let sleepBlue = Color(red: 0.49, green: 0.64, blue: 0.79)
+    private static let strainBlue = Color(red: 0.00, green: 0.58, blue: 0.91)
+
+    private var batterySymbol: String {
+        guard let p = snap.batteryPct else { return "battery.50" }
+        switch p {
+        case 88...: return "battery.100"
+        case 63...: return "battery.75"
+        case 38...: return "battery.50"
+        case 13...: return "battery.25"
+        default:    return "battery.0"
+        }
+    }
+
+    /// One ring in the overview: value (dash when missing) centred in a stroked ring, caps label below.
+    private func overviewRing(label: String, text: String?, sub: String?,
+                              fraction: Double?, color: Color) -> some View {
+        VStack(spacing: 7) {
+            ZStack {
+                Circle().stroke(Color.white.opacity(0.12), lineWidth: 6)
+                if let fraction {
+                    Circle()
+                        .trim(from: 0, to: min(max(fraction, 0), 1))
+                        .stroke(color, style: StrokeStyle(lineWidth: 6, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                }
+                HStack(alignment: .firstTextBaseline, spacing: 1) {
+                    Text(text ?? "–")
+                        .font(.system(size: 21, weight: .bold, design: .rounded))
+                        .foregroundStyle(text == nil ? StrandPalette.textTertiary : StrandPalette.textPrimary)
+                        .minimumScaleFactor(0.6)
+                    if let sub, text != nil {
+                        Text(sub)
+                            .font(.system(size: 11, weight: .semibold))
+                            .foregroundStyle(StrandPalette.textTertiary)
+                    }
+                }
+                .padding(.horizontal, 8)
+            }
+            .frame(width: 62, height: 62)
+            Text(label)
+                .font(.system(size: 10, weight: .semibold))
+                .tracking(1.5)
+                .foregroundStyle(StrandPalette.textSecondary)
+        }
+        .frame(maxWidth: .infinity)
     }
 
     /// The rich `systemLarge` layout (#446): the Charge headline plus a stat grid of Effort, Rest, HRV,
@@ -197,8 +293,8 @@ struct NOOPWidget: Widget {
                     .background(StrandPalette.surfaceBase)
             }
         }
-        .configurationDisplayName("NOOP Charge")
-        .description("Charge, Effort, Rest, HRV, resting and live heart rate, and strap battery at a glance.")
+        .configurationDisplayName("The Machine")
+        .description("Sleep, Recovery and Strain rings with HRV, heart rate and strap battery at a glance.")
         .supportedFamilies([
             .systemSmall, .systemMedium, .systemLarge,
             .accessoryCircular, .accessoryInline, .accessoryRectangular
