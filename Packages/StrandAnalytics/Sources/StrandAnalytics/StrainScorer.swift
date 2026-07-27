@@ -140,11 +140,29 @@ public enum StrainScorer {
         return deltaS > 0 ? deltaS / 60.0 : fallbackSampleMin
     }
 
+    /// Ambient credit below the first Edwards zone (WHOOP parity): everyday movement between
+    /// `ambientThresholdPctHRR` and the 50% zone-1 cut-off accrues a small per-minute fraction, so a
+    /// calm-but-lived day reads a low single digit on the 0–21 display axis instead of a hard 0 —
+    /// matching how WHOOP's Day Strain (and therefore the user's imported history) always carries
+    /// some baseline load. The weight is deliberately tiny: a full sedentary day contributes ~5–12
+    /// TRIMP (→ strain ~20–29 of 100), while the log map keeps it negligible next to real training
+    /// (a 180-TRIMP workout moves < 1 point when ambient is added on top).
+    static let ambientThresholdPctHRR: Double = 10.0
+    static let ambientWeight: Double = 0.02
+
     static func edwardsTRIMP(_ hr: [HRSample], restingHR: Double, hrReserve: Double,
                              sampleDurationMin: Double) -> Double {
-        var weighted = 0
-        for s in hr { weighted += zoneWeight(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve) }
-        return Double(weighted) * sampleDurationMin
+        var weighted = 0.0
+        for s in hr {
+            let zone = zoneWeight(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve)
+            if zone > 0 {
+                weighted += Double(zone)
+            } else if pctHRR(Double(s.bpm), restingHR: restingHR, hrReserve: hrReserve)
+                        >= ambientThresholdPctHRR {
+                weighted += ambientWeight
+            }
+        }
+        return weighted * sampleDurationMin
     }
 
     static func banisterTRIMP(_ hr: [HRSample], restingHR: Double, hrReserve: Double,

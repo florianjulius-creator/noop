@@ -112,14 +112,27 @@ final class StrainScorerTests: XCTestCase {
         XCTAssertNil(StrainScorer.strain(tooFew, maxHR: 190, restingHR: 60))
     }
 
-    func testLightDayHonestlyScoresZeroNotFabricated() {
-        // #482: HR that never crosses ~50% HRR earns ZERO Effort, by design. With max 184 / rest 60,
-        // zone 1 starts at 122 bpm; a day spent at 82–110 stays below it. The fix must NOT invent
-        // load to make the gauge "look alive" — both a dense (4.0) and a sparse (5/MG) light day = 0.
+    func testLightDayAccruesSmallAmbientStrain() {
+        // WHOOP-parity ambient credit: HR between the 10% HRR ambient threshold and zone 1 accrues a
+        // SMALL baseline load (the imported WHOOP history always carries some Day Strain, so a
+        // lived-in day must not read a hard 0). With max 184 / rest 60, a day at 105 bpm (~36% HRR)
+        // sits in the ambient band: clearly above zero, but far below a real workout's score.
         let denseLight = hr(105, 1200, start: 0)                     // 4.0-style, 20 min at 1 Hz
         let sparseLight = hrEvery(105, 40)                           // 5/MG-style, 40 × 30 s
-        XCTAssertEqual(StrainScorer.strain(denseLight, maxHR: 184, restingHR: 60), 0.0)
-        XCTAssertEqual(StrainScorer.strain(sparseLight, maxHR: 184, restingHR: 60), 0.0)
+        for light in [denseLight, sparseLight] {
+            let s = StrainScorer.strain(light, maxHR: 184, restingHR: 60)
+            XCTAssertNotNil(s)
+            XCTAssertGreaterThan(s!, 0.0)
+            XCTAssertLessThan(s!, 15.0, "ambient credit must stay far below workout territory")
+        }
+    }
+
+    func testTrueRestStillScoresZero() {
+        // The honesty rule survives the ambient credit: HR at/near resting (below the 10% HRR
+        // ambient threshold — 72 bpm here with rest 60 / max 184) still earns exactly zero. Ambient
+        // credit is about a lived-in day, never about inventing load at genuine rest.
+        let resting = hr(68, 1200, start: 0)                         // ~6.5% HRR, under the threshold
+        XCTAssertEqual(StrainScorer.strain(resting, maxHR: 184, restingHR: 60), 0.0)
     }
 
     func testSparseStreamScoresRealWorkout() {
