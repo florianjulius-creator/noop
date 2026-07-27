@@ -646,7 +646,13 @@ public enum AnalyticsEngine {
         // night `hr` for pure-function callers/tests.
         let effMaxHR: Double? = maxHROverride ?? (profile.age > 0 ? StrainScorer.tanakaHRmax(age: profile.age) : nil)
         let restForStrain = restingHRDaily.map(Double.init) ?? StrainScorer.defaultRestingHR
-        let strain = StrainScorer.strain(dayHr ?? hr, maxHR: effMaxHR, restingHR: restForStrain,
+        // Trim a caller-supplied dayHr to the day bounds before integrating: neighbour-day spill used
+        // to be invisible here (sub-zone samples weighed 0) but the ambient credit gives every
+        // lived-in sample weight, so an untrimmed stream would leak the spill into Effort and break
+        // the full-vs-prefiltered byte-identity. The night-window fallback stays unfiltered — its
+        // pre-midnight tail is the pure-function callers' documented contract.
+        let strainHr = dayHr.map { $0.filter { tsInDay($0.ts) } } ?? hr
+        let strain = StrainScorer.strain(strainHr, maxHR: effMaxHR, restingHR: restForStrain,
                                          sex: profile.sex)
 
         // ── Workouts ──────────────────────────────────────────────────────────
