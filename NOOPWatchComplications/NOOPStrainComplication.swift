@@ -155,7 +155,7 @@ struct NOOPStrainView: View {
         // fit-to-corner scaling to shrink the digits, so Strain identifies itself through the
         // signal-blue gauge colour instead.
         Text(strainText ?? "–")
-            .font(StrandFont.rounded(30, weight: .semibold))
+            .font(.system(.title2, design: .rounded).weight(.semibold))
             .minimumScaleFactor(0.7)
             .foregroundStyle(strainText == nil ? StrandPalette.textTertiary : Self.strainBlue)
             .widgetAccentable()
