@@ -249,49 +249,16 @@ struct NOOPChargeView: View {
     // MARK: accessoryCorner — number hugging the corner, a zone-gradient gauge along the bezel
 
     private var corner: some View {
-        // Number only, as large as the corner allows — a companion glyph forces the system's
-        // fit-to-corner scaling to shrink the digits (the "why is my font tiny" trap), so the metric
-        // identifies itself through the zone tint + gauge colour instead.
+        // Large-content mode: with NO widgetLabel attached the corner renders its content at full
+        // size — the only way a third-party complication matches the big digits of Apple's own
+        // battery corner. With a gauge or label, watchOS locks the inner content to a small fixed
+        // circle and ignores requested fonts (see Apple forums 718053/707827). Default SF matches
+        // the system corners' typeface; the metric identifies itself through its colour.
         Text(charge.numberText)
-            .font(.system(.title, design: .rounded).weight(.semibold))
-            .minimumScaleFactor(0.7)
+            .font(.system(.title).weight(.semibold))
             .foregroundStyle(chargeTint)
             .widgetAccentable()
-            // A real, current number earns the curved zone gauge (red → amber → green, the same
-            // colour world every Recovery surface uses) so the corner reads like the iOS ring rather
-            // than a bare digit. Calibrating / stale / missing keep the honest TEXT label — a gauge
-            // fill is a claim about a value we don't have.
-            .widgetLabel {
-                if case .value = charge, !isStale {
-                    Gauge(value: charge.fraction, in: 0...1) { Text("Recovery") }
-                        .tint(Gradient(colors: [StrandPalette.statusCritical,
-                                                StrandPalette.statusWarning,
-                                                StrandPalette.statusPositive]))
-                } else {
-                    Text(cornerLabel)
-                }
-            }
             .accessibilityLabel(accessibilityCharge)
-    }
-
-    private var cornerLabel: String {
-        switch charge {
-        case .value:
-            // Real number: ride the bezel with the recency so an aging score stays honest. A current
-            // snapshot keeps the plain label (semantic flag, not a display-text comparison).
-            guard let fresh = freshness, !isFreshToday else { return String(localized: "Charge") }
-            return String(localized: "Charge · \(fresh)")
-        case .calibrating:
-            // When the dash is here because the whole snapshot went stale, say so plainly rather than
-            // "cal" (which means "needs more data", a different thing).
-            if isStale {
-                let fresh = freshness ?? String(localized: "stale")
-                return String(localized: "Charge · \(fresh)")
-            }
-            return String(localized: "Charge · cal")
-        case .missing:
-            return noSnapshot ? String(localized: "Open Machine") : String(localized: "Charge")
-        }
     }
 
     // MARK: accessoryInline — a single line of text along the top of the face

@@ -151,32 +151,16 @@ struct NOOPStrainView: View {
     // MARK: accessoryCorner — number hugging the corner, gauge along the bezel
 
     private var corner: some View {
-        // Number only, as large as the corner allows — a companion glyph forces the system's
-        // fit-to-corner scaling to shrink the digits, so Strain identifies itself through the
-        // signal-blue gauge colour instead.
+        // Large-content mode: with NO widgetLabel attached the corner renders its content at full
+        // size — the only way a third-party complication matches the big digits of Apple's own
+        // battery corner. With a gauge or label, watchOS locks the inner content to a small fixed
+        // circle and ignores requested fonts (see Apple forums 718053/707827). Default SF matches
+        // the system corners' typeface; the metric identifies itself through its colour.
         Text(strainText ?? "–")
-            .font(.system(.title, design: .rounded).weight(.semibold))
-            .minimumScaleFactor(0.7)
+            .font(.system(.title).weight(.semibold))
             .foregroundStyle(strainText == nil ? StrandPalette.textTertiary : Self.strainBlue)
             .widgetAccentable()
-            // A present value earns the curved gauge; missing/stale keeps the honest text label.
-            .widgetLabel {
-                if let fraction = strainFraction {
-                    Gauge(value: fraction, in: 0...1) { Text("Strain") }
-                        .tint(Self.strainGradient)
-                } else {
-                    Text(cornerLabel)
-                }
-            }
             .accessibilityLabel(accessibilityStrain)
-    }
-
-    private var cornerLabel: String {
-        if isStale {
-            let fresh = freshness ?? String(localized: "stale")
-            return String(localized: "Strain · \(fresh)")
-        }
-        return noSnapshot ? String(localized: "Open Machine") : String(localized: "Strain")
     }
 
     // MARK: accessoryInline — one line: Strain + Recovery

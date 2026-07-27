@@ -167,37 +167,16 @@ struct NOOPHRVView: View {
     // MARK: accessoryCorner — number hugging the corner, an HRV gauge along the bezel
 
     private var corner: some View {
-        // Number only, as large as the corner allows — a companion glyph forces the system's
-        // fit-to-corner scaling to shrink the digits, so HRV identifies itself through the cyan
-        // gauge colour instead.
+        // Large-content mode: with NO widgetLabel attached the corner renders its content at full
+        // size — the only way a third-party complication matches the big digits of Apple's own
+        // battery corner. With a gauge or label, watchOS locks the inner content to a small fixed
+        // circle and ignores requested fonts (see Apple forums 718053/707827). Default SF matches
+        // the system corners' typeface; the metric identifies itself through its colour.
         Text(hrv.map(String.init) ?? "–")
-            .font(.system(.title, design: .rounded).weight(.semibold))
-            .minimumScaleFactor(0.7)
+            .font(.system(.title).weight(.semibold))
             .foregroundStyle(hrv == nil ? StrandPalette.textTertiary : StrandPalette.textPrimary)
             .widgetAccentable()
-            // A present value earns the curved gauge (same 0–120 ms axis as the circular ring);
-            // missing / stale keeps the honest text label instead of an empty-claim fill.
-            .widgetLabel {
-                if let fraction = hrvFraction {
-                    Gauge(value: fraction, in: 0...1) { Text("HRV") }
-                        .tint(Self.hrvGradient)
-                } else {
-                    Text(cornerLabel)
-                }
-            }
             .accessibilityLabel(accessibilityHRV)
-    }
-
-    private var cornerLabel: String {
-        if hrv != nil {
-            guard let fresh = freshness, !isFreshToday else { return String(localized: "HRV ms") }
-            return String(localized: "HRV · \(fresh)")
-        }
-        if isStale {
-            let fresh = freshness ?? String(localized: "stale")
-            return String(localized: "HRV · \(fresh)")
-        }
-        return noSnapshot ? String(localized: "Open Machine") : String(localized: "HRV")
     }
 
     // MARK: accessoryInline — one line: HRV + Charge

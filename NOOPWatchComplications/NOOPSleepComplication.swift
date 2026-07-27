@@ -140,31 +140,16 @@ struct NOOPSleepView: View {
     // MARK: accessoryCorner — bed glyph + number, gauge along the bezel
 
     private var corner: some View {
-        // Number only, as large as the corner allows — a companion glyph forces the system's
-        // fit-to-corner scaling to shrink the digits, so Sleep identifies itself through the slate
-        // gauge colour instead.
+        // Large-content mode: with NO widgetLabel attached the corner renders its content at full
+        // size — the only way a third-party complication matches the big digits of Apple's own
+        // battery corner. With a gauge or label, watchOS locks the inner content to a small fixed
+        // circle and ignores requested fonts (see Apple forums 718053/707827). Default SF matches
+        // the system corners' typeface; the metric identifies itself through its colour.
         Text(rest.map(String.init) ?? "–")
-            .font(.system(.title, design: .rounded).weight(.semibold))
-            .minimumScaleFactor(0.7)
+            .font(.system(.title).weight(.semibold))
             .foregroundStyle(rest == nil ? StrandPalette.textTertiary : Self.sleepBlue)
             .widgetAccentable()
-            .widgetLabel {
-                if let fraction = restFraction {
-                    Gauge(value: fraction, in: 0...1) { Text("Sleep") }
-                        .tint(Self.sleepGradient)
-                } else {
-                    Text(cornerLabel)
-                }
-            }
             .accessibilityLabel(accessibilitySleep)
-    }
-
-    private var cornerLabel: String {
-        if isStale {
-            let fresh = freshness ?? String(localized: "stale")
-            return String(localized: "Sleep · \(fresh)")
-        }
-        return noSnapshot ? String(localized: "Open Machine") : String(localized: "Sleep")
     }
 
     // MARK: accessoryInline — one line: Sleep % + the summary
