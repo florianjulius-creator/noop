@@ -144,7 +144,7 @@ struct NOOPSleepView: View {
         // fit-to-corner scaling to shrink the digits, so Sleep identifies itself through the slate
         // gauge colour instead.
         Text(rest.map(String.init) ?? "–")
-            .font(.system(.title2, design: .rounded).weight(.semibold))
+            .font(.system(.title, design: .rounded).weight(.semibold))
             .minimumScaleFactor(0.7)
             .foregroundStyle(rest == nil ? StrandPalette.textTertiary : Self.sleepBlue)
             .widgetAccentable()

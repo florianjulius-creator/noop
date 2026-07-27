@@ -253,7 +253,7 @@ struct NOOPChargeView: View {
         // fit-to-corner scaling to shrink the digits (the "why is my font tiny" trap), so the metric
         // identifies itself through the zone tint + gauge colour instead.
         Text(charge.numberText)
-            .font(.system(.title2, design: .rounded).weight(.semibold))
+            .font(.system(.title, design: .rounded).weight(.semibold))
             .minimumScaleFactor(0.7)
             .foregroundStyle(chargeTint)
             .widgetAccentable()

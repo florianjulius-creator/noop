@@ -171,7 +171,7 @@ struct NOOPHRVView: View {
         // fit-to-corner scaling to shrink the digits, so HRV identifies itself through the cyan
         // gauge colour instead.
         Text(hrv.map(String.init) ?? "–")
-            .font(.system(.title2, design: .rounded).weight(.semibold))
+            .font(.system(.title, design: .rounded).weight(.semibold))
             .minimumScaleFactor(0.7)
             .foregroundStyle(hrv == nil ? StrandPalette.textTertiary : StrandPalette.textPrimary)
             .widgetAccentable()
