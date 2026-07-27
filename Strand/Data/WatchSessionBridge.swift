@@ -262,6 +262,23 @@ extension WatchSessionBridge: WCSessionDelegate {
         }
     }
 
+    /// Fires when the paired watch's state changes — most importantly when the NOOP watch app is
+    /// (re)installed. A reinstall starts with an EMPTY watch-side app group, while this process's
+    /// push gates still remember the last snapshot as "already sent" and would swallow the next
+    /// push as unchanged. Reset both gates and immediately re-send the mirrored snapshot so a fresh
+    /// install fills its complications without waiting for new data or an app restart.
+    nonisolated func sessionWatchStateDidChange(_ session: WCSession) {
+        Task { @MainActor in
+            self.isWatchReachable = session.isReachable
+            guard session.activationState == .activated, session.isWatchAppInstalled else { return }
+            self.lastPushedAt = nil
+            self.lastSent = nil
+            if let snap = WatchScoreSnapshot.load() {
+                self.send(snap)
+            }
+        }
+    }
+
     /// The watch's "send me the latest" request on launch. We re-mirror the last snapshot into the
     /// shared app group and reply with it inline so the watch has a value the instant it asks. The
     /// reply also lets the watch confirm the link is live.
