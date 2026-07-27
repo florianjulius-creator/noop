@@ -140,15 +140,12 @@ struct NOOPSleepView: View {
     // MARK: accessoryCorner — bed glyph + number, gauge along the bezel
 
     private var corner: some View {
-        // The bed glyph identifies this corner as Sleep on faces that flatten colours to one tint
-        // and show no gauge text.
-        HStack(spacing: 2) {
-            Image(systemName: "bed.double.fill")
-                .font(.system(size: 13, weight: .semibold))
-            Text(rest.map(String.init) ?? "–")
-                .font(StrandFont.rounded(26, weight: .semibold))
-                .minimumScaleFactor(0.5)
-        }
+        // Number only, as large as the corner allows — a companion glyph forces the system's
+        // fit-to-corner scaling to shrink the digits, so Sleep identifies itself through the slate
+        // gauge colour instead.
+        Text(rest.map(String.init) ?? "–")
+            .font(StrandFont.rounded(30, weight: .semibold))
+            .minimumScaleFactor(0.7)
             .foregroundStyle(rest == nil ? StrandPalette.textTertiary : Self.sleepBlue)
             .widgetAccentable()
             .widgetLabel {

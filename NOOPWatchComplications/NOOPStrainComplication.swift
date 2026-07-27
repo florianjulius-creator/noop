@@ -151,15 +151,12 @@ struct NOOPStrainView: View {
     // MARK: accessoryCorner — number hugging the corner, gauge along the bezel
 
     private var corner: some View {
-        // The bolt glyph identifies this corner as Strain on faces that flatten colours to one tint
-        // and show no gauge text.
-        HStack(spacing: 2) {
-            Image(systemName: "bolt.fill")
-                .font(.system(size: 13, weight: .semibold))
-            Text(strainText ?? "–")
-                .font(StrandFont.rounded(26, weight: .semibold))
-                .minimumScaleFactor(0.5)
-        }
+        // Number only, as large as the corner allows — a companion glyph forces the system's
+        // fit-to-corner scaling to shrink the digits, so Strain identifies itself through the
+        // signal-blue gauge colour instead.
+        Text(strainText ?? "–")
+            .font(StrandFont.rounded(30, weight: .semibold))
+            .minimumScaleFactor(0.7)
             .foregroundStyle(strainText == nil ? StrandPalette.textTertiary : Self.strainBlue)
             .widgetAccentable()
             // A present value earns the curved gauge; missing/stale keeps the honest text label.
