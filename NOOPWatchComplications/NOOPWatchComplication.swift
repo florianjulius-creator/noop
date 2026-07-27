@@ -221,7 +221,7 @@ struct NOOPChargeView: View {
             VStack(spacing: 0) {
                 Text(charge.numberText)
                     .font(StrandFont.rounded(15, weight: .semibold))
-                    .minimumScaleFactor(0.6)
+                    .minimumScaleFactor(0.5)
                 if case .calibrating = charge {
                     calPip
                 }
@@ -254,10 +254,10 @@ struct NOOPChargeView: View {
         // durable identifier.
         HStack(spacing: 2) {
             Image(systemName: "heart.fill")
-                .font(.system(size: 12, weight: .semibold))
+                .font(.system(size: 13, weight: .semibold))
             Text(charge.numberText)
-                .font(StrandFont.rounded(21, weight: .semibold))
-                .minimumScaleFactor(0.6)
+                .font(StrandFont.rounded(26, weight: .semibold))
+                .minimumScaleFactor(0.5)
         }
             .foregroundStyle(chargeTint)
             .widgetAccentable()
