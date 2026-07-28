@@ -46,6 +46,9 @@ struct StrandiOSApp: App {
         // target's BGTaskSchedulerPermittedIdentifiers (project.yml). Without this the overnight drop
         // never fires; the macOS timer, foreground catch-up, and "Run now" already work without it.
         ScheduledDebugExport.register()
+        // Morning briefing rides the same rule: register its BGTask handler before launch finishes,
+        // or the ~06:45 background run is never delivered.
+        MorningBriefing.register()
         // Foreground presentation: without a delegate, iOS suppresses a notification's banner while the app
         // is open, so a user testing the wind-down reminder with NOOP foregrounded sees nothing. Register
         // before the first scene so any early-fired notification is presented.
@@ -184,6 +187,11 @@ struct StrandiOSApp: App {
                 .task {
                     watch.activate()
                     await watch.pushLatest(from: model)
+                    // Hand the briefing its model + arm tomorrow's ~06:45 run; catch up now in case
+                    // today's briefing hasn't been generated yet (first open of the day).
+                    MorningBriefing.model = model
+                    MorningBriefing.scheduleNext()
+                    await MorningBriefing.generateIfDue(model: model)
                 }
         }
         // HealthKit authorization is intentionally NOT requested on launch. The system permission
@@ -207,6 +215,9 @@ struct StrandiOSApp: App {
                 Task {
                     health.refreshAuthIfPreviouslyGranted()
                     await health.sync()
+                    // Foreground catch-up: day-guarded inside, so this exits immediately once
+                    // today's briefing exists.
+                    await MorningBriefing.generateIfDue(model: model)
                     await WidgetSnapshot.publish(from: model)
                     // Push the wrist on the SAME refresh as the Home-screen widget so the watch, the
                     // widget and Today never disagree about which day they describe. Without this the
