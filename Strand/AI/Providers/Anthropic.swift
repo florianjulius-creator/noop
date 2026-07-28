@@ -13,9 +13,11 @@ struct AnthropicClient: AIProviderClient {
         for m in messages { wire.append(["role": m.role.rawValue, "content": m.content]) }
 
         // Anthropic: system prompt is a top-level field, not a message role.
+        // max_tokens covers thinking + response text together on the Claude 5 series (which runs
+        // adaptive thinking by default), so 900 would let thinking starve the visible answer.
         let body: [String: Any] = [
             "model": model,
-            "max_tokens": 900,
+            "max_tokens": 4096,
             "system": systemPrompt,
             "messages": wire
         ]
@@ -28,11 +30,17 @@ struct AnthropicClient: AIProviderClient {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         let json = try await performRequest(req, session: session)
-        guard let content = json["content"] as? [[String: Any]],
-              let first = content.first,
-              let text = first["text"] as? String else {
+        guard let content = json["content"] as? [[String: Any]] else {
             throw AICoachError.decode
         }
+        // Claude 5-series models run adaptive thinking by default: `content` then LEADS with one or
+        // more `thinking` blocks before the `text` block(s). Reading `content.first` blindly broke
+        // on those models ("couldn't read the provider's reply") — join every text block instead.
+        let text = content
+            .filter { ($0["type"] as? String) == "text" }
+            .compactMap { $0["text"] as? String }
+            .joined()
+        guard !text.isEmpty else { throw AICoachError.decode }
         return text
     }
 
