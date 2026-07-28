@@ -384,7 +384,9 @@ final class AICoachEngine: ObservableObject {
 
     /// Set a custom model id (any string). Adds it to the picker if it isn't already listed.
     func setCustomModel(_ id: String) {
-        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Model ids are case-sensitive lowercase; normalise so an auto-capitalized entry
+        // ("Claude-opus-5") can never reach the API and 404.
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         guard !trimmed.isEmpty else { return }
         if !availableModels.contains(trimmed) {
             availableModels.insert(trimmed, at: 0)

@@ -332,6 +332,12 @@ struct CoachView: View {
                 HStack(spacing: 8) {
                     TextField("Enter a model id", text: $customModelDraft)
                         .textFieldStyle(.plain)
+                        // Model ids are strictly lowercase; iOS auto-capitalization turned
+                        // "claude-opus-5" into "Claude-opus-5" → 404 from the API.
+                        .autocorrectionDisabled()
+                        #if os(iOS)
+                        .textInputAutocapitalization(.never)
+                        #endif
                         .font(StrandFont.body)
                         .foregroundStyle(StrandPalette.textPrimary)
                         .padding(.horizontal, 12)
