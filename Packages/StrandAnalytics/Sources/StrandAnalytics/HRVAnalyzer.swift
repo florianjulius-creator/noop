@@ -50,6 +50,11 @@ public enum HRVAnalyzer {
         /// RMSSD in milliseconds, or nil when too few valid beats.
         public let rmssd: Double?
         /// SDNN (sample SD, ddof=1) in milliseconds, or nil when too few valid beats.
+        ///
+        /// A caller holding the window's TIMESTAMPS should also refuse this value when
+        /// `beatSpreadIsTrustworthy(classifyCoverage(...))` is false: SDNN is a spread over every
+        /// interval, so an over-counted capture inflates it directly. `analyze` cannot do that itself —
+        /// it is given intervals, not times.
         public let sdnn: Double?
         /// Mean NN interval (ms) over the cleaned beats, or nil.
         public let meanNN: Double?
@@ -353,6 +358,12 @@ public enum HRVAnalyzer {
     public enum RrCoverageVerdict: String, Equatable, Sendable {
         /// At or near 1.0 — the beat-time fits the wall clock. Nothing to explain.
         case plausible
+        /// Materially BELOW 1.0: beat-time is missing from the window. Not a clean night, and not an
+        /// over-count either — the analysis window silently is not the window it appears to be, because
+        /// beats that never arrived cannot be distinguished from beats that were never there. Same
+        /// principle as `unmeasurable` below: claiming a capture was fine when a seventh of it is absent
+        /// is the opposite of what this verdict exists to do. (#977)
+        case underCovered
         /// Over-covered, but collapsing same-second duplicates brings it back in range: the extra beats
         /// share a timestamp, so a de-dup at that granularity would fix it.
         case sameSecondOverCount
@@ -364,6 +375,50 @@ public enum HRVAnalyzer {
         /// when nothing was measurable, which is the opposite of what this verdict exists to do.
         case unmeasurable
     }
+
+    /// Whether a window's BEAT-SPREAD statistics — SDNN, and anything derived from it — can be trusted,
+    /// given that window's coverage verdict. Pure. Byte-parity twin of Kotlin `beatSpreadIsTrustworthy`.
+    ///
+    /// SDNN is the standard deviation of EVERY NN interval in the window, so a capture that holds some
+    /// beats twice reports a spread no heart produced. It is not a subtle bias: measured on a ring whose
+    /// banked R-R covers 1.25× the wall-clock it spans, a sleeping night reads **197 ms** against a
+    /// 40-100 ms physiological range, and the app had no way to refuse the number — `classifyCoverage`
+    /// already knew the capture was over-counted, but nothing acted on it.
+    ///
+    /// Only the two OVER-COUNT verdicts gate. `underCovered` and `unmeasurable` stay trusted: neither
+    /// duplicates a beat. `unmeasurable` in particular is what a LIVE spot reading looks like — beats
+    /// arriving in real time, carrying no timestamps to measure coverage with — and suppressing those
+    /// would refuse honest readings, the opposite of the point.
+    ///
+    /// Successive-difference statistics (RMSSD, pNN50) are deliberately NOT gated here. Their dominant
+    /// error on a banked stream was the lost within-second emission order (#823, root-caused in #1072),
+    /// which is fixed at the write path; whether they need a gate of their own is a question for a
+    /// post-fix capture to answer, not an assumption to bake in now.
+    public static func beatSpreadIsTrustworthy(_ verdict: RrCoverageVerdict) -> Bool {
+        switch verdict {
+        case .sameSecondOverCount, .crossSecondOverCount:
+            return false
+        case .plausible, .underCovered, .unmeasurable:
+            return true
+        }
+    }
+
+    /// Tolerance BELOW 1.0 treated as "fits", the mirror of `coveragePlausibleCeiling`. Same allowance,
+    /// same caveat: a ROUNDING allowance rather than a tuned threshold, because whole-second timestamps
+    /// under-report as easily as they over-report. Where the real boundary sits still needs coverage
+    /// figures from several wearers — `IntelligenceEngine` already logs `coverage` in the `hrv diag`
+    /// line, so that distribution can be gathered from traces that already exist. (#977)
+    ///
+    /// Deliberately symmetric rather than fitted: picking a number between the reported 0.859 and the
+    /// 0.89 of #803's capture would be choosing a threshold to match one corpus, which is what the
+    /// ceiling's own comment warns against.
+    ///
+    /// DERIVED rather than written as 0.90 so it cannot drift if the ceiling moves. IEEE-754 makes the
+    /// result 0.8999999999999999, not exactly 0.90, because 1.10 - 1.0 is not exactly 0.10 — harmless
+    /// (a night at exactly 0.90 is still above it) and identical on both platforms, since both fold the
+    /// same double arithmetic. Symmetry with the ceiling is the property worth keeping; the last bit is
+    /// not.
+    public static let coveragePlausibleFloor: Double = 1.0 - (coveragePlausibleCeiling - 1.0)
 
     /// Tolerance above 1.0 treated as "fits". R-R timestamps are whole seconds while beats are not, so a
     /// clean night can round fractionally over. This is a ROUNDING allowance, deliberately not a tuned
@@ -377,6 +432,9 @@ public enum HRVAnalyzer {
     /// the twins would otherwise disagree. NaN falls to `.unmeasurable` on both.
     public static func classifyCoverage(coverage: Double, collapsed: Double) -> RrCoverageVerdict {
         guard coverage > 0 else { return .unmeasurable }
+        // #977: the floor is tested BEFORE the ceiling so the negated-`>` NaN convention above still
+        // holds — a non-finite coverage has already left via `unmeasurable` and cannot reach here.
+        guard coverage >= coveragePlausibleFloor else { return .underCovered }
         guard coverage > coveragePlausibleCeiling else { return .plausible }
         return collapsed > coveragePlausibleCeiling ? .crossSecondOverCount : .sameSecondOverCount
     }

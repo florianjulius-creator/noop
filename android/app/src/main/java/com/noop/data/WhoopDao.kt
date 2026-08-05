@@ -91,6 +91,25 @@ interface WhoopDao : DeviceRegistryDao {
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insertRawImu(rows: List<RawImuSampleEntity>): List<Long>
 
+    /**
+     * The remaining 5/MG v18 per-second fields, one compact blob per strap-second. Idempotent by
+     * (deviceId, ts) — IGNORE keeps the FIRST-seen row, matching every other per-second stream, so a
+     * re-sync cannot duplicate or overwrite. Instrumentation only.
+     */
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertV18Aux(rows: List<V18AuxSampleEntity>): List<Long>
+
+    /**
+     * Bound the v18 aux table to the newest [keep] rows for [deviceId] (rolling retention, v31). Same
+     * shape as [pruneRawImu] — this is instrumentation nothing reads yet, so it is capped rather than
+     * unbounded. Swift twin: the DELETE at the end of `WhoopStore.insert`.
+     */
+    @Query(
+        "DELETE FROM v18AuxSample WHERE deviceId = :deviceId AND ts < " +
+            "(SELECT MIN(ts) FROM (SELECT ts FROM v18AuxSample WHERE deviceId = :deviceId ORDER BY ts DESC LIMIT :keep))"
+    )
+    suspend fun pruneV18Aux(deviceId: String, keep: Int)
+
     /** Bound the raw-IMU table to the newest [keep] rows for [deviceId] (rolling retention, #423). */
     @Query(
         "DELETE FROM rawImuSample WHERE deviceId = :deviceId AND ts < " +
@@ -289,13 +308,52 @@ interface WhoopDao : DeviceRegistryDao {
     suspend fun ppgWaveformSamples(deviceId: String, from: Long, to: Long, limit: Int):
         List<PpgWaveformSampleEntity>
 
-    /** Aggregate HR over a window (one indexed (deviceId,ts) range scan — no row materialisation,
-     *  no [hrSamples] LIMIT truncation). Backs the imported-workout HR fallback (#77). */
+    /**
+     * The banked 5/MG v18 auxiliary-field rows in [from, to] (ascending). Empty on a WHOOP 4.0 and for
+     * any window offloaded before the columns existed. INSTRUMENTATION: no analytic calls this — it
+     * exists so the banked bytes are reachable for a census, and so the write path has a round-trip test.
+     */
     @Query(
-        "SELECT COUNT(*) AS n, AVG(bpm) AS avg, MAX(bpm) AS max FROM hrSample " +
-            "WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to"
+        "SELECT * FROM v18AuxSample WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "ORDER BY ts ASC LIMIT :limit"
     )
-    suspend fun hrWindowStats(deviceId: String, from: Long, to: Long): HrWindowStats
+    suspend fun v18AuxSamples(deviceId: String, from: Long, to: Long, limit: Int):
+        List<V18AuxSampleEntity>
+
+    /** Aggregate HR over a window (one indexed (deviceId,ts) range scan — no row materialisation,
+     *  no [hrSamples] LIMIT truncation). Backs the imported-workout HR fallback (#77).
+     *
+     *  #836: aggregates the SAME measured-∪-PPG rows [hrSamples] returns, not `hrSample` alone. It used
+     *  to read only measured rows, so on a WHOOP 5 — where the firmware banks v26 PPG instead of v18 HR
+     *  per second — a PPG-heavy workout charted a full trace (the chart uses [hrSamples]) while this
+     *  counted under `fillWorkoutHrFromStrap`'s 60-sample floor, and Avg HR rendered blank. iOS never had
+     *  it: its twin reduces `store.hrSamples`, the coalescing read. Same anti-join as [hrSamples], so a
+     *  measured second is never double-counted by its PPG estimate. */
+    @Query(
+        // #856: up to TWO ids, :primaryId winning per second. A naive `deviceId IN (…)` would count a
+        // second banked under BOTH ids twice after a strap re-add, inflating n and skewing avg — and
+        // both numbers would stay plausible, so nothing would look wrong. GROUP BY ts with MIN(pri)
+        // keeps one row per second and takes the primary's, matching the dedup the chart already does.
+        // Passing the same id for both is byte-identical to the old single-id read.
+        "SELECT COUNT(*) AS n, AVG(bpm) AS avg, MAX(bpm) AS max FROM (" +
+            "SELECT ts, MIN(pri), bpm FROM (" +
+            "SELECT ts, bpm, 0 AS pri FROM hrSample " +
+            "WHERE deviceId = :primaryId AND ts >= :from AND ts <= :to " +
+            "UNION ALL " +
+            "SELECT p.ts AS ts, p.bpm AS bpm, 0 AS pri FROM ppgHrSample p " +
+            "WHERE p.deviceId = :primaryId AND p.ts >= :from AND p.ts <= :to " +
+            "AND NOT EXISTS (SELECT 1 FROM hrSample h WHERE h.deviceId = p.deviceId AND h.ts = p.ts) " +
+            "UNION ALL " +
+            "SELECT ts, bpm, 1 AS pri FROM hrSample " +
+            "WHERE deviceId = :secondaryId AND ts >= :from AND ts <= :to " +
+            "UNION ALL " +
+            "SELECT p.ts AS ts, p.bpm AS bpm, 1 AS pri FROM ppgHrSample p " +
+            "WHERE p.deviceId = :secondaryId AND p.ts >= :from AND p.ts <= :to " +
+            "AND NOT EXISTS (SELECT 1 FROM hrSample h WHERE h.deviceId = p.deviceId AND h.ts = p.ts) " +
+            ") GROUP BY ts" +
+            ")"
+    )
+    suspend fun hrWindowStats(primaryId: String, secondaryId: String, from: Long, to: Long): HrWindowStats
 
     @Query(
         // #823: `ord` FIRST, so same-second beats come back in EMISSION order. Ordering by rrMs made
@@ -305,7 +363,32 @@ interface WhoopDao : DeviceRegistryDao {
         // Byte-parity twin of Swift Reads.swift rrIntervals; both are SQLite, so NULL ordering matches.
         // Note this no longer matches the PK index (ts, rrMs, seq), so SQLite sorts; see the PR for why
         // that is acceptable at this query's size rather than adding a covering index.
+        //
+        // #1071: ONE optical channel. An Oura ring measures the same heartbeats on more than one tag and
+        // all of them are stored, so an unfiltered read returned roughly TWO complete copies of a night —
+        // 2.06x the beats the measured HR curve allows. That leaves meanNN (and resting HR) correct and
+        // destroys every statistic built on successive differences: RMSSD, and a ~200 ms nocturnal SDNN
+        // where a healthy adult asleep is 40-100 ms.
+        //
+        // The predicate EXCLUDES the one channel proven redundant (SPO2_IBI, 0x6E) rather than
+        // whitelisting the one preferred (GREEN_QUALITY, 0x80), which matters for what it does NOT drop:
+        //   - NULL is kept. Every WHOOP row is NULL by construction (one beat source), as is every row
+        //     written before v26. A whitelist would delete every WHOOP night from scoring.
+        //   - IBI_AMPLITUDE (0x60/0x44) is kept. It does not fire on the Gen-3 hardware this was measured
+        //     on, so there is no evidence it duplicates green — and dropping a ring's ONLY beat source on
+        //     an untested assumption is the more expensive mistake. If a capture ever shows 0x60 and 0x80
+        //     firing together, that is a second exclusion here, decided on that evidence.
+        // 0x6E is the one excluded because it is the demonstrated duplicate AND the worse measurement of
+        // the two: quantised to an 8 ms grid, no quality gate, and running only while an SpO2 measurement
+        // is on — so scoring off it would make HRV coverage a function of the SpO2 duty cycle.
+        //
+        // Rows are FILTERED, never deleted: the 0x6E stream stays on disk as the cross-check on green.
+        // Every R-R consumer reads through this one query, so the `hrv diag` trace moves with the scores
+        // rather than reporting a coverage nobody can reproduce. The literal 2 is RrSourceChannel.SPO2_IBI
+        // .code — a Room @Query is a compile-time constant string and cannot reference it; RrChannelTest
+        // pins the two together.
         "SELECT * FROM rrInterval WHERE deviceId = :deviceId AND ts >= :from AND ts <= :to " +
+            "AND (srcChannel IS NULL OR srcChannel <> 2) " +
             "ORDER BY ts ASC, ord ASC, rrMs ASC, seq ASC LIMIT :limit"
     )
     suspend fun rrIntervals(deviceId: String, from: Long, to: Long, limit: Int): List<RrInterval>
@@ -659,6 +742,19 @@ interface WhoopDao : DeviceRegistryDao {
     suspend fun workoutsCount(deviceId: String, from: Long, to: Long): Int
 
     /**
+     * #1058: sum per-session `steps` over one source's workouts whose startTs is in [from, to). Used to
+     * recompute an activity-file day's step total from ALL its sessions, so a second file on the same day
+     * ADDS rather than clobbers — and re-importing a file is idempotent (its row's steps are replaced, not
+     * re-added, by [upsertWorkouts]). Returns 0 when no session in the range carried steps. Byte-parity
+     * with Swift WhoopStore `sumWorkoutSteps`.
+     */
+    @Query(
+        "SELECT COALESCE(SUM(steps), 0) FROM workout " +
+            "WHERE deviceId = :deviceId AND steps IS NOT NULL AND startTs >= :from AND startTs < :to"
+    )
+    suspend fun sumWorkoutSteps(deviceId: String, from: Long, to: Long): Int
+
+    /**
      * Apple-Health daily aggregates for days in [from, to] (lexicographic compare), oldest first.
      * Port of JournalWorkoutAppleCache.swift appleDaily(deviceId:from:to:).
      */
@@ -721,12 +817,24 @@ interface WhoopDao : DeviceRegistryDao {
     /** Max HR sample ts for a device, or null if none — the biometric data frontier.
      *  COALESCEs measured `hrSample` with the v26 PPG-derived `ppgHrSample` (#156) so a PPG-only
      *  offload (a v26 WHOOP 5 night with no measured HR) still advances the frontier, matching the
-     *  Swift reader (Reads.swift latestHrSampleTs). Both persist on the same per-second ts grid. */
+     *  Swift reader (Reads.swift latestHrSampleTs). Both persist on the same per-second ts grid.
+     *
+     *  Each arm is its OWN `SELECT MAX(ts)` rather than one `MAX(ts)` over a `UNION ALL` of the two
+     *  timestamp streams. SQLite's MIN/MAX optimization only fires on a bare `SELECT MAX(col)` that can
+     *  seek the last matching index entry; wrapping the columns in a compound subquery first makes the
+     *  planner materialize it and walk EVERY index entry for the device. Measured on Apple against a
+     *  746 MB store (3.1M hrSample rows) at 4.3–5.8 s for the old shape and 0.01–0.07 s for this one
+     *  (#908); Room is SQLite, so the same plan applies here, and this reader is on paths a user waits
+     *  on — FullDayChartScreen's land-on-the-latest-day effect and DataSourcesScreen's load.
+     *
+     *  Identical answer in every case: each scalar subquery is NULL when that stream has no rows for the
+     *  device, MAX() ignores NULLs, and both-empty stays NULL. Both arms are aliased because Room
+     *  verifies queries at compile time and only the first arm's names survive a compound select. */
     @Query(
-        "SELECT MAX(ts) FROM (" +
-            "SELECT ts FROM hrSample WHERE deviceId = :deviceId " +
+        "SELECT MAX(m) FROM (" +
+            "SELECT (SELECT MAX(ts) FROM hrSample WHERE deviceId = :deviceId) AS m " +
             "UNION ALL " +
-            "SELECT ts FROM ppgHrSample WHERE deviceId = :deviceId)",
+            "SELECT (SELECT MAX(ts) FROM ppgHrSample WHERE deviceId = :deviceId) AS m)",
     )
     suspend fun latestHrSampleTs(deviceId: String): Long?
 
@@ -788,6 +896,23 @@ interface WhoopDao : DeviceRegistryDao {
 
     @Query("DELETE FROM spo2Sample WHERE ts < :minTs OR ts > :maxTs")
     suspend fun pruneSpo2ByTs(minTs: Long, maxTs: Long): Int
+
+    // The instrumentation streams landed AFTER this heal was written and were never added to it, so a
+    // bad-clock strap's garbage-ts rows survived in them while every sibling stream above was cleaned.
+    // They are keyed by the SAME `ts` from the SAME type-47 ingest path, so there is no reason to exempt
+    // them. Legacy-rows only in practice (the #547 ingest gate now rejects an implausible ts before it is
+    // banked), which is why it went unnoticed. Swift twin: TimestampHeal.rawTables.
+    @Query("DELETE FROM sleepStateSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun pruneSleepStateByTs(minTs: Long, maxTs: Long): Int
+
+    @Query("DELETE FROM ppgWaveformSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun prunePpgWaveformByTs(minTs: Long, maxTs: Long): Int
+
+    @Query("DELETE FROM rawImuSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun pruneRawImuByTs(minTs: Long, maxTs: Long): Int
+
+    @Query("DELETE FROM v18AuxSample WHERE ts < :minTs OR ts > :maxTs")
+    suspend fun pruneV18AuxByTs(minTs: Long, maxTs: Long): Int
 
     @Query("DELETE FROM event WHERE ts < :minTs OR ts > :maxTs")
     suspend fun pruneEventByTs(minTs: Long, maxTs: Long): Int

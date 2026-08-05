@@ -30,6 +30,9 @@ struct StrandiOSApp: App {
     @AppStorage(ChartStyle.storageKey) private var chartStyleRaw = ChartStyle.titanium.rawValue
 
     init() {
+        // #1008: pin the pre-change Overnight-only default for existing installs before
+        // anything reads it. Idempotent; a no-op on fresh installs and after the first launch.
+        PuffinExperiment.migrateContinuousHrvOvernightDefault()
         #if DEBUG
         // DEBUG-only promo-screenshot harness: when launched with `--demo-hour <Int>`, pin Today to that
         // hour's day-cycle scene + a per-hour stat frame. No-op (active stays nil) when the arg is absent.
@@ -55,11 +58,17 @@ struct StrandiOSApp: App {
         UNUserNotificationCenter.current().delegate = NotificationPresenter.shared
         let model = AppModel()
         _model = StateObject(wrappedValue: model)
-        _health = StateObject(wrappedValue: HealthKitBridge(
+        let bridge = HealthKitBridge(
             repo: model.repo,
             appleDeviceId: model.appleDeviceId,
             noopDeviceId: model.deviceId
-        ))
+        )
+        _health = StateObject(wrappedValue: bridge)
+        // #1021: publish to Apple Health when an offload lands, not only on foreground entry - the
+        // scenePhase pass below starts the offload and wrote to Health in parallel with it, so a night
+        // synced on open only reached Health at the next launch. Weak so the scene owns the bridge's
+        // lifetime; the bridge no-ops unless Health was authorized.
+        model.healthWriteBack = { [weak bridge] in await bridge?.writeBackAfterNewData() }
     }
 
     var body: some Scene {
@@ -90,7 +99,9 @@ struct StrandiOSApp: App {
                     // Home/Lock widget and the watch snapshot use, so this fourth surface can't drift to a
                     // different day at the rollover (it previously read `days.last(where: recovery != nil)`,
                     // which kept pointing at yesterday's scored row after Today had moved on).
-                    let day = Repository.widgetAnchor(days: model.repo.days)
+                    // Memoized: this closure fires on EVERY live-HR tick, so re-deriving the anchor here
+                    // scanned the whole history + hit the DateFormatter lock ~1-3x/sec (#1051-shaped).
+                    let day = model.repo.cachedWidgetAnchor()
                     liveActivity.update(
                         bpm: model.live.connected ? (model.bpm ?? model.live.heartRate) : nil,
                         recovery: day?.recovery.map { Int($0.rounded()) },
@@ -101,8 +112,9 @@ struct StrandiOSApp: App {
                 // End the Live Activity the moment the link drops, even if no further HR tick arrives.
                 .onReceive(model.live.$connected) { isConnected in
                     // #911: same shared anchor as the heartRate site above, so the Live Activity, the
-                    // widget, the watch and Today never disagree about which day they describe.
-                    let day = Repository.widgetAnchor(days: model.repo.days)
+                    // widget, the watch and Today never disagree about which day they describe. Memoized
+                    // (shares the heartRate site's cache; recomputes only on a data refresh or day-roll).
+                    let day = model.repo.cachedWidgetAnchor()
                     liveActivity.update(
                         bpm: isConnected ? (model.bpm ?? model.live.heartRate) : nil,
                         recovery: day?.recovery.map { Int($0.rounded()) },

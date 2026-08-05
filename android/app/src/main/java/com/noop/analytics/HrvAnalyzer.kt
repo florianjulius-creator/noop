@@ -321,6 +321,12 @@ object HrvAnalyzer {
     enum class RrCoverageVerdict(val raw: String) {
         /** At or near 1.0 — the beat-time fits the wall clock. Nothing to explain. */
         PLAUSIBLE("plausible"),
+        /** Materially BELOW 1.0: beat-time is missing from the window. Not a clean night, and not an
+         *  over-count either — the analysis window silently is not the window it appears to be, because
+         *  beats that never arrived cannot be distinguished from beats that were never there. Same
+         *  principle as [UNMEASURABLE] below: claiming a capture was fine when a seventh of it is absent
+         *  is the opposite of what this verdict exists to do. (#977) */
+        UNDER_COVERED("underCovered"),
         /** Over-covered, but collapsing same-second duplicates brings it back in range: the extra beats
          *  share a timestamp, so a de-dup at that granularity would fix it. */
         SAME_SECOND_OVER_COUNT("sameSecondOverCount"),
@@ -339,12 +345,61 @@ object HrvAnalyzer {
      *  point of logging the verdict in the first place. Twin of Swift `coveragePlausibleCeiling`. */
     const val COVERAGE_PLAUSIBLE_CEILING: Double = 1.10
 
-    /** Classify a night from its coverage pair. Pure. Byte-parity twin of Swift `classifyCoverage`. */
-    /** Both platforms use the NEGATED `>` form rather than `<=` so a non-finite input lands identically:
+    /**
+     * Tolerance BELOW 1.0 treated as "fits", the mirror of [COVERAGE_PLAUSIBLE_CEILING]. Same allowance,
+     * same caveat: a ROUNDING allowance rather than a tuned threshold, because whole-second timestamps
+     * under-report as easily as they over-report. Where the real boundary sits still needs coverage
+     * figures from several wearers — IntelligenceEngine already logs `coverage` in the `hrv diag` line,
+     * so that distribution can be gathered from traces that already exist. (#977)
+     *
+     * Deliberately symmetric rather than fitted: picking a number between the reported 0.859 and the
+     * 0.89 of #803's capture would be choosing a threshold to match one corpus, which is what the
+     * ceiling's own comment warns against.
+     *
+     * DERIVED rather than written as 0.90 so it cannot drift if the ceiling moves. IEEE-754 makes the
+     * result 0.8999999999999999, not exactly 0.90, because 1.10 - 1.0 is not exactly 0.10 - harmless
+     * (a night at exactly 0.90 is still above it) and identical on both platforms, since both fold the
+     * same double arithmetic. Symmetry with the ceiling is the property worth keeping; the last bit is
+     * not. Byte-parity twin of Swift `coveragePlausibleFloor`.
+     */
+    const val COVERAGE_PLAUSIBLE_FLOOR: Double = 1.0 - (COVERAGE_PLAUSIBLE_CEILING - 1.0)
+
+    /**
+     * Whether a window's BEAT-SPREAD statistics — SDNN, and anything derived from it — can be trusted,
+     * given that window's coverage verdict. Pure. Byte-parity twin of Swift `beatSpreadIsTrustworthy`.
+     *
+     * SDNN is the standard deviation of EVERY NN interval in the window, so a capture that holds some
+     * beats twice reports a spread no heart produced. It is not a subtle bias: measured on a ring whose
+     * banked R-R covers 1.25x the wall-clock it spans, a sleeping night reads **197 ms** against a
+     * 40-100 ms physiological range, and the app had no way to refuse the number — [classifyCoverage]
+     * already knew the capture was over-counted, but nothing acted on it.
+     *
+     * Only the two OVER-COUNT verdicts gate. UNDER_COVERED and UNMEASURABLE stay trusted: neither
+     * duplicates a beat. UNMEASURABLE in particular is what a LIVE spot reading looks like — beats
+     * arriving in real time, carrying no timestamps to measure coverage with — and suppressing those
+     * would refuse honest readings, the opposite of the point.
+     *
+     * Successive-difference statistics (RMSSD, pNN50) are deliberately NOT gated here. Their dominant
+     * error on a banked stream was the lost within-second emission order (#823, root-caused in #1072),
+     * which is fixed at the write path; whether they need a gate of their own is a question for a
+     * post-fix capture to answer, not an assumption to bake in now.
+     */
+    fun beatSpreadIsTrustworthy(verdict: RrCoverageVerdict): Boolean = when (verdict) {
+        RrCoverageVerdict.SAME_SECOND_OVER_COUNT, RrCoverageVerdict.CROSS_SECOND_OVER_COUNT -> false
+        RrCoverageVerdict.PLAUSIBLE, RrCoverageVerdict.UNDER_COVERED,
+        RrCoverageVerdict.UNMEASURABLE -> true
+    }
+
+    /** Classify a night from its coverage pair. Pure. Byte-parity twin of Swift `classifyCoverage`.
+     *
+     *  Both platforms use the NEGATED `>` form rather than `<=` so a non-finite input lands identically:
      *  every IEEE-754 comparison with NaN is false, so `<=` and `>` are not each other's inverse there and
      *  the twins would otherwise disagree. NaN falls to UNMEASURABLE on both. */
     fun classifyCoverage(coverage: Double, collapsed: Double): RrCoverageVerdict {
         if (!(coverage > 0.0)) return RrCoverageVerdict.UNMEASURABLE
+        // #977: the floor is tested BEFORE the ceiling so the negated-`>` NaN convention above still
+        // holds — a non-finite coverage has already left via UNMEASURABLE and cannot reach here.
+        if (!(coverage >= COVERAGE_PLAUSIBLE_FLOOR)) return RrCoverageVerdict.UNDER_COVERED
         if (!(coverage > COVERAGE_PLAUSIBLE_CEILING)) return RrCoverageVerdict.PLAUSIBLE
         return if (collapsed > COVERAGE_PLAUSIBLE_CEILING) RrCoverageVerdict.CROSS_SECOND_OVER_COUNT
         else RrCoverageVerdict.SAME_SECOND_OVER_COUNT

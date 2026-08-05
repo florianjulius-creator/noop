@@ -80,7 +80,12 @@ public enum OuraDecoders {
     /// byte-scatter layout, cross-checked against the same capture, yields a coherent ~60 bpm train
     /// (10% jump rate) that tracks the night's sleep stages and its day/night dip. Validated against
     /// the `open_oura` decompiled `parse_api_ibi_and_amplitude_event`.
-    public static func decodeIBIAmplitude(_ rec: OuraRecord) -> [OuraIBI]? {
+    /// - Parameter channel: which tag's record this is. 0x60 and 0x44 share this layout byte for byte,
+    ///   so they share the decoder — but they are different tags on the wire, and the caller states
+    ///   which one it routed here so the beat carries its true origin (#1071 follow-up). Defaults to
+    ///   0x60's channel, which is what every existing call site means.
+    public static func decodeIBIAmplitude(_ rec: OuraRecord,
+                                          channel: OuraIBIChannel = .ibiAmplitude) -> [OuraIBI]? {
         let b = rec.payload
         guard b.count >= 14 else { return nil }   // fixed 14-byte packet (body bytes 6..19)
         let b12 = Int(b[12]), b13 = Int(b[13])
@@ -98,7 +103,8 @@ public enum OuraDecoders {
         for k in 0..<6 {
             guard ibi[k] > 0 else { continue }                 // drop a zero IBI, never invent one
             let amp = (Int(b[6 + k]) >> 1) << shift            // 7-bit mantissa << exponent
-            out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi[k], amplitude: amp))
+            out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi[k], amplitude: amp,
+                               channel: channel))
         }
         return out.isEmpty ? nil : out
     }
@@ -165,7 +171,8 @@ public enum OuraDecoders {
             let ibi = (Int(b[i + 1]) & 0x07) | (Int(b[i]) << 3)   // high byte first
             let quality = (Int(b[i + 1]) >> 3) & 0x03
             if quality == 1 && ibi >= 300 && ibi <= 2000 {
-                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi))
+                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi,
+                                   channel: .greenQuality))
             }
             i += 2
             sampleCount += 1
@@ -192,7 +199,7 @@ public enum OuraDecoders {
         while idx >= 1 {
             let ibi = Int(b[idx]) * 8                  // 8-bit count x8 -> ms
             if ibi > 0 {
-                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi))
+                out.append(OuraIBI(ringTimestamp: rec.ringTimestamp, ibiMs: ibi, channel: .spo2Ibi))
             }
             idx -= 1
         }
@@ -224,6 +231,18 @@ public enum OuraDecoders {
     /// Decode the 0x6F spo2_event: byte6 bits [7:4]=SpO2 base/status field, [3:0]=status flag; then one
     /// uint8 SpO2 value per second from byte7 onward (optional 0xFF terminator). Per OURA_PROTOCOL.md
     /// s6.5. Returns nil on a short body.
+    ///
+    /// UNIT TAG: these samples carry the default `unit: "raw"`, which is a legacy CHANNEL label, not a
+    /// claim about the quantity — 0x6F is a firmware-computed PERCENTAGE (s6.5, corroborated by
+    /// open_oura), unlike 0x77 which really is a raw DC channel and tags itself `"dc_raw"`. The string
+    /// is deliberately left alone: it is a persisted column (`Database.swift` spo2 `unit`), no consumer
+    /// branches on it (only the CLI dump and one log line read it), and rewriting it would split stored
+    /// history across two spellings of the same channel for a cosmetic gain. Kotlin matches exactly.
+    ///
+    /// s6.5 also records an OPEN ISSUE: ~47% of decoded 0x6F samples exceed 100%, which no ground truth
+    /// yet explains, so no offset is applied here — a guessed calibration would be worse than the gap.
+    /// These land in the RAW channel (`SpO2Sample.red`), never in `spo2Pct`, so an impossible value is
+    /// not surfaced as a Blood Oxygen reading.
     public static func decodeSpO2PerSample(_ rec: OuraRecord) -> [OuraSpO2]? {
         let b = rec.payload
         guard b.count >= 2 else { return nil }
@@ -235,10 +254,24 @@ public enum OuraDecoders {
         while i < b.count {
             let raw = Int(b[i])
             if raw == 0xFF { break }                  // terminator
-            out.append(OuraSpO2(ringTimestamp: rec.ringTimestamp, value: raw))
+            // The samples are one PER SECOND, so each carries its position in the record: `ringTimestamp`
+            // stays the record's anchor and the consumer spreads them over their own seconds. Without the
+            // position the offset is unrecoverable downstream and 12 of every 13 samples collide away on
+            // the `(deviceId, ts)` primary key (#1070).
+            out.append(OuraSpO2(ringTimestamp: rec.ringTimestamp, value: raw, index: out.count))
             i += 1
         }
-        return out.isEmpty ? nil : out
+        return out.isEmpty ? nil : stampSampleCount(out)
+    }
+
+    /// Fill in `count` (the number of samples the record yielded) on every sample of one record. The
+    /// total is only known once the body has been walked, so the decoders stamp `index` inline and the
+    /// count in one pass at the end.
+    private static func stampSampleCount(_ samples: [OuraSpO2]) -> [OuraSpO2] {
+        let n = samples.count
+        return samples.map {
+            OuraSpO2(ringTimestamp: $0.ringTimestamp, value: $0.value, unit: $0.unit, index: $0.index, count: n)
+        }
     }
 
     // MARK: - SpO2 stable, BIG-endian (0x7B; s6.6)
@@ -272,16 +305,18 @@ public enum OuraDecoders {
         }
         var out: [OuraSpO2] = []
         if hasBase {
-            out.append(OuraSpO2(ringTimestamp: rec.ringTimestamp, value: acc, unit: "dc_raw"))
+            out.append(OuraSpO2(ringTimestamp: rec.ringTimestamp, value: acc, unit: "dc_raw", index: 0))
         }
         while i < b.count {
             let v = Int(Int8(bitPattern: b[i]))
             let mag = abs(v) << scale
             acc += (v < 0) ? -mag : mag
-            out.append(OuraSpO2(ringTimestamp: rec.ringTimestamp, value: acc, unit: "dc_raw"))
+            // Same per-sample position as 0x6F (see #1070): this record is multi-sample too, and its
+            // samples reach the same `(deviceId, ts)`-keyed table, so they collide the same way.
+            out.append(OuraSpO2(ringTimestamp: rec.ringTimestamp, value: acc, unit: "dc_raw", index: out.count))
             i += 1
         }
-        return out.isEmpty ? nil : out
+        return out.isEmpty ? nil : stampSampleCount(out)
     }
 
     // MARK: - Temperature (0x46 / 0x69 / 0x75; s6.8)

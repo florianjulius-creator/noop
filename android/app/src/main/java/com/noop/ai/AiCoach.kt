@@ -67,6 +67,7 @@ class AiCoach(private val repo: WhoopRepository) {
         model: String,
         consent: Boolean = false,
         customBaseUrl: String = "",
+        customAuthHeader: CustomAiAuthHeader = CustomAiAuthHeader.BEARER,
         includeSignals: Boolean = false,
     ): String = withContext(Dispatchers.IO) {
         // Local (Custom) servers usually need no key; the cloud providers always do. The guarded read
@@ -125,7 +126,15 @@ class AiCoach(private val repo: WhoopRepository) {
             AiProvider.GEMINI ->
                 callGemini(provider, model, key!!, grounded, systemPrompt)
             AiProvider.CUSTOM ->
-                callOpenAiCompatible(provider, customChatUrl(customBaseUrl), model, key, grounded, systemPrompt)
+                callOpenAiCompatible(
+                    provider,
+                    customChatUrl(customBaseUrl),
+                    model,
+                    key,
+                    grounded,
+                    systemPrompt,
+                    customAuthHeader,
+                )
         }
     }
 
@@ -158,6 +167,7 @@ class AiCoach(private val repo: WhoopRepository) {
         ctx: Context,
         provider: AiProvider,
         customBaseUrl: String = "",
+        customAuthHeader: CustomAiAuthHeader = CustomAiAuthHeader.BEARER,
     ): List<String> = withContext(Dispatchers.IO) {
         // Guarded read: only a key saved for THIS provider (or a legacy cloud key) is used, never one
         // provider's key against another's models endpoint.
@@ -184,7 +194,7 @@ class AiCoach(private val repo: WhoopRepository) {
                 builder.addHeader("anthropic-version", "2023-06-01")
             }
             AiProvider.GEMINI -> builder.addHeader("x-goog-api-key", key!!)
-            AiProvider.CUSTOM -> if (!key.isNullOrBlank()) builder.addHeader("Authorization", "Bearer $key")
+            AiProvider.CUSTOM -> applyCustomAuthHeader(builder, key, customAuthHeader)
         }
 
         runCatching {
@@ -195,21 +205,7 @@ class AiCoach(private val repo: WhoopRepository) {
             // parse; every other provider is OpenAI-shaped ({"data":[{"id":"…"}]}).
             if (provider == AiProvider.GEMINI) return@runCatching parseGeminiModels(text)
 
-            val data = JSONObject(text).optJSONArray("data") ?: return@runCatching emptyList<String>()
-            val ids = ArrayList<String>(data.length())
-            for (i in 0 until data.length()) {
-                val id = data.optJSONObject(i)?.optString("id")?.trim().orEmpty()
-                if (id.isEmpty()) continue
-                val keep = when (provider) {
-                    AiProvider.OPENAI -> id.startsWith("gpt") || id.startsWith("o")
-                    // Anthropic + a local server name models freely → keep all.
-                    AiProvider.ANTHROPIC, AiProvider.CUSTOM -> true
-                    // GEMINI returned early above.
-                    AiProvider.GEMINI -> true
-                }
-                if (keep) ids.add(id)
-            }
-            ids.distinct()
+            parseOpenAiCompatibleModels(provider, text)
         }.getOrDefault(emptyList())
     }
 
@@ -382,6 +378,7 @@ class AiCoach(private val repo: WhoopRepository) {
         key: String?,
         history: List<ChatMsg>,
         systemPrompt: String,
+        customAuthHeader: CustomAiAuthHeader = CustomAiAuthHeader.BEARER,
     ): String {
         val messages = JSONArray()
         messages.put(JSONObject().put("role", "system").put("content", systemPrompt))
@@ -390,30 +387,44 @@ class AiCoach(private val repo: WhoopRepository) {
             messages.put(JSONObject().put("role", m.role).put("content", m.text))
         }
 
-        val body = JSONObject()
-            .put("model", model)
-            .put("messages", messages)
-            .put("temperature", 0.6)
-            .put("max_tokens", 900)
-            .toString()
+        val (code, text) = executeOpenAiCompatible(
+            provider = provider,
+            url = url,
+            model = model,
+            messages = messages,
+            key = key,
+            customAuthHeader = customAuthHeader,
+            modernParams = false,
+        )
+        val responseText = if (code in 200..299) {
+            text
+        } else if (code == 400 && shouldRetryOpenAiModernParams(text)) {
+            val (retryCode, retryText) = executeOpenAiCompatible(
+                provider = provider,
+                url = url,
+                model = model,
+                messages = messages,
+                key = key,
+                customAuthHeader = customAuthHeader,
+                modernParams = true,
+            )
+            if (retryCode !in 200..299) throw httpError(provider, retryCode, retryText)
+            retryText
+        } else {
+            throw httpError(provider, code, text)
+        }
 
-        val builder = Request.Builder()
-            .url(url)
-            .addHeader("Content-Type", "application/json")
-            .post(body.toRequestBody(JSON))
-        if (!key.isNullOrBlank()) builder.addHeader("Authorization", "Bearer $key")
-
-        val (code, text) = execute(builder.build())
-        if (code !in 200..299) throw httpError(provider, code, text)
-
-        val json = parse(text)
+        val json = parse(responseText)
         val firstChoice = json.optJSONArray("choices")?.optJSONObject(0)
         val content = firstChoice
             ?.optJSONObject("message")
             ?.optString("content")
             ?.trim()
 
-        if (content.isNullOrEmpty()) throw Exception("The provider returned an empty reply. Please try again.")
+        // Empty assistant content on a 200: some OpenAI-compatible servers (notably a model set by hand
+        // that the provider doesn't offer) return the real error INSIDE a 200 body rather than a 4xx, so
+        // surface it instead of a blanket "empty reply" that hides the cause (#1074).
+        if (content.isNullOrEmpty()) throw Exception(emptyReplyMessage(responseText))
 
         // Local servers (notably Ollama) stop with finish_reason "length" at the context-window edge
         // and give NO error, keep the partial text and append the actionable notice so it isn't silent.
@@ -421,8 +432,64 @@ class AiCoach(private val repo: WhoopRepository) {
         return if (truncated) content + TRUNCATION_NOTE else content
     }
 
+    private fun executeOpenAiCompatible(
+        provider: AiProvider,
+        url: String,
+        model: String,
+        messages: JSONArray,
+        key: String?,
+        customAuthHeader: CustomAiAuthHeader,
+        modernParams: Boolean,
+    ): Pair<Int, String> {
+        val body = JSONObject()
+            .put("model", model)
+            .put("messages", messages)
+        if (modernParams) {
+            // #1074: same 4096 cap as the standard path below. This modern-params leg fronts REASONING
+            // models, which count hidden thinking tokens against max_completion_tokens — so 900 starved
+            // them into truncated/empty replies even more readily. A cap, not a target.
+            body.put("max_completion_tokens", 4096)
+        } else {
+            body.put("temperature", 0.6)
+            // #1074: 900 truncated detailed coaching replies mid-sentence on cloud providers (the reporter
+            // hit it on a DeepSeek "pro" model). 4096 lets a full multi-section reply complete; it is a cap,
+            // not a target, so short answers are unaffected. Matches the Gemini leg's maxOutputTokens.
+            body.put("max_tokens", 4096)
+        }
+
+        val builder = Request.Builder()
+            .url(url)
+            .addHeader("Content-Type", "application/json")
+            .post(body.toString().toRequestBody(JSON))
+        when (provider) {
+            AiProvider.CUSTOM -> applyCustomAuthHeader(builder, key, customAuthHeader)
+            else -> if (!key.isNullOrBlank()) builder.addHeader("Authorization", "Bearer $key")
+        }
+        return execute(builder.build())
+    }
+
+    private fun applyCustomAuthHeader(
+        builder: Request.Builder,
+        key: String?,
+        customAuthHeader: CustomAiAuthHeader,
+    ) {
+        if (key.isNullOrBlank()) return
+        when (customAuthHeader) {
+            CustomAiAuthHeader.BEARER -> builder.addHeader("Authorization", "Bearer $key")
+            CustomAiAuthHeader.X_API_KEY -> builder.addHeader("x-api-key", key)
+        }
+    }
+
+    private fun shouldRetryOpenAiModernParams(text: String): Boolean {
+        val detail = runCatching { parse(text).toString() }.getOrDefault(text).lowercase()
+        return detail.contains("max_completion_tokens") ||
+            detail.contains("max_tokens") ||
+            detail.contains("temperature") ||
+            detail.contains("unsupported")
+    }
+
     /** Base for the Custom provider, the user's URL with any trailing slashes trimmed. */
-    private fun customBase(url: String): String = url.trim().trimEnd('/')
+    private fun customBase(url: String): String = normalizeCustomBaseUrl(url)
 
     private fun customChatUrl(url: String): String {
         val base = customBase(url)
@@ -481,7 +548,7 @@ class AiCoach(private val repo: WhoopRepository) {
 
         val body = JSONObject()
             .put("model", model)
-            .put("max_tokens", 900)
+            .put("max_tokens", 4096)   // #1074: 900 truncated detailed replies; a cap, not a target
             .put("system", systemPrompt)
             .put("messages", messages)
             .toString()
@@ -503,7 +570,7 @@ class AiCoach(private val repo: WhoopRepository) {
             ?.optString("text")
             ?.trim()
 
-        if (content.isNullOrEmpty()) throw Exception("The provider returned an empty reply. Please try again.")
+        if (content.isNullOrEmpty()) throw Exception(emptyReplyMessage(text))
         return content
     }
 
@@ -562,7 +629,7 @@ class AiCoach(private val repo: WhoopRepository) {
             if (parts != null) for (i in 0 until parts.length()) append(parts.optJSONObject(i)?.optString("text").orEmpty())
         }.trim()
 
-        if (reply.isEmpty()) throw Exception("The provider returned an empty reply. Please try again.")
+        if (reply.isEmpty()) throw Exception(emptyReplyMessage(text))
         return reply
     }
 
@@ -650,6 +717,44 @@ class AiCoach(private val repo: WhoopRepository) {
         private val JSON = "application/json; charset=utf-8".toMediaType()
 
         /**
+         * Normalise a user-entered Custom base URL: trim, drop a trailing slash, and tolerate a pasted
+         * FULL chat URL by stripping a trailing OpenAI-style chat path. So the derived `/chat/completions`
+         * and `/models` endpoints resolve whether the user pasted the API root (`https://api.deepseek.com`
+         * or `.../v1`) OR the whole chat URL (`.../v1/chat/completions`) — the latter otherwise made the
+         * model scan hit `.../chat/completions/models` and silently return nothing (#1074). Pure → tested.
+         */
+        internal fun normalizeCustomBaseUrl(url: String): String {
+            var base = url.trim().trimEnd('/')
+            for (suffix in listOf("/chat/completions", "/completions")) {
+                if (base.endsWith(suffix, ignoreCase = true)) {
+                    base = base.dropLast(suffix.length).trimEnd('/')
+                    break
+                }
+            }
+            return base
+        }
+
+        /**
+         * The user-facing message for a 200 response whose assistant content is empty (#1074). Some
+         * OpenAI-compatible servers (e.g. a hand-set model the provider doesn't offer) return the real
+         * error INSIDE a 200 body rather than as a 4xx; surface that here instead of a blanket "empty
+         * reply" so the cause is visible. Falls back to a hint about the hand-set model otherwise.
+         * Pure + `internal` so it is unit-testable without a network. Same `{"error":{"message":…}}`
+         * shape [extractApiErrorMessage] reads.
+         */
+        internal fun emptyReplyMessage(body: String): String {
+            val providerError = runCatching {
+                JSONObject(body).optJSONObject("error")?.optString("message")?.takeIf { it.isNotBlank() }
+            }.getOrNull()
+            return if (providerError != null) {
+                "The provider returned an error: $providerError"
+            } else {
+                "The provider returned an empty reply. If you set a custom model by hand, check that " +
+                    "the model name is one the provider actually offers."
+            }
+        }
+
+        /**
          * Pure: unwrap Gemini's `{"models":[{"name":"models/…"}]}` into chat-capable ids. Strips the
          * `models/` prefix, keeps `gemini*` only (drops embedding / AQA models). Byte-for-byte twin of
          * the Swift `GeminiClient.parseModels`, so both platforms surface the same fetched catalogue.
@@ -663,6 +768,40 @@ class AiCoach(private val repo: WhoopRepository) {
                 if (name.isEmpty()) continue
                 val id = if (name.startsWith("models/")) name.removePrefix("models/") else name
                 if (id.startsWith("gemini") && !id.contains("embedding") && !id.contains("aqa")) ids.add(id)
+            }
+            return ids.distinct()
+        }
+
+        /**
+         * Pure: unwrap OpenAI-compatible `/models` ids. Custom gateways may return either the normal
+         * `data[].id` envelope or a gateway catalog with `catalog[].models`; keep all Custom ids.
+         */
+        internal fun parseOpenAiCompatibleModels(provider: AiProvider, text: String): List<String> {
+            val json = runCatching { JSONObject(text) }.getOrNull() ?: return emptyList()
+            val data = json.optJSONArray("data")
+            if (data != null) {
+                val ids = ArrayList<String>(data.length())
+                for (i in 0 until data.length()) {
+                    val id = data.optJSONObject(i)?.optString("id")?.trim().orEmpty()
+                    if (id.isEmpty()) continue
+                    val keep = when (provider) {
+                        AiProvider.OPENAI -> id.startsWith("gpt") || id.startsWith("o")
+                        AiProvider.ANTHROPIC, AiProvider.CUSTOM -> true
+                        AiProvider.GEMINI -> true
+                    }
+                    if (keep) ids.add(id)
+                }
+                return ids.distinct()
+            }
+
+            val catalog = json.optJSONArray("catalog") ?: return emptyList()
+            val ids = ArrayList<String>()
+            for (i in 0 until catalog.length()) {
+                val models = catalog.optJSONObject(i)?.optJSONArray("models") ?: continue
+                for (j in 0 until models.length()) {
+                    val id = models.optString(j).trim()
+                    if (id.isNotEmpty()) ids.add(id)
+                }
             }
             return ids.distinct()
         }
@@ -711,17 +850,15 @@ class AiCoach(private val repo: WhoopRepository) {
         const val MAX_HISTORY_TURNS = 10
 
         /**
-         * Appended to a reply when the server stopped early because it ran out of context window.
-         * Local OpenAI-compatible servers (notably Ollama, which defaults to a 2048-token window and
-         * IGNORES `num_ctx` on the `/v1` endpoint) truncate silently, no error, the text just stops
-         * mid-sentence. We can't raise the window over the OpenAI wire format, so we make the cutoff
-         * visible and tell the user exactly how to fix it.
+         * Appended to a reply that stopped early with `finish_reason == "length"` — it reached the
+         * response-length cap (`max_tokens`, now 4096) or, on a local server (e.g. Ollama's default
+         * 2048-token window), the model's own limit. Either way the text just stops mid-sentence with no
+         * error, so make the cutoff visible. Kept provider-agnostic: the old note gave Ollama-specific
+         * `num_ctx` instructions that were wrong for cloud providers like the #1074 DeepSeek report.
          */
         const val TRUNCATION_NOTE =
-            "\n\n---\n*Reply cut off: the model hit its context-window limit. " +
-                "On a local server like Ollama (default 2048 tokens), raise it - create a Modelfile " +
-                "with `PARAMETER num_ctx 8192` and select that model, or set " +
-                "`OLLAMA_CONTEXT_LENGTH=8192` and relaunch Ollama - then ask again.*"
+            "\n\n---\n*Reply cut off at the response-length limit. Ask a more specific question for a " +
+                "shorter, complete answer — or, on a local server (e.g. Ollama), raise its context window.*"
 
         /**
          * Pure: sliding-window the chat. Returns everything when short; otherwise the first user turn

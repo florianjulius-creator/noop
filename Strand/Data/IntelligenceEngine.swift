@@ -747,7 +747,17 @@ final class IntelligenceEngine: ObservableObject {
                     // from a cross-second one (it would not) — a rule that lived only in the comment above,
                     // so triaging an "HRV reads ~2x high" report required knowing it. Now the line says which.
                     let verdict = HRVAnalyzer.classifyCoverage(coverage: covVal, collapsed: colCovVal)
-                    hrvDiag = "hrv diag day=\(res.daily.day) rmssd=\(ms(h.rmssd))ms sdnn=\(ms(h.sdnn))ms "
+                    // #550 follow-up: having stated the conclusion, ACT on it. SDNN is a spread over every
+                    // interval, so an over-counted night inflates it directly — a ring whose banked R-R
+                    // covers 1.25x its wall-clock reads ~197 ms across a sleeping night, against a 40-100 ms
+                    // physiological range. Printing that number beside the verdict that says it cannot be
+                    // trusted invites it to be read as a measurement, so it is withheld instead; the
+                    // `rrIntegrity=` field on the same line says why. RMSSD/meanNN are NOT withheld — mean
+                    // rate survives an over-count, and RMSSD's dominant error was the emission order fixed
+                    // at the write path (#1072).
+                    let sdnnField = HRVAnalyzer.beatSpreadIsTrustworthy(verdict)
+                        ? "\(ms(h.sdnn))ms" : "withheld"
+                    hrvDiag = "hrv diag day=\(res.daily.day) rmssd=\(ms(h.rmssd))ms sdnn=\(sdnnField) "
                         + "meanNN=\(ms(h.meanNN))ms rr=\(h.nInput)/\(h.nClean) rejected=\(rej)% coverage=\(cov) collapsedCov=\(colCov) dupBeats=\(dup) "
                         + "rrIntegrity=\(verdict.rawValue)"
                 }
@@ -1485,7 +1495,16 @@ final class IntelligenceEngine: ObservableObject {
         // #137: a manually-started workout is scored from sparse live HR at save time , near-zero
         // calories/strain on a 5/MG. Now that offloaded HR may cover the window, re-score the
         // under-sampled ones from that denser data.
-        await rescoreManualWorkouts(store: store, profile: up)
+        // #950: score the workout against the wearer's MEASURED resting HR, not the hardcoded 60 —
+        // the day total above already uses the measured value, and the mismatch is what made a workout's
+        // Effort incomparable to its own day's. The most recent scored day that has one is the best
+        // available estimate; nil (cold start) keeps the old default. Twin of the Kotlin derivation.
+        // FIRST, not last: `out` is NEWEST-FIRST, because the scoring loop counts backwards from today
+        // (`for offset in 0..<maxDays` with `dayStart = nowLocalMidnight - offset * 86_400`), so out[0] is
+        // today and the tail is the oldest day in the window. Taking the last match would have scored
+        // today's workout against a resting HR up to `maxDays` old.
+        let measuredResting = out.first(where: { $0.rhr != nil })?.rhr.map(Double.init)
+        await rescoreManualWorkouts(store: store, profile: up, restingHR: measuredResting)
 
         results = out
         note = out.isEmpty
@@ -1597,7 +1616,8 @@ final class IntelligenceEngine: ObservableObject {
     /// window, recompute from it. Conservative + idempotent: only `manual` rows that look under-scored
     /// (negligible calories), and only when the recompute is a genuine improvement , so a well-scored
     /// 4.0 workout is never touched and a still-sparse window is a no-op.
-    private func rescoreManualWorkouts(store: WhoopStore, profile up: UserProfile) async {
+    private func rescoreManualWorkouts(store: WhoopStore, profile up: UserProfile,
+                                       restingHR: Double? = nil) async {
         let now = Int(Date().timeIntervalSince1970)
         let since = now - 14 * 86_400
         guard let rows = try? await store.workouts(deviceId: deviceId, from: since, to: now, limit: 200)
@@ -1611,7 +1631,8 @@ final class IntelligenceEngine: ObservableObject {
             && (ManualWorkoutRescore.looksUnderScored(currentKcal: row.energyKcal) || row.strain == nil) {
             guard let samples = try? await store.hrSamples(deviceId: deviceId, from: row.startTs,
                                                            to: row.endTs, limit: 20_000),
-                  let s = ManualWorkoutRescore.scored(windowSamples: samples, profile: up, hrMax: hrMax),
+                  let s = ManualWorkoutRescore.scored(windowSamples: samples, profile: up, hrMax: hrMax,
+                                                      restingHR: restingHR),
                   ManualWorkoutRescore.improves(s, over: row.energyKcal, currentStrain: row.strain,
                                                 allowStrainOnlyFill: true)
             else { continue }
