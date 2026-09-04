@@ -44,9 +44,9 @@ generates + pushes; it no longer posts a notification.
 
 ### Shared (`Packages/StrandDesign`)
 
-- `WatchScoreSnapshot` gains seven optional, wire-compatible fields (same pattern as `hrvMs`):
-  `restingHr: Int?`, `hrvBaselineMs: Int?`, `sleepMin: Int?`, `sleepEfficiencyPct: Int?`,
-  `briefing: String?`, `briefingDay: String?`, `briefingStatus: String?`.
+- `WatchScoreSnapshot` gains eight optional, wire-compatible fields (same pattern as `hrvMs`):
+  `restingHr: Int?`, `restingHrBaseline: Int?`, `hrvBaselineMs: Int?`, `sleepMin: Int?`,
+  `sleepEfficiencyPct: Int?`, `briefing: String?`, `briefingDay: String?`, `briefingStatus: String?`.
 - `MorningMoment` (pure struct, no SwiftUI): snapshot + `now` → display state.
   - `scoreState`: `.fresh(recovery:sleep:)` when `scoreDay` is today's local day; `.notScored`
     otherwise (rings empty, dash, hint "Nacht nog niet gesynct — open The Machine op je iPhone").
@@ -56,13 +56,13 @@ generates + pushes; it no longer posts a notification.
     is missing or baseline is 0.
   - `briefingText: String?` only when `briefingDay` equals `scoreDay` (never yesterday's text
     under today's rings).
-  - Contributor bars (0…1): HRV = clamp(hrvMs / (1.25 × baseline)); RHR = clamp(baseline / RHR);
-    Sleep = rest / 100. Each nil when inputs are missing (bar hidden).
+  - Contributor bars (0…1): HRV = clamp(hrvMs / (1.25 × hrvBaselineMs)); RHR =
+    clamp(restingHrBaseline / restingHr); Sleep = rest / 100. Each nil when inputs are missing (bar hidden).
 
 ### iPhone (`Strand/Data/WatchSessionBridge.swift`, `StrandiOS/App/MorningBriefing.swift`)
 
 - `buildSnapshot` fills the new fields from the same anchor day the widget uses: `restingHr`,
-  30-day `hrvBaselineMs` (same average `MorningBriefing.buildContext` computes — extract that into
+  30-day `restingHrBaseline` and `hrvBaselineMs` (same average `MorningBriefing.buildContext` computes — extract that into
   one shared helper), `sleepMin`, `sleepEfficiencyPct`, plus `briefing`/`briefingDay`/
   `briefingStatus` from `MorningBriefing` storage.
 - `headlineChanged` counts the new fields except `briefingStatus`.
@@ -119,11 +119,11 @@ generates + pushes; it no longer posts a notification.
 
 ## Testing
 
-- `StrandDesign` package tests: snapshot round-trip with the seven fields + legacy payload
+- `StrandDesign` package tests: snapshot round-trip with the eight fields + legacy payload
   decodes to nil; `MorningMoment` states (fresh / not scored / stale / no briefing / yesterday's
   briefing suppressed / verdict thresholds / HRV delta / bars).
-- `StrandTests` (macOS): `MorningBriefing` status strings per exit path (pure helpers), the T − 10
-  min derivation, `headlineChanged` with the new fields.
+- `BriefingStatus` texts and the T − 10 min derivation live in `StrandDesign` (pure) and are
+  tested there; `headlineChanged` is iOS-only and verified by the Release compile + device run.
 - Simulator: `.apns` payload with `"category": "MORNING"` on the NOOPWatch scheme renders the long
   look with the DEBUG demo snapshot.
 - Device: `Tools/install-device.sh`; on the Watch "Rapport nu" → status shows OK or the reason;
