@@ -17,9 +17,12 @@ import StrandDesign
 
 @main
 struct NOOPWatchApp: App {
-    // Created once for the app's lifetime. The store activates WCSession on init so a snapshot the
-    // phone sent while the app was backgrounded is delivered as soon as we come up.
-    @StateObject private var store = WatchScoreStore()
+    // Launch hook (arms the morning notification + refresh) and background-task dispatch.
+    @WKApplicationDelegateAdaptor(WatchAppDelegate.self) private var delegate
+    // The ONE store (shared with the notification scene + background refresh). It activates WCSession
+    // on init so a snapshot the phone sent while the app was backgrounded is delivered as soon as we
+    // come up.
+    @StateObject private var store = WatchScoreStore.shared
     @StateObject private var liveHR = WatchLiveHR()
 
     init() {
@@ -37,6 +40,10 @@ struct NOOPWatchApp: App {
                 // tokens resolve their dark values here, so the rings read on the near-black canvas.
                 .preferredColorScheme(.dark)
         }
+        // The morning long look: any local notification with category MORNING renders
+        // MorningMomentView instead of the plain title/body.
+        WKNotificationScene(controller: MorningNotificationController.self,
+                            category: MorningScheduler.category)
     }
 
     // Normally the glance. In DEBUG only, a NOOP_DEMO_SCREEN env var can root the app directly at one of
@@ -64,11 +71,20 @@ struct NOOPWatchApp: App {
     /// is compiled out of release builds, so it can never ship.
     static func seedDemoSnapshotIfNeeded() {
         guard WatchScoreSnapshot.load() == nil else { return }
-        let demo = WatchScoreSnapshot(charge: 72, chargeCalibrating: false,
+        let today = WatchScoreSnapshot.localDayKey(Date())
+        var demo = WatchScoreSnapshot(charge: 78, chargeCalibrating: false,
                                       effort: 61, effortCalibrating: false,
                                       rest: 84, restCalibrating: false,
-                                      hr: 58, sleepSummary: "7h 12m",
-                                      asOf: Date())
+                                      hr: 58, sleepSummary: "7h 12m · 91%",
+                                      asOf: Date(), scoreDay: today, hrvMs: 62)
+        demo.restingHr = 49
+        demo.restingHrBaseline = 51
+        demo.hrvBaselineMs = 58
+        demo.sleepMin = 432
+        demo.sleepEfficiencyPct = 91
+        demo.briefing = "Je staat er goed voor: HRV boven je baseline en rustpols lager dan gemiddeld, met een volle nacht. De geplande JOIN-training kan vol."
+        demo.briefingDay = today
+        demo.briefingStatus = "OK 06:52"
         demo.save()
     }
     #endif
