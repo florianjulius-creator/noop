@@ -152,7 +152,11 @@ final class StrainBanisterDenominatorTests: XCTestCase {
         let edwards = StrainScorer.strain(hour, maxHR: max, restingHR: rest, method: .edwards)
         let banister = StrainScorer.strain(hour, maxHR: max, restingHR: rest, method: .banister)
 
-        XCTAssertEqual(edwards, 0.0, "an hour below the floor earns nothing under Edwards, by design")
+        // Fork: Edwards carries the WHOOP-parity ambient credit (StrainScorer.ambientWeight), so the
+        // floored hour scores a little rather than nothing — see StrainScorerTests. Upstream asserts 0.
+        XCTAssertNotNil(edwards)
+        XCTAssertGreaterThan(edwards!, 0.0)
+        XCTAssertLessThan(edwards!, 15.0, "ambient credit must stay far below workout territory")
         XCTAssertNotNil(banister)
         XCTAssertGreaterThan(banister!, 40.0, "Banister credits the same hour on the 0–100 axis")
     }

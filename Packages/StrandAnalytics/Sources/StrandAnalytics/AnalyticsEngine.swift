@@ -847,8 +847,14 @@ public enum AnalyticsEngine {
         // to be invisible here (sub-zone samples weighed 0) but the ambient credit gives every
         // lived-in sample weight, so an untrimmed stream would leak the spill into Effort and break
         // the full-vs-prefiltered byte-identity. The night-window fallback stays unfiltered — its
-        // pre-midnight tail is the pure-function callers' documented contract.
-        let strainHr = dayHr.map { $0.filter { tsInDay($0.ts) } } ?? hr
+        // pre-midnight tail is the pure-function callers' documented contract. A day stream with
+        // NOTHING inside the day is that same kind of caller (upstream's threading tests feed epoch
+        // timestamps against a 2026 day); trimming it would score nil, so it passes through whole.
+        let strainHr: [HRSample] = {
+            guard let dayHr else { return hr }
+            let trimmed = dayHr.filter { tsInDay($0.ts) }
+            return trimmed.isEmpty ? dayHr : trimmed
+        }()
         let strain = StrainScorer.strain(strainHr, maxHR: effMaxHR, restingHR: restForStrain,
                                          method: effortMethod, sex: profile.sex,
                                          diag: strainDiag, day: day)

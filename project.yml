@@ -160,7 +160,12 @@ targets:
     platform: macOS
     deploymentTarget: "13.0"
     sources:
-      - StrandTests
+      - path: StrandTests
+        # Fork: upstream a7f24db7 (#1879) added this test against fileprivate Repository helpers and a
+        # DailyMetric initializer that does not exist; upstream CI never compiles StrandTests on main.
+        # Excluded until upstream fixes it — drop this exclude when a merge makes it compile.
+        excludes:
+          - DailySkinTempAbsoluteCarryTests.swift
       # Compile the exact cross-target snapshot source into the test bundle so the AltStore App Group
       # resolver is covered without adding this iOS/widget-only type to the macOS application module.
       - StrandiOSShared/WidgetSnapshot.swift

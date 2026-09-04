@@ -42,7 +42,10 @@ final class EffortMethodThreadingTests: XCTestCase {
                                                   dayHr: subThresholdHour(),
                                                   profile: profile(), maxHROverride: 190.0).strain
         XCTAssertEqual(implicit ?? -2.0, score(.edwards) ?? -1.0, accuracy: 1e-12)
-        XCTAssertEqual(implicit ?? -1.0, 0.0, accuracy: 1e-9)
+        // Fork: Edwards carries the WHOOP-parity ambient credit (StrainScorer.ambientWeight), so a
+        // floored hour scores a little rather than nothing — see StrainScorerTests. Upstream asserts 0.
+        XCTAssertGreaterThan(implicit ?? -1.0, 0.0)
+        XCTAssertLessThan(implicit ?? 99.0, 15.0, "ambient credit must stay far below workout territory")
     }
 
     /// The whole point: asking for Banister actually changes the day's Effort. If the parameter were
