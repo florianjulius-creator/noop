@@ -1,0 +1,146 @@
+# Ochtendmoment — morning ring moment on the Watch (design spec)
+
+Date: 2026-09-04 · Fork: The Machine (`hrv-complication`) · Status: approved by Florian (HTML design + popup)
+
+## Goal
+
+Every morning at a time the user picks on the Watch, a full-screen ring moment appears on the Watch
+Ultra without opening the app: Recovery (outer) and Sleep (inner) animate in Apple-Activity style,
+then the Digital Crown scrolls through three blocks (Recovery, Sleep, Ochtendrapport). Mechanism:
+a watch-local notification with a custom long look (`WKNotificationScene`), the same mechanism
+Apple's own "ring closed" celebration uses. The Watch owns the schedule and wakes the iPhone.
+
+Decisions taken with the user:
+- Route A only: notification + custom long look. No Smart Stack widget, no Live Activity.
+- Two rings: Recovery + Sleep. Blocks: Recovery · Sleep · Ochtendrapport.
+- Time is set on the Watch (default 07:00, default enabled).
+- The daily iPhone push "Ochtendrapport" has never fired for the user and is removed. The
+  briefing text is delivered only through the watch snapshot.
+- Every briefing outcome is recorded as a readable status; silent failure is not allowed.
+
+## What cannot be done (and what we do instead)
+
+- watchOS gives third-party apps no "first unlock / wrist-on" hook and no way to self-launch
+  full screen. Hence a user-chosen time. If the Watch is on the charger when it fires, the
+  notification waits in Notification Center; tapping it plays the same long look + animation.
+- Notifications cannot page horizontally; "tabs" become vertically stacked blocks (Crown).
+- Sleep Focus silences normal notifications; the user picks a time at/after the focus ends.
+  Time-sensitive interruption level is out of scope (needs an entitlement).
+
+## Morning flow
+
+| When | Where | What |
+|---|---|---|
+| night | WHOOP strap → iPhone | BLE offload in background, as today. |
+| T − 10 min | Watch → iPhone | Watch background refresh task sends `requestMorning`. WatchConnectivity wakes The Machine on the iPhone. The iPhone replies at once with its current snapshot, then generates the briefing (day-guarded) and pushes a fresh snapshot with text via `updateApplicationContext` plus one `transferCurrentComplicationUserInfo` per day (wakes the watch app; a complication is on the active face). |
+| T | Watch | Repeating calendar notification (category `MORNING`). Wrist up → short look → automatic full-screen long look. The long look reads the App Group snapshot, observes the shared store, and sends `requestLatest` when the iPhone is reachable. |
+| 0–2 s | Watch | Rings sweep in (spring), number counts up, comet-tail sparks trail the ring tip, burst on arrival, haptic `.notification`. |
+| after | Watch | Crown scrolls to the three blocks. System "Dismiss" closes. |
+
+The iPhone's own 06:45 BGAppRefresh (`.morningbriefing`) stays as a silent fallback that only
+generates + pushes; it no longer posts a notification.
+
+## Components
+
+### Shared (`Packages/StrandDesign`)
+
+- `WatchScoreSnapshot` gains seven optional, wire-compatible fields (same pattern as `hrvMs`):
+  `restingHr: Int?`, `hrvBaselineMs: Int?`, `sleepMin: Int?`, `sleepEfficiencyPct: Int?`,
+  `briefing: String?`, `briefingDay: String?`, `briefingStatus: String?`.
+- `MorningMoment` (pure struct, no SwiftUI): snapshot + `now` → display state.
+  - `scoreState`: `.fresh(recovery:sleep:)` when `scoreDay` is today's local day; `.notScored`
+    otherwise (rings empty, dash, hint "Nacht nog niet gesynct — open The Machine op je iPhone").
+    A stale snapshot (`isStale`) is `.notScored` too.
+  - `verdict`: one word from the recovery zone — ≥ 67 "KLAAR", 34…66 "MATIG", < 34 "RUST".
+  - `hrvDeltaPct: Int?` = (hrvMs − hrvBaselineMs) / hrvBaselineMs × 100, rounded; nil when either
+    is missing or baseline is 0.
+  - `briefingText: String?` only when `briefingDay` equals `scoreDay` (never yesterday's text
+    under today's rings).
+  - Contributor bars (0…1): HRV = clamp(hrvMs / (1.25 × baseline)); RHR = clamp(baseline / RHR);
+    Sleep = rest / 100. Each nil when inputs are missing (bar hidden).
+
+### iPhone (`Strand/Data/WatchSessionBridge.swift`, `StrandiOS/App/MorningBriefing.swift`)
+
+- `buildSnapshot` fills the new fields from the same anchor day the widget uses: `restingHr`,
+  30-day `hrvBaselineMs` (same average `MorningBriefing.buildContext` computes — extract that into
+  one shared helper), `sleepMin`, `sleepEfficiencyPct`, plus `briefing`/`briefingDay`/
+  `briefingStatus` from `MorningBriefing` storage.
+- `headlineChanged` counts the new fields except `briefingStatus`.
+- `pushLatest(from:force:)`: `force: true` skips the 30-minute spacing gate (used for the
+  morning push and the `requestMorning` reply path only).
+- `send(_:wakeWatch:)`: when `wakeWatch` is true also call `transferCurrentComplicationUserInfo`
+  with the same payload, at most once per local day (`watch.lastWakeDay`).
+- New WC message `requestMorning` (`force: Bool`): reply immediately with the current snapshot
+  (App Group mirror), then `Task { await MorningBriefing.generateIfDue(model:force:) ; await
+  watch.pushLatest(from: model, force: true, wakeWatch: true) }`.
+- `MorningBriefing`:
+  - `notify(_:dayKey:)` and the `UserNotifications` import are removed. Nothing on the iPhone
+    posts a morning notification any more.
+  - `generateIfDue` records `briefing.lastStatus` on every exit path: "OK HH:mm" (Dutch,
+    24h), "uitgeschakeld", "geen API-key", "geen gescoorde nacht", "te vroeg (< 06:00)",
+    "API-fout: <localizedDescription>" (the `try?` becomes `do/catch`), "leeg antwoord".
+    Status text is written in Dutch because it is read on the Watch.
+  - Fire time stays 06:45 (fallback only). No change to `nextFireDate`.
+
+### Watch (`NOOPWatch`)
+
+- `WatchScoreStore.shared` singleton; the App and the notification controller both use it.
+  Adds `session(_:didReceiveUserInfo:)` (same decode/apply as context), `requestLatest()` and
+  `requestMorning(force:)` via `sendMessage` with reply handler (apply the reply snapshot;
+  ignore errors). Both are no-ops when `!session.isReachable`.
+- `MorningSettings` (UserDefaults.standard): `morning.enabled` (default true), `morning.hour`
+  (7), `morning.minute` (0).
+- `MorningScheduler`:
+  - `scheduleNotification()`: removes pending `morning-moment`, and when enabled adds a
+    `UNCalendarNotificationTrigger(dateMatching: hour+minute, repeats: true)` with category
+    `MORNING`, title "Goedemorgen", body "Je ochtendrapport staat klaar". Requests
+    authorization (`.alert, .sound`) first when not determined.
+  - `scheduleRefresh()`: `WKExtension.shared().scheduleBackgroundRefresh(withPreferredDate:
+    nextFire − 10 min, userInfo: nil)`; re-armed from the refresh handler and on launch.
+  - `scheduleTest()`: one-shot `UNTimeIntervalNotificationTrigger(10 s)` with the same
+    category, id `morning-test`.
+  - Called on app launch and after every settings change.
+- `NOOPWatchApp`: adds `WKNotificationScene(controller: MorningNotificationController.self,
+  category: "MORNING")` and `.backgroundTask(.appRefresh)` on the WindowGroup; the handler sends
+  `requestMorning(force: false)` and re-arms `scheduleRefresh()`.
+- `MorningNotificationController: WKUserNotificationHostingController<MorningMomentView>`:
+  `didReceive` loads the App Group snapshot into the store if the store has none newer, calls
+  `store.requestLatest()`, returns `MorningMomentView(store:)`. `isInteractive` stays false.
+- `MorningMomentView`: two concentric `GlowRing`-style arcs (recovery colour =
+  `StrandPalette.recoveryColor(score)`, sleep colour = `StrandPalette.restLine`), centre number
+  + verdict word, spark layer (`Canvas` in a `TimelineView`, ~1.2 s, then removed from the
+  hierarchy), haptic on appear. Below: Recovery block (verdict line + three contributor bars),
+  Sleep block (duration, efficiency, Rest score), Ochtendrapport block (text; hidden when nil).
+  Honours system Reduce Motion: no sweep, no sparks, haptic kept.
+- `WatchMorningSettingsView` = page 5 of `WatchRootView`: toggle, `DatePicker(.hourAndMinute)`,
+  status row "Rapport: <briefingStatus>" with a "Nu" button (`requestMorning(force: true)`),
+  "Test nu" (`scheduleTest`), "Bekijk vandaag" (sheet with `MorningMomentView`).
+- Strings go through `NOOPWatch/Localizable.xcstrings` like the rest of the watch UI.
+
+## Testing
+
+- `StrandDesign` package tests: snapshot round-trip with the seven fields + legacy payload
+  decodes to nil; `MorningMoment` states (fresh / not scored / stale / no briefing / yesterday's
+  briefing suppressed / verdict thresholds / HRV delta / bars).
+- `StrandTests` (macOS): `MorningBriefing` status strings per exit path (pure helpers), the T − 10
+  min derivation, `headlineChanged` with the new fields.
+- Simulator: `.apns` payload with `"category": "MORNING"` on the NOOPWatch scheme renders the long
+  look with the DEBUG demo snapshot.
+- Device: `Tools/install-device.sh`; on the Watch "Rapport nu" → status shows OK or the reason;
+  "Test nu" → notification after 10 s → animation + blocks; next morning real run.
+- Gate: 8 packages `swift test`, `xcodebuild test -scheme Strand` (macOS), NOOPiOS + NOOPWatch
+  Release against the 27 SDK — all green.
+
+## Build order
+
+1. Shared: snapshot fields + `MorningMoment` + tests.
+2. iPhone: fill fields, briefing + status into snapshot, remove push, `requestMorning` handler,
+   force push, wake push.
+3. Watch: store singleton + messaging, background refresh, scheduler, notification scene, ring
+   view, settings page.
+4. Device install; verify with "Rapport nu" / "Test nu"; confirm the next morning.
+
+## Out of scope
+
+Smart Stack widget, Live Activity, iPhone UI changes, evening moment, time-sensitive
+notifications, Dutch localisation of the rest of the watch app.
