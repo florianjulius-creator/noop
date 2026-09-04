@@ -8,18 +8,20 @@ import StrandDesign
 // concentric rings (Recovery outside in the recovery colour, Sleep inside in the app blue) sweep in with
 // a spark trail and a burst on arrival; below, the Crown scrolls to the Recovery / Slaap / Ochtendrapport
 // blocks. Every number comes from `MorningMoment`, so a not-scored morning is an empty track + a dash,
-// never yesterday's figures. Reduce Motion: no sweep, no sparks, haptic kept.
+// never yesterday's figures. Quiet motion (system Reduce Motion, the in-app "Reduce motion in NOOP"
+// switch, Low Power Mode — the composed `NoopMotionState.poseStill`): no sweep, no sparks, haptic kept.
 struct MorningMomentView: View {
     @ObservedObject var store: WatchScoreStore
     var celebrate: Bool = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @ObservedObject private var motion = NoopMotionState.shared
 
     private var moment: MorningMoment { MorningMoment(snapshot: store.snapshot) }
 
     var body: some View {
         ScrollView {
             VStack(spacing: 10) {
-                MorningRingsView(moment: moment, animated: celebrate && !reduceMotion)
+                MorningRingsView(moment: moment, animated: celebrate && !motion.poseStill(reduceMotion))
                 switch moment.scores {
                 case .fresh: blocks
                 case .notScored: notScored
