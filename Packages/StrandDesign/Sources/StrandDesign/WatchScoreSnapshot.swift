@@ -40,6 +40,28 @@ public struct WatchScoreSnapshot: Codable, Equatable, Sendable {
     /// nil when absent so older payloads on the wire stay compatible.
     public var hrvMs: Int?
 
+    // MARK: Morning-moment fields (2026-09). All optional + decode as nil when absent so older
+    // phone builds stay on the wire. The Watch long look reads these; nothing else does.
+
+    /// Resting heart rate for the anchor day (bpm).
+    public var restingHr: Int?
+    /// 30-day average resting heart rate (bpm), the baseline the RHR contributor bar compares against.
+    public var restingHrBaseline: Int?
+    /// 30-day average overnight HRV (whole ms), the baseline `hrvMs` is compared against.
+    public var hrvBaselineMs: Int?
+    /// Total sleep for the anchor day, whole minutes.
+    public var sleepMin: Int?
+    /// Sleep efficiency for the anchor day, whole percent (0…100).
+    public var sleepEfficiencyPct: Int?
+    /// The AI morning briefing text (Dutch), or nil when none was produced.
+    public var briefing: String?
+    /// The local day key the briefing describes ("YYYY-MM-DD"). The Watch only shows `briefing`
+    /// when this equals `scoreDay`, so yesterday's text never sits under today's rings.
+    public var briefingDay: String?
+    /// Why the iPhone did or did not produce a briefing, already phrased for the Watch settings page
+    /// ("OK 06:52", "geen API-key", …). See `BriefingStatus`.
+    public var briefingStatus: String?
+
     /// A one line sleep summary for the glance (e.g. "7h 12m · 81% efficiency"), already formatted by
     /// the phone. Empty string when there is nothing to show.
     public var sleepSummary: String
@@ -192,6 +214,11 @@ public struct WatchScoreSnapshot: Codable, Equatable, Sendable {
         case .today, .builtJustNow: return true
         default:                    return false
         }
+    }
+
+    /// "YYYY-MM-DD" local day key for `date`, the same shape the phone writes into `scoreDay`.
+    public static func localDayKey(_ date: Date) -> String {
+        dayKeyFormatter.string(from: date)
     }
 
     /// Shared "YYYY-MM-DD" parser/formatter for `scoreDay`. Fixed locale + POSIX so it round-trips the
