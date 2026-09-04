@@ -86,6 +86,12 @@ class OuraDriver(
      * Per OURA_PROTOCOL.md s3.2 (the 0x24 SetAuthKey is a DANGEROUS, one-time provisioning write).
      */
     val allowKeyInstall: Boolean = false,
+    /**
+     * Wall-clock "now" in unix ms, used ONLY to reject a banked sample that converts to the future
+     * (#1073). Injectable so the gate is testable without touching the system clock; defaults to the
+     * real clock, so no ingest call site has to thread it. Twin of Swift's `nowMsProvider`.
+     */
+    private val nowMsProvider: () -> Long = { System.currentTimeMillis() },
 ) {
     var phase: OuraDriverPhase = OuraDriverPhase.Idle
         private set
@@ -300,11 +306,19 @@ class OuraDriver(
         val deltaTicks = forRingTimestamp - anchorRt
         val ms = anchorMs + deltaTicks * 100   // default 100 ms/tick (s5.5); bounded input, no overflow
         // #968: a corrupt/misaligned ring timestamp (seen on a full cursor=0 history dump) can convert to
-        // an implausible epoch. Gate the RESULT to the same 2020-2035 plausible window used for anchoring
-        // (was a weak `ms <= 0`), so the caller honestly falls back to arrival time instead of banking a
-        // 1970 or far-future sample. Byte-identical to the Swift twin.
+        // an implausible epoch; return null so the caller falls back to arrival time instead of banking it.
+        //
+        // #1073: a banked SAMPLE is always in the past, so its upper bound is "now", NOT the 2020-2035
+        // anchor window. That window is the right screen for ADOPTING a clock anchor and far too generous
+        // for a sample — a corrupt ring timestamp that converts years ahead (measured on a live ring:
+        // ~1,600 R-R beats stamped 2026→2034, and still accruing) passed it cleanly and got filed into a
+        // future day, invisible to the night it belongs to. Gate a sample at `now + skew tolerance`
+        // (minutes, absorbing ring-clock skew + anchor rounding) and keep the 2020 lower bound (the #968
+        // 1970 guard). The 2020-2035 window stays in `plausibleAnchorMs`, for anchor adoption only.
+        // Byte-identical to the Swift twin.
         val seconds = ms / 1000
-        if (seconds < MIN_PLAUSIBLE_EPOCH_SECONDS || seconds > MAX_PLAUSIBLE_EPOCH_SECONDS) return null
+        val nowSeconds = nowMsProvider() / 1000
+        if (seconds < MIN_PLAUSIBLE_EPOCH_SECONDS || seconds > nowSeconds + SAMPLE_FUTURE_TOLERANCE_SECONDS) return null
         return seconds
     }
 
@@ -494,15 +508,31 @@ class OuraDriver(
                         ),
                     ),
                 )
-            OuraEventTag.REAL_STEPS_1, OuraEventTag.REAL_STEPS_2 ->
-                listOf(
-                    OuraEvent.TierB(
-                        OuraTierBSummary(
-                            tag = record.type, ringTimestamp = record.ringTimestamp,
-                            rawPayload = record.payload, kind = "real_steps",
-                        ),
-                    ),
-                )
+            OuraEventTag.REAL_STEPS_1, OuraEventTag.REAL_STEPS_2 -> {
+                // Split out of the raw-bytes TierB wrapper, same as ActivityInfo: this tag pair now has a
+                // cited third-party unpack formula (OuraDecoders.decodeRealStepsFields, [oura-rs]). Still
+                // Tier B - only reached behind allowTierB (gated above), and OuraStreamMapping never folds
+                // RealStepsFields into a durable stream. Applies the SAME 14-field unpack to both 0x7E and
+                // 0x7F bodies (the formula is generic over any 14-byte body; NOOP's own investigation
+                // found the movement-correlated fields present in both).
+                val fields = OuraDecoders.decodeRealStepsFields(record) ?: return emptyList()
+                listOf(OuraEvent.RealStepsFields(fields))
+            }
+            OuraEventTag.SLEEP_PERIOD_INFO -> {
+                // Split out of the raw-bytes TierB wrapper, same as ActivityInfo: this tag has a cited
+                // third-party layout ([open_ring]) whose field NAMES are what our own s6.12 was missing,
+                // and whose declared invariants our captures uphold. Still Tier B - only reached behind
+                // allowTierB (gated above). ONE field of it is durable: OuraStreamMapping maps
+                // `breathsPerMin` to a respSample row under the ring's OWN deviceId, and on a ring night
+                // AnalyticsEngine takes the night's median of those rows as dailyMetric.respRateBpm (the
+                // ring measures it; NOOP does not derive it). It is still refused at the STAGING read by
+                // provenance (OuraRespScale.forScoring) - that path reads the stream as a ~1 Hz raw ADC
+                // waveform and a per-window rate is the wrong shape for a peak detector. `averageHrBpm`
+                // and every other field stay diagnostic-only - in particular the HR must not join the
+                // beat-derived series at a different cadence.
+                val info = OuraDecoders.decodeSleepPeriodInfo(record) ?: return emptyList()
+                listOf(OuraEvent.SleepPeriodInfo(info))
+            }
             OuraEventTag.SPO2_SMOOTHED ->
                 listOf(
                     OuraEvent.TierB(
@@ -611,18 +641,46 @@ class OuraDriver(
         private const val MAX_PLAUSIBLE_EPOCH_SECONDS = 2_051_222_400L
 
         /**
+         * Skew allowance on the sample-side "must not be in the future" gate (#1073): a sample converting
+         * up to this many seconds past `now` is still accepted, absorbing ring-clock skew and the anchor's
+         * own rounding. Minutes, not the anchor window's years. Applies ONLY to [unixSeconds], never anchor
+         * adoption. Byte-identical to the Swift `sampleFutureToleranceSeconds`.
+         */
+        private const val SAMPLE_FUTURE_TOLERANCE_SECONDS = 300L
+
+        /**
+         * How far the ring's clock may run AHEAD of [lowerBoundTicks] and still be recognised. The bound
+         * is a stale resume cursor or the oldest ring-time a drain has seen, either of which can trail
+         * the ring's clock by the ring's whole banked depth (~14 days) plus however long the cursor has
+         * been stuck — the original 7-day window silently excluded exactly that case: in the 2026-09-02/03
+         * iOS captures an 8.2-day-stale cursor could never be re-anchored, so it could never advance, so
+         * the staleness only grew — one full re-serve of the same window per launch, forever. Widening
+         * costs no honesty: both readings fit the window only when
+         * `window >= 9 × lowerBound`, i.e. a ring under ~5 days of clock — and that case still resolves
+         * to null below, exactly as before. Byte-identical twin of Swift's syncTimeAnchorWindowTicks.
+         */
+        const val SYNC_TIME_ANCHOR_WINDOW_TICKS = 38_880_000L   // 45 days of 100 ms ticks
+
+        /**
          * Resolve the 0x13 SyncTime-response device timestamp into ring TICKS, or null when no
          * unambiguous reading exists. ringverse BLE.md labels the field "seconds" but the ring's record
          * clock runs in 100 ms ticks, so both readings are tried: the raw value (already ticks) and
-         * value×10 (seconds→ticks). The ring's clock at connect must sit shortly AFTER where the last
-         * drain ended, so a candidate is plausible iff it falls in `[historyCursor, historyCursor +
-         * 7 days]`; exactly one must fit (ambiguity or a fresh/reset cursor → null → the caller logs
-         * raw instead of guessing). Pure. Byte-identical twin of Swift's syncTimeAnchorCandidate.
+         * value×10 (seconds→ticks). The ring's clock at connect must sit AFTER any ring-time we already
+         * know about, so a candidate is plausible iff it falls in `[lowerBoundTicks, lowerBoundTicks +
+         * SYNC_TIME_ANCHOR_WINDOW_TICKS]`; exactly one must fit (ambiguity or no reference at all → null
+         * → the caller logs raw instead of guessing).
+         *
+         * [lowerBoundTicks] is any ring-time known to precede the ring's clock NOW: the persisted resume
+         * cursor at connect, or — when that is 0 (fresh pair / post-reboot reset) or too stale — the
+         * largest envelope ring-time the drain has actually seen ([OuraHistoryDrain.maxSeenRingTime]),
+         * which needs no anchor to read and so breaks the cursor↔anchor deadlock (2026-09-02/03 captures).
+         *
+         * Pure. Byte-identical twin of Swift's syncTimeAnchorCandidate.
          */
-        fun syncTimeAnchorCandidate(responseValue: Long, historyCursor: Long): Long? {
-            if (historyCursor <= 0) return null
-            val lower = historyCursor
-            val upper = lower + 6_048_000L   // 7 days of 100 ms ticks
+        fun syncTimeAnchorCandidate(responseValue: Long, lowerBoundTicks: Long): Long? {
+            if (lowerBoundTicks <= 0) return null
+            val lower = lowerBoundTicks
+            val upper = lower + SYNC_TIME_ANCHOR_WINDOW_TICKS
             val readings = listOf(responseValue, responseValue * 10)
             val fits = readings.filter { it in lower..upper && it <= 0xFFFF_FFFFL }
             if (fits.size != 1) return null

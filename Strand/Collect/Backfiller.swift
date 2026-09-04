@@ -75,7 +75,7 @@ final class Backfiller {
     /// Strap family for the current offload, set at begin(). Drives family-aware frame parsing (WHOOP 5/MG
     /// records sit at +4 offsets vs WHOOP 4.0) and the end_data slice the ack needs. Captured at begin()
     /// rather than init so it's correct even if the Backfiller was constructed before the strap was known.
-    private var family: DeviceFamily = .whoop4
+    private(set) var family: DeviceFamily = .whoop4
 
     /// Diagnostic sink (strap log). Surfaces historical records whose firmware layout we can't decode.
     private let log: ((String) -> Void)?
@@ -85,6 +85,20 @@ final class Backfiller {
     /// Per-session persistence tally — the success-side observability the log forensics flagged as the
     /// blind spot (#150): we logged FAILURES (decoded-to-0) but never SUCCESSES, so a strap log couldn't
     /// tell a banking strap from a broken one. Reset at begin(); read by BLEManager at session end to emit
+    /// #1008/#1118 PRE-STORAGE R-R census, accumulated across the session. `offered` is what the decoder
+    /// handed over; `inserted` is what survived the store's ON CONFLICT key, so the gap is how much the
+    /// primary key already absorbs. The per-second histogram sums per chunk, so a second split across two
+    /// chunks is counted in both — a rounding artifact at chunk edges only, and the ratio below (exact
+    /// sums over the exact span) is the number that decides emission-vs-ingest. Instrumentation only.
+    private(set) var sessionRrOffered = 0
+    private(set) var sessionRrInserted = 0
+    private(set) var sessionRrSumMs = 0
+    private(set) var sessionRrMinTs: Int?
+    private(set) var sessionRrMaxTs: Int?
+    private(set) var sessionRrHist = [0, 0, 0, 0]
+    private(set) var sessionRrGapHist = [0, 0, 0, 0, 0, 0, 0, 0]
+    private(set) var sessionRrFill = [0, 0, 0, 0]
+
     /// "persisted N rows (M with motion) across K night(s)". Nights are day-keys (ts / 86400).
     private(set) var sessionRowsPersisted = 0
     /// #42: set by `begin` when this session continues an auto-continue burst (#364) that already banked
@@ -111,13 +125,20 @@ final class Backfiller {
     /// session. Surfaces whether the stale-RTC timestamp correction (FIX #72's `correctedWall`) could even
     /// engage. `sessionUsedIdentityRef` = no clock correlation had landed when the first chunk decoded, so
     /// that decode fell back to an identity
-    /// ref (device==wall==now) → clock offset 0 → correction OFF. On a strap whose RTC has reset, that
+    /// ref (device==wall==now) → clock offset 0 → correction OFF. On a WHOOP 4.0 whose RTC has reset, that
     /// silently stores the strap's stale (years-old) timestamps verbatim, so the night lands off the recent
     /// timeline and reads as "missed sleep". Paired with the persisted-nights DATE RANGE below, one strap
     /// log now shows both WHERE the rows landed and WHY. Reset in begin(). Log-only.
+    ///
+    /// #1598: read this WITH the family — it is family-agnostic on purpose (it records what the decode did),
+    /// so it is `true` on EVERY 5/MG session, where identity is the correct ref rather than a fallback.
+    /// `sessionClockDiagLine` is what applies that judgement; don't treat this flag alone as a fault.
     private(set) var sessionClockDevice: Int?
     private(set) var sessionClockWall: Int?
     private(set) var sessionUsedIdentityRef = false
+    /// #1008: 1-based chunk counter for the per-chunk `hist clock` diag line, so a strap log can be read
+    /// as a trajectory across one offload. Reset per session alongside the clock ref above.
+    private var chunkIndex = 0
     /// Logged once per session when the strap reports trim=0xFFFFFFFF — the "no valid flash cursor"
     /// sentinel: it has no banked history to offload (a clock/charge state, not a decode bug).
     private var loggedNoCursor = false
@@ -233,12 +254,21 @@ final class Backfiller {
         chunk.removeAll(keepingCapacity: true)
         chunkOpen = true
         sessionRowsPersisted = 0
+        sessionRrOffered = 0
+        sessionRrInserted = 0
+        sessionRrSumMs = 0
+        sessionRrMinTs = nil
+        sessionRrMaxTs = nil
+        sessionRrHist = [0, 0, 0, 0]
+        sessionRrGapHist = [0, 0, 0, 0, 0, 0, 0, 0]
+        sessionRrFill = [0, 0, 0, 0]
         sessionMotionRows = 0
         sessionSkinTempRows = 0
         sessionNightKeys.removeAll(keepingCapacity: true)
         sessionClockDevice = nil          // #67: re-capture the decode clock ref for this session
         sessionClockWall = nil
         sessionUsedIdentityRef = false
+        chunkIndex = 0
         loggedNoCursor = false
         loggedFutureRtc = false
         sessionDroppedImplausible = 0
@@ -305,13 +335,30 @@ final class Backfiller {
         return "Backfill: session persisted \(rows) rows (\(motion) with motion, \(skinTemp) skin-temp) across \(nights) night(s)."
     }
 
+    /// #1008/#1118: the session's PRE-STORAGE R-R census. `ratio` is beat-time per second of wall time
+    /// over the whole session — above 1.0 is physically impossible, and because it is measured on what the
+    /// DECODER produced it separates an emission/decode defect (ratio already high here) from an ingest
+    /// one (ratio ~1 here while the stored night still reads high). nil when the session banked no R-R.
+    func sessionRrEmissionLine() -> String? {
+        guard sessionRrOffered > 0, let lo = sessionRrMinTs, let hi = sessionRrMaxTs else { return nil }
+        let span = max(hi - lo + 1, 1)
+        let ratio = Double(sessionRrSumMs) / 1000.0 / Double(span)
+        let r = RrEmissionStats.Result(secondsWithRr: sessionRrHist.reduce(0, +),
+                                       intervals: sessionRrOffered, sumRrMs: sessionRrSumMs,
+                                       spanSec: span, ratio: ratio, perSecond: sessionRrHist,
+                                       gapHist: sessionRrGapHist, fill: sessionRrFill)
+        return RrEmissionStats.logLine(path: "historical", offered: sessionRrOffered,
+                                       inserted: sessionRrInserted, r)
+    }
+
     /// #67 diag: the persisted-nights DATE RANGE plus the offload's effective clock state — the two facts
     /// the summary above omits. `nightKeys` are UTC day-keys (ts / 86400); their min/max are the day(s) the
     /// rows LANDED on. When those days sit years in the past while the clock ref reads ~now (an identity
     /// fallback, or an in-sync ref on a strap that banked stale), the night is misdated off the recent
     /// timeline — the "missed sleep" signature (#67). Returns nil when nothing landed. Log-only, pure.
     nonisolated static func sessionClockDiagLine(nightKeys: Set<Int>,
-                                                 device: Int?, wall: Int?, usedIdentityRef: Bool) -> String? {
+                                                 device: Int?, wall: Int?, usedIdentityRef: Bool,
+                                                 family: DeviceFamily) -> String? {
         guard let lo = nightKeys.min(), let hi = nightKeys.max() else { return nil }
         let day: (Int) -> String = { key in
             let f = DateFormatter()
@@ -325,7 +372,12 @@ final class Backfiller {
         if let device, let wall {
             let offset = wall - device
             let days = offset / 86_400
-            if usedIdentityRef {
+            if usedIdentityRef && family == .whoop5 {
+                // #1598: identity is the DESIGNED ref for a 5/MG — its records carry real-unix seconds, so
+                // offset 0 is correct and there is nothing to correct FOR. Labelling it "IDENTITY fallback"
+                // made every healthy 5/MG log look like the #700 misdating bug.
+                line += " · clock ref: identity - correct for 5/MG (records carry real-unix timestamps, no correlation needed)"
+            } else if usedIdentityRef {
                 line += " · clock ref: IDENTITY fallback (no clock correlation at decode) - stale-record correction OFF"
             } else if abs(offset) > 86_400 {
                 line += " · strap clock \(days >= 0 ? "\(days)d behind" : "\(-days)d ahead") wall - correction engaged"
@@ -374,6 +426,54 @@ final class Backfiller {
     nonisolated static func futureRtcLine(endUnix: Int, wallNowUnix: Int) -> String {
         let aheadDays = max(0, (endUnix - wallNowUnix)) / 86_400
         return "Backfill: the strap reported a record dated about \(aheadDays) day(s) in the FUTURE - its clock (RTC) is corrupt, not a NOOP problem. Those records can't be filed onto the right day. Fully charge the strap to 100% and reconnect so it re-syncs its clock; if it persists, forget and re-pair the strap."
+    }
+
+    /// #1683: how far BEHIND the wall clock the strap's newest stored record may sit before a sync that
+    /// banked nothing is worth explaining. Two days, not one: a strap left off-wrist overnight is ordinary,
+    /// and this line only ever accompanies a completed offload that banked nothing anyway.
+    nonisolated static let staleRecordToleranceSeconds = 2 * 86_400
+
+    /// Is the strap's newest stored record far enough in the past to be worth naming? A nil or
+    /// non-positive value is not a date and never qualifies.
+    nonisolated static func isStaleNewestRecord(newestUnix: Int?, wallNowUnix: Int) -> Bool {
+        guard let newestUnix, newestUnix > 0 else { return false }
+        return newestUnix <= wallNowUnix - staleRecordToleranceSeconds
+    }
+
+    /// #1683: the counterpart `futureRtcLine` never had. A strap that stopped banking weeks ago and one
+    /// that is simply caught up produce the SAME "banked no sensor history" line today, so neither the user
+    /// nor anyone reading their log can tell them apart. #1541 stayed open and vague for exactly that
+    /// reason.
+    ///
+    /// Deliberately states the FACT and lets the condition carry the interpretation. A newest record two
+    /// weeks old means the strap stopped recording IF it was being worn; if it sat in a drawer, the same
+    /// number is unremarkable. Asserting a corrupt RTC here would claim more than the data supports, which
+    /// is how this area has misled people before.
+    ///
+    /// It also says the part the existing advice omits: NOOP re-sends SET_CLOCK on every connect, so
+    /// "charge it" alone has already been retried every session.
+    ///
+    /// Byte-identical to the Android twin. No em-dash (project rule).
+    nonisolated static func staleRecordLine(newestUnix: Int, wallNowUnix: Int) -> String {
+        let ageDays = max(0, wallNowUnix - newestUnix) / 86_400
+        return "Backfill: this sync banked nothing and the strap's newest stored record is about \(ageDays) day(s) old. If you have worn it since then, it has stopped saving history to its flash. NOOP already re-sends the clock on every connect, so charging alone may not be enough: charge to 100% and reconnect, then use Restart strap in Devices, and if that does not help forget and re-pair. If the official WHOOP app is also missing these days, the strap is the cause and not NOOP."
+    }
+
+
+    /// #1683: the same honesty as `staleRecordLine`, for the message the user actually READS.
+    ///
+    /// The standing banner says "fully charge it to 100%, then reconnect, and it should start banking
+    /// again". It omits the one fact that makes the situation legible - how long the strap has been
+    /// silent - and it PROMISES a recovery that has already failed every session for weeks, because NOOP
+    /// re-sends SET_CLOCK on every connect and the charge advice has therefore been retried all along. A
+    /// banner that keeps promising something that keeps not happening teaches people to distrust the app
+    /// rather than their strap.
+    ///
+    /// Byte-identical to the Android twin. Not localized, matching the sibling `lastSyncError` copy on
+    /// both platforms; localizing that surface is its own change. No em-dash (project rule).
+    nonisolated static func staleRecordBanner(newestUnix: Int, wallNowUnix: Int) -> String {
+        let ageDays = max(0, wallNowUnix - newestUnix) / 86_400
+        return "Synced, but your strap handed over no stored history, and its newest saved record is about \(ageDays) day(s) old. If you have been wearing it since then, it has stopped saving to flash. Charge it to 100% and reconnect; NOOP already re-sets its clock every connect, so if that does not help, try Restart strap in Devices, then forget and re-pair. If the official WHOOP app is missing these days too, the strap is the cause and not NOOP."
     }
 
     /// Commit one HISTORY_END chunk: (persist decoded → enqueueRaw when present) → setCursor → ackTrim.
@@ -443,6 +543,16 @@ final class Backfiller {
                 return DecodedChunk(parsed: parsed, decoded: decoded, rejected: rejected)
             }.value
             let parsed = d.parsed
+            // #1008: per-chunk clock basis + R-R packing. The session summary logs only the FIRST chunk's
+            // correlation, which cannot show the offset moving across a long offload nor separate "the same
+            // beats arrived twice" from "one record stamped 8 intervals on one second". Log-only.
+            chunkIndex += 1
+            if let l = ChunkClockDiag.line(chunk: chunkIndex,
+                                           deviceClockRef: ref.device,
+                                           wallClockRef: ref.wall,
+                                           rrTimestamps: d.decoded.rr.map(\.ts)) {
+                log?(l)
+            }
             // Observability (PR #241): log which layout this strap emits on a HEALTHY sync too — the
             // unmapped-version path below only fires for layouts NOOP can't decode, so a normal log
             // never revealed v18/v24/v25/v26. Once per distinct layout this session.
@@ -575,15 +685,27 @@ final class Backfiller {
                 // prefix — v25/v26 records run ~84 B and the truncated tail is exactly where the
                 // unmapped motion/HR fields sit), and sample a few more so one log carries enough
                 // records to triangulate offsets. These only ever fire for unmapped firmware.
-                for (i, f) in rejected.prefix(8).enumerated() {
+                let sample = Array(rejected.prefix(8))
+                var emptySkipped = 0
+                for (i, f) in sample.enumerated() {
+                    // #1007: an all-zero frame has no record layout to map, so its hex dump is pure log
+                    // bloat (a strap emitting these produced ~4 MB of all-00). Keep the WARNING count above.
+                    if isEmptyRecordFrame(f) { emptySkipped += 1; continue }
                     let hex = f.map { String(format: "%02x", $0) }.joined()
                     log?("Backfill: rejected frame[\(i)] \(f.count)B: \(hex)")
+                }
+                if emptySkipped > 0 {
+                    log?("Backfill: #1007 \(emptySkipped)/\(sample.count) sampled frame(s) all-zero (empty payload) - hex dump skipped")
                 }
             }
             // Commit the decoded rows FIRST (durable). Doing this before the reject archive means a
             // rare insert failure — which returns and re-sends the whole chunk next session — can't
             // leave duplicate lines in the append-only reject archive.
             let counts: (hr: Int, rr: Int, events: Int, battery: Int, spo2: Int, skinTemp: Int, resp: Int, gravity: Int)
+            // #1008/#1118: census the batch BEFORE it is stored — the only place the decoder's own
+            // emission can be measured, since every existing R-R number is taken after the ON CONFLICT key
+            // has already absorbed part of it.
+            let rrCensus = RrEmissionStats.compute(decoded.rr.map { (ts: $0.ts, rrMs: $0.rrMs) })
             do { counts = try await store.insert(decoded, deviceId: deviceId) } catch {
                 // Diag (#601): the decoded rows couldn't be written — this is the "history stalls but live HR
                 // works" class. We return WITHOUT acking so the strap keeps this chunk and re-sends it next
@@ -596,6 +718,19 @@ final class Backfiller {
             // "persisted N rows (M with motion) across K night(s)" — the win-rate signal a log never had.
             let tally = Backfiller.chunkTally(counts: counts, timestamps: decoded.gravity.map(\.ts) + decoded.hr.map(\.ts))
             sessionRowsPersisted += tally.rows
+            // #1008/#1118 census accumulation (pre-storage `offered` vs post-key `inserted`).
+            sessionRrOffered += rrCensus.intervals
+            sessionRrInserted += counts.rr
+            sessionRrSumMs += rrCensus.sumRrMs
+            if rrCensus.intervals > 0 {
+                let lo = decoded.rr.map(\.ts).min() ?? 0
+                let hi = decoded.rr.map(\.ts).max() ?? 0
+                sessionRrMinTs = min(sessionRrMinTs ?? lo, lo)
+                sessionRrMaxTs = max(sessionRrMaxTs ?? hi, hi)
+                for i in 0..<4 { sessionRrHist[i] += rrCensus.perSecond[i] }
+                for i in 0..<8 { sessionRrGapHist[i] += rrCensus.gapHist[i] }
+                for i in 0..<4 { sessionRrFill[i] += rrCensus.fill[i] }
+            }
             sessionMotionRows += tally.motion
             sessionSkinTempRows += counts.skinTemp
             sessionNightKeys.formUnion(tally.nights)

@@ -83,12 +83,19 @@ public final class OuraDriver {
     /// injected one (so re-auth after a key install uses the new key). Per OURA_PROTOCOL.md s3.2.
     private var effectiveKey: [UInt8]? { installedKey ?? authKey }
 
+    /// Wall-clock "now" in unix ms, used ONLY to reject a banked sample that converts to the future
+    /// (#1073). Injectable so the gate is testable without touching the system clock; defaults to the
+    /// real clock, so no ingest call site has to thread it.
+    private let nowMsProvider: () -> Int64
+
     public init(ringGen: OuraRingGen, authKey: [UInt8]?, allowTierB: Bool = false,
-                allowKeyInstall: Bool = false) {
+                allowKeyInstall: Bool = false,
+                nowMsProvider: @escaping () -> Int64 = { Int64(Date().timeIntervalSince1970 * 1000) }) {
         self.ringGen = ringGen
         self.authKey = authKey
         self.allowTierB = allowTierB
         self.allowKeyInstall = allowKeyInstall
+        self.nowMsProvider = nowMsProvider
     }
 
     // MARK: - Command flow
@@ -223,25 +230,50 @@ public final class OuraDriver {
         let deltaTicks = Int64(rt) - Int64(anchorRingTime)
         let ms = anchorUtcMs + deltaTicks * 100   // default 100 ms/tick (s5.5); bounded input, no overflow
         // #968: a corrupt/misaligned ring timestamp (seen on a full cursor=0 history dump) can convert to
-        // an implausible epoch. Gate the RESULT to the same 2020-2035 plausible window used for anchoring
-        // (was a weak `ms > 0`), so the caller honestly falls back to arrival time instead of banking a
-        // 1970 or far-future sample.
+        // an implausible epoch; return nil so the caller falls back to arrival time instead of banking it.
+        //
+        // #1073: a banked SAMPLE is always in the past, so its upper bound is "now", NOT the 2020-2035
+        // anchor window. That window is the right screen for ADOPTING a clock anchor and far too generous
+        // for a sample — a corrupt ring timestamp that converts years ahead (measured on a live ring:
+        // ~1,600 R-R beats stamped 2026→2034, and still accruing) passed it cleanly and got filed into a
+        // future day, invisible to the night it belongs to. Gate a sample at `now + skew tolerance`
+        // (minutes, absorbing ring-clock skew + anchor rounding) and keep the 2020 lower bound (the #968
+        // 1970 guard). The 2020-2035 window stays in `plausibleAnchorMs`, for anchor adoption only.
         let seconds = ms / 1000
-        guard seconds >= Self.minPlausibleEpochSeconds, seconds <= Self.maxPlausibleEpochSeconds else { return nil }
+        let nowSeconds = nowMsProvider() / 1000
+        guard seconds >= Self.minPlausibleEpochSeconds,
+              seconds <= nowSeconds + Self.sampleFutureToleranceSeconds else { return nil }
         return Int(seconds)
     }
+
+    /// How far the ring's clock may run AHEAD of `lowerBoundTicks` and still be recognised. The bound is a
+    /// stale resume cursor or the oldest ring-time a drain has seen, either of which can trail the ring's
+    /// clock by the ring's whole banked depth (~14 days) plus however long the cursor has been stuck — the
+    /// original 7-day window silently excluded exactly that case: in the 2026-09-02/03 iOS captures an
+    /// 8.2-day-stale cursor could never be re-anchored, so it could never advance, so the staleness only
+    /// grew — one full re-serve of the same window per launch, forever. Widening costs no
+    /// honesty: both readings fit the window only when `window >= 9 × lowerBound`, i.e. a ring under ~5
+    /// days of clock — and that case still resolves to nil below, exactly as before.
+    public static let syncTimeAnchorWindowTicks: Int64 = 38_880_000   // 45 days of 100 ms ticks
 
     /// Resolve the 0x13 SyncTime-response device timestamp into ring TICKS, or nil when no unambiguous
     /// reading exists. ringverse BLE.md labels the field "seconds" but the ring's record clock runs in
     /// 100 ms ticks, so both readings are tried: the raw value (already ticks) and value×10 (seconds→
-    /// ticks). The ring's clock at connect must sit shortly AFTER where the last drain ended, so a
-    /// candidate is plausible iff it falls in `[historyCursor, historyCursor + 7 days]`; exactly one
-    /// must fit (ambiguity or a fresh/reset cursor → nil → the caller logs raw instead of guessing).
+    /// ticks). The ring's clock at connect must sit AFTER any ring-time we already know about, so a
+    /// candidate is plausible iff it falls in `[lowerBoundTicks, lowerBoundTicks +
+    /// syncTimeAnchorWindowTicks]`; exactly one must fit (ambiguity or no reference at all → nil → the
+    /// caller logs raw instead of guessing).
+    ///
+    /// `lowerBoundTicks` is any ring-time known to precede the ring's clock NOW: the persisted resume
+    /// cursor at connect, or — when that is 0 (fresh pair / post-reboot reset) or too stale — the largest
+    /// envelope ring-time the drain has actually seen (`OuraHistoryDrain.maxSeenRingTime`), which needs no
+    /// anchor to read and so breaks the cursor↔anchor deadlock (2026-09-02/03 captures).
+    ///
     /// Pure and testable; the honest-data invariant is "no anchor beats a wrong anchor".
-    public static func syncTimeAnchorCandidate(responseValue: UInt32, historyCursor: UInt32) -> UInt32? {
-        guard historyCursor > 0 else { return nil }
-        let lower = Int64(historyCursor)
-        let upper = lower + 6_048_000   // 7 days of 100 ms ticks
+    public static func syncTimeAnchorCandidate(responseValue: UInt32, lowerBoundTicks: UInt32) -> UInt32? {
+        guard lowerBoundTicks > 0 else { return nil }
+        let lower = Int64(lowerBoundTicks)
+        let upper = lower + syncTimeAnchorWindowTicks
         let readings = [Int64(responseValue), Int64(responseValue) * 10]
         let fits = readings.filter { $0 >= lower && $0 <= upper && $0 <= Int64(UInt32.max) }
         guard fits.count == 1 else { return nil }
@@ -267,6 +299,12 @@ public final class OuraDriver {
     /// Int64 (a naive multiply on a near-Int64.max raw value traps).
     private static let minPlausibleEpochSeconds: Int64 = 1_577_836_800
     private static let maxPlausibleEpochSeconds: Int64 = 2_051_222_400
+
+    /// Skew allowance on the sample-side "must not be in the future" gate (#1073): a sample converting up
+    /// to this many seconds past `now` is still accepted, absorbing ring-clock skew and the anchor's own
+    /// rounding. Minutes, not the anchor window's years — a sample banked further ahead than this is
+    /// corrupt by construction. Applies ONLY to `unixSeconds(forRingTimestamp:)`, never anchor adoption.
+    private static let sampleFutureToleranceSeconds: Int64 = 300
 
     private static func plausibleAnchorMs(fromEpochSeconds seconds: Int64) -> Int64? {
         guard seconds >= minPlausibleEpochSeconds, seconds <= maxPlausibleEpochSeconds else { return nil }
@@ -410,8 +448,28 @@ public final class OuraDriver {
             return [.tierB(OuraTierBSummary(tag: record.type, ringTimestamp: record.ringTimestamp,
                                             rawPayload: record.payload, kind: "activity"))]
         case .realSteps1, .realSteps2:
-            return [.tierB(OuraTierBSummary(tag: record.type, ringTimestamp: record.ringTimestamp,
-                                            rawPayload: record.payload, kind: "real_steps"))]
+            // Split out of the raw-bytes .tierB wrapper, same as .activityInfo: this tag pair now has a
+            // cited third-party unpack formula (Decoders.decodeRealStepsFields, [oura-rs]). Still Tier B
+            // - only reached behind allowTierB (gated above), and OuraStreamMapping never folds
+            // .realStepsFields into a durable stream. Applies the SAME 14-field unpack to both 0x7E and
+            // 0x7F bodies (the formula is generic over any 14-byte body; NOOP's own investigation found
+            // the movement-correlated fields present in both).
+            guard let fields = OuraDecoders.decodeRealStepsFields(record) else { return [] }
+            return [.realStepsFields(fields)]
+        case .sleepPeriodInfo:
+            // Split out of the raw-bytes .tierB wrapper, same as .activityInfo: this tag has a cited
+            // third-party layout ([open_ring]) whose field NAMES are what our own §6.12 was missing, and
+            // whose declared invariants our captures uphold. Still Tier B - only reached behind
+            // allowTierB (gated above). ONE field of it is durable: OuraStreamMapping maps `breathsPerMin`
+            // to a respSample row under the ring's OWN deviceId, and on a ring night AnalyticsEngine takes
+            // the night's median of those rows as dailyMetric.respRateBpm (the ring measures it; NOOP does
+            // not derive it). It is still refused at the STAGING read by provenance
+            // (`OuraRespScale.forScoring`) - that path reads the stream as a ~1 Hz raw ADC waveform and a
+            // per-window rate is the wrong shape for a peak detector. `averageHrBpm` and every other field
+            // stay diagnostic-only - in particular the HR must not join the beat-derived series at a
+            // different cadence.
+            guard let info = OuraDecoders.decodeSleepPeriodInfo(record) else { return [] }
+            return [.sleepPeriodInfo(info)]
         case .spo2Smoothed:
             return [.tierB(OuraTierBSummary(tag: record.type, ringTimestamp: record.ringTimestamp,
                                             rawPayload: record.payload, kind: "spo2_smoothed"))]

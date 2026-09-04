@@ -132,13 +132,7 @@ struct HydrationView: View {
         content()
             .padding(padding)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(StrandPalette.surfaceRaised)
-                    .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .strokeBorder(StrandPalette.hairline, lineWidth: 1))
-                    .opacity(cardOpacity)
-            )
+            .background(NoopPanelSurface(cornerRadius: 22, surfaceOpacity: cardOpacity))
     }
 
     // MARK: - Quick log (Sip / Cup / Bottle, secondary style)
@@ -280,9 +274,9 @@ struct HydrationView: View {
         }
     }
 
-    private static let entryTimeFmt: DateFormatter = {
-        let f = DateFormatter(); f.timeStyle = .short; f.dateStyle = .none; return f
-    }()
+    /// #1821: routed through AppClock so the Clock format setting reaches this label. Was a `static
+    /// let`, which would have frozen the reader's choice at first use until the app relaunched.
+    private static var entryTimeFmt: DateFormatter { AppClock.hourMinuteFormatter() }
 
     // MARK: - 7-day mini history (flat bars, today on the right)
 

@@ -53,6 +53,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import kotlin.math.roundToInt
+import com.noop.analytics.ClockFormat
 
 // MARK: - Coupled view (task #43) — Kotlin twin of CoupledView.swift
 //
@@ -80,7 +81,6 @@ private const val COUPLED_NO_DATA = "No Data"
 // a translucent near-black that floats over the day-of-sky so the vessel + white count-up numbers stay
 // crisp — the card does the contrast work, not a muted sky. heroFill = rgba(13,14,20,.80), stroke
 // white@0.11, radius 26. Mirrors the iOS LiquidTodayView heroCard.
-private val LIQUID_HERO_FILL: Color = Color(red = 13f / 255f, green = 14f / 255f, blue = 20f / 255f, alpha = 0.80f)
 private val LIQUID_HERO_RADIUS: Dp = 26.dp
 
 @Composable
@@ -105,8 +105,11 @@ fun CoupledScreen(
     LaunchedEffect(days) {
         sleeps = runCatching {
             val now = System.currentTimeMillis() / 1000L
-            val imported = vm.repo.sleepSessions("my-whoop", 0L, now)
-            val computed = vm.repo.sleepSessions(vm.repo.computedDeviceId("my-whoop"), 0L, now)
+            // #1304/#512: read across the active-strap UNION (active ∪ canonical "my-whoop"), exactly as
+            // SleepScreen does — a 2nd strap's sleep is banked under "whoop-<uuid>", invisible to a raw
+            // "my-whoop" read. A single-WHOOP install collapses to "my-whoop" only, byte-identical.
+            val imported = vm.repo.sleepSessionsUnion(vm.activeStrapId, 0L, now)
+            val computed = vm.repo.computedSleepSessionsUnion(vm.activeStrapId, 0L, now)
             val importedEnds = imported.map { it.endTs }.toHashSet()
             (imported + computed.filter { it.endTs !in importedEnds }).sortedBy { it.effectiveStartTs }
         }.getOrDefault(emptyList())
@@ -116,7 +119,9 @@ fun CoupledScreen(
     // span below resolves the IDENTICAL block (#294) instead of a screen-local heuristic.
     var habitualMidsleepSec by remember { mutableStateOf<Long?>(null) }
     LaunchedEffect(days) {
-        habitualMidsleepSec = runCatching { vm.repo.habitualMidsleepSec("my-whoop") }.getOrNull()
+        // #1304/#512: thread the active strap id — `habitualMidsleepSec` unions internally, but the
+        // literal "my-whoop" collapses that union and re-drops a 2nd strap's nights (matches SleepScreen).
+        habitualMidsleepSec = runCatching { vm.repo.habitualMidsleepSec(vm.activeStrapId) }.getOrNull()
     }
 
     // Imported export-verbatim sleep figures (sleep_performance / need), preferred over the on-device
@@ -147,8 +152,25 @@ fun CoupledScreen(
                 .toString() == todayKey
         }
     }
-    val carriedRecoveryDay = remember(days, todayKey) {
-        days.lastOrNull { it.recovery != null && it.day < todayKey }
+    val context = LocalContext.current
+    val hrvEpoch = remember { NoopPrefs.of(context).getLong(Baselines.hrvBaselineEpochKey, 0L).toDouble() }
+    // #1458: carry through the SAME helper Today uses, not a local re-derivation. The local copy was
+    // `days.lastOrNull { it.recovery != null && it.day < todayKey }`, which has no `todayScored` guard —
+    // so on a day that HAS a score it still returned a prior day, and the hero's Charge sheet opened that
+    // older night while the card beside it showed today's number. It also missed the #547 upper bound
+    // (a future-dated row from a bad strap clock is how that bug read "12 Jul") and the calibrating gate.
+    // One helper, one answer: the card and its own detail sheet cannot disagree again.
+    val carriedRecoveryDay = remember(days, todayKey, todayRow, hrvEpoch, logicalKey, localKey) {
+        lastScoredRecoveryDay(
+            days = days,
+            selectedDayKey = todayKey,
+            isToday = true,   // the Coupled view has no day selector; it is always today
+            todayScored = todayRow?.recovery != null,
+            isCalibrating = recoveryCalibrationNights(
+                days, hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch,
+            ) != null,
+            today = maxOf(logicalKey, localKey),
+        )
     }
     val recovery = todayRow?.recovery ?: carriedRecoveryDay?.recovery
     val isCarrying = todayRow?.recovery == null && carriedRecoveryDay?.recovery != null
@@ -174,8 +196,6 @@ fun CoupledScreen(
     // Recovery cold-start nights (the SAME pure helper Today's ring reads), for the honest calibrating
     // caption + accessibility copy while the HRV baseline still seeds. Threads the persisted
     // "Recalibrate HRV baseline" epoch so N folds the SAME epoch-aware history the engine folds (Bug B).
-    val context = LocalContext.current
-    val hrvEpoch = remember { NoopPrefs.of(context).getLong(Baselines.hrvBaselineEpochKey, 0L).toDouble() }
     val calibrationNights = remember(days, todayRow, hrvEpoch) {
         recoveryCalibrationNights(days, hasRecovery = todayRow?.recovery != null, hrvBaselineEpoch = hrvEpoch)
     }
@@ -201,10 +221,10 @@ fun CoupledScreen(
         // The Android equivalent of the iOS `ScreenScaffold(topBackground: liquidScaffoldSky())`; it replaces
         // the classic flat-canvas backdrop with the liquid day-of-sky (LiquidSkyStatic — no per-frame cost on
         // this scrolling column). The other liquid screens drop in the SAME LiquidScreenSky() slot verbatim.
-        topBackground = if (showDayCycleBackground) { { LiquidScreenSky(fillHeight = skyBehindCards) } } else null,
+        topBackground = screenBackdropSlot(showDayCycleBackground, skyBehindCards),
         // Sky-behind-cards fills the viewport so the transparent cards reveal the sky the whole way
         // down (Today / Trends / Sleep / metric-detail parity - same two prefs, same two behaviours).
-        fullBleedBackground = showDayCycleBackground && skyBehindCards,
+        fullBleedBackground = screenBackdropFullBleed(showDayCycleBackground, skyBehindCards),
     ) {
         HeroCard(
             recovery = recovery,
@@ -225,7 +245,7 @@ fun CoupledScreen(
             sleepPerformance = sleepPerformance,
             asleepMin = todayRow?.totalSleepMin,
             needMin = sleepNeedForDay(todayRow, days, importedNeed),
-            bedWakeSpan = bedWakeSpan(sleeps, habitualMidsleepSec),
+            bedWakeSpan = bedWakeSpan(sleeps, habitualMidsleepSec, ClockPrefs.uses24Hour(LocalContext.current)),
             onOpenSleep = onOpenSleep,
         )
         Text(
@@ -310,8 +330,8 @@ private fun HeroCard(
             .fillMaxWidth()
             .liquidPress(interaction)
             .clip(RoundedCornerShape(LIQUID_HERO_RADIUS))
-            .background(LIQUID_HERO_FILL.copy(alpha = LIQUID_HERO_FILL.alpha * CardAppearance.opacity))
-            .border(1.dp, Color.White.copy(alpha = 0.11f * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
+            .background(Palette.heroFill.copy(alpha = Palette.heroFill.alpha * CardAppearance.opacity))
+            .border(1.dp, Palette.heroBorder.copy(alpha = Palette.heroBorder.alpha * CardAppearance.opacity), RoundedCornerShape(LIQUID_HERO_RADIUS))
             .clickable(
                 interactionSource = interaction,
                 indication = null,
@@ -345,8 +365,12 @@ private fun HeroCard(
                 // prior score (#543/#779, the SAME caption Today uses), or the calibrating progress while
                 // the baseline seeds. Nothing when today's own score is showing.
                 if (isCarrying && carriedDay != null) {
+                    val caption = carriedCaption(carriedDay.day, today = todayKey)
                     Text(
-                        carriedCaption(carriedDay.day, today = todayKey),
+                        when (caption) {
+                            is DisplayText.Resource -> uiString(caption.id, *caption.args.toTypedArray())
+                            is DisplayText.Dynamic -> caption.value
+                        },
                         style = NoopType.footnote,
                         color = Palette.textTertiary,
                     )
@@ -387,8 +411,8 @@ private fun HeroCentre(recovery: Double?, readinessLevel: ReadinessEngine.Level)
             Text(COUPLED_NO_DATA, style = NoopType.headline, color = Palette.textSecondary)
         }
         Text(uiString(R.string.l10n_coupled_screen_recovery_b668d988), style = NoopType.overline, color = sampled)
-        val word = readinessWord(readinessLevel)
-        if (word != null) ReadinessPill(word = word, level = readinessLevel)
+        val wordRes = readinessWord(readinessLevel)
+        if (wordRes != null) ReadinessPill(word = uiString(wordRes), level = readinessLevel)
     }
 }
 
@@ -473,11 +497,52 @@ private fun StrainCard(dayStrain21: Double?, recovery: Double?, calories: Double
                 verticalArrangement = Arrangement.spacedBy(14.dp),
             ) {
                 HeroStat("Day Strain", dayStrain21?.let { String.format(Locale.US, "%.1f", it) } ?: COUPLED_NO_DATA, Palette.effortColor)
-                HeroStat("Optimal", optimalStrainRangeText(recovery), Palette.chargeColor)
+                OptimalStat("Optimal", recovery)
                 HeroStat("Calories", calories?.let { "${it.roundToInt()} kcal" } ?: COUPLED_NO_DATA, Palette.metricAmber)
                 HeroStat("Workouts", workouts.toString(), Palette.textPrimary)
             }
         }
+    }
+}
+
+/**
+ * The OPTIMAL strain band stat: the heroStat idiom plus a liquid tube visualising where the suggested band
+ * sits on the 0-21 axis. Twin of Swift CoupledView.optimalStat, which has had the tube since the coupled
+ * layout shipped while Android printed the range alone - the band was the one coupled stat with a shape to
+ * show and no shape shown.
+ *
+ * Not folded into [HeroStat]: Swift keeps optimalStat separate for the same reasons (4dp spacing rather
+ * than 2, and the tube), and every other stat here is a bare number with nothing to plot.
+ *
+ * A calibrating / unscored day shows the no-data token over an EMPTY tube, never a guessed band.
+ */
+@Composable
+private fun OptimalStat(title: String, recovery: Double?) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        // Takes the title as a parameter and uppercases it here, exactly as [HeroStat] does, rather than
+        // inlining "OPTIMAL". Not cosmetic: the four stat titles on this screen are unlocalized literals
+        // that the i18n gate cannot see as HeroStat arguments, and inlining one into a Text() makes that
+        // ONE of the four visible and fails the gate. Localising a single stat title while its three
+        // siblings stay hardcoded would be the wrong fix for a parity PR; the four of them are one
+        // pre-existing gap and belong to one change.
+        Text(title.uppercase(), style = NoopType.overline, color = Palette.textSecondary)
+        // Deliberately the same bare Text as [HeroStat]'s value, with no maxLines. Swift shrinks this
+        // (lineLimit(1).minimumScaleFactor(0.6)) but so does its heroStat, and Android's HeroStat does
+        // neither - so that divergence belongs to all four coupled stats, not to this one. Adding a
+        // maxLines here alone would truncate where the siblings wrap and where Swift shrinks: different
+        // from both.
+        Text(optimalStrainRangeText(recovery), style = NoopType.number(20f), color = Palette.chargeColor)
+        // animated = false matches the Swift call: the stat stack is a read-out, not an instrument, and a
+        // posed tube costs nothing per frame.
+        LiquidTube(
+            frac = optimalUpperFraction(recovery),
+            tint = Palette.chargeColor,
+            height = 8.dp,
+            animated = false,
+        )
     }
 }
 
@@ -613,11 +678,11 @@ private fun sleepNeedForDay(day: DailyMetric?, days: List<DailyMetric>, imported
  * session" pick, which could name a different block -- and so a different span -- than the Sleep tab and
  * Today's HR graph for a night stored as more than one block (#294).
  */
-private fun bedWakeSpan(sleeps: List<SleepSession>, habitualMidsleepSec: Long?): String? {
+private fun bedWakeSpan(sleeps: List<SleepSession>, habitualMidsleepSec: Long?, is24h: Boolean): String? {
     val windowStart = System.currentTimeMillis() / 1000L - 36 * 3600L // within the last 36h counts as last night
     val candidates = sleeps.filter { it.endTs > windowStart }
     val span = mainSleepSpan(candidates, habitualMidsleepSec) ?: return null
-    val fmt = SimpleDateFormat("HH:mm", Locale.getDefault())
+    val fmt = SimpleDateFormat(ClockFormat.hourMinutePattern(is24h), Locale.getDefault())   // #1821
     return "${fmt.format(Date(span.first * 1000L))} - ${fmt.format(Date(span.second * 1000L))}"
 }
 
@@ -642,6 +707,19 @@ internal fun optimalStrainRange(recovery: Double?): OptimalStrainRange? {
         r >= 34 -> OptimalStrainRange(10, 14)
         else -> OptimalStrainRange(4, 10)
     }
+}
+
+/**
+ * The optimal band's UPPER bound as a 0..1 fraction of the 0-21 axis, for the tube fill. 0 (an empty tube)
+ * when recovery is unknown, so the tube never fabricates a band the text is refusing to name.
+ *
+ * Twin of Swift CoupledView.optimalUpperFraction. Reads the upper bound rather than the midpoint because
+ * the tube shows how far up the axis the suggested band REACHES, which is what pairs with "14 to 18"
+ * printed above it.
+ */
+internal fun optimalUpperFraction(recovery: Double?): Double {
+    val band = optimalStrainRange(recovery) ?: return 0.0
+    return (band.high.toDouble() / 21.0).coerceIn(0.0, 1.0)
 }
 
 /** The optimal band as display text ("14 to 18" / the no-data token). Byte-identical to the Swift twin. */

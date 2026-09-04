@@ -156,6 +156,10 @@ final class AICoachEngine: ObservableObject {
 
     // Published state the UI binds to.
     @Published var messages: [ChatMessage] = []
+
+    /// Local day the current transcript was last written on; nil while it is empty. Drives the day
+    /// boundary in `send` — see `isStaleConversation`. Kotlin twin: `CoachViewModel.conversationDay`.
+    private var conversationDay: Int?
     @Published var sending = false
     @Published var errorText: String?
     @Published var provider: AIProvider {
@@ -221,8 +225,10 @@ final class AICoachEngine: ObservableObject {
     static let defaultSystemPrompt = """
     You are an elite, supportive recovery and performance coach with a real training methodology. \
     You may be given a summary of the user's own wearable data (charge 0-100, effort 0-100, rest 0-100, \
-    HRV, resting heart rate) and recent workouts. Charge is the daily recovery/readiness score, effort \
-    is the daily cardiovascular load score, and rest is the nightly sleep-quality score. \
+    sleep duration and its deep/REM/light breakdown, sleep efficiency, HRV, resting heart rate) and \
+    recent workouts. Charge is the daily recovery/readiness score, effort is the daily cardiovascular \
+    load score, and rest is the nightly sleep-quality score. A dash in the data means that value was \
+    NOT MEASURED that day — say so rather than treating it as a zero. \
     Coach using autoregulation:
     • Readiness → prescription: charge 67-100 = green light to build/push, higher effort is fine; \
     34-66 = maintain, quality over volume, keep it controlled; 0-33 = active recovery only \
@@ -361,6 +367,12 @@ final class AICoachEngine: ObservableObject {
     func disconnect() {
         AIKeyStore.clear()
         customConnected = false
+        // Retire the transcript with the connection. Kotlin has done this since the method existed
+        // (CoachViewModel.disconnect) and this side never did, so returning to the setup screen on Apple
+        // left the whole conversation sitting behind it — including whatever the user had told a coach
+        // they were in the middle of disconnecting from.
+        messages = []
+        conversationDay = nil
         objectWillChange.send()
     }
 
@@ -384,6 +396,11 @@ final class AICoachEngine: ObservableObject {
     /// Forget the stored key.
     func clearKey() {
         AIKeyStore.clear()
+        // Same reasoning as `disconnect`: clearing the key returns the user to the setup screen, and
+        // Kotlin empties the transcript when it does. Leaving it meant a "clear my key" on Apple removed
+        // the credential and kept the conversation.
+        messages = []
+        conversationDay = nil
         objectWillChange.send()
     }
 
@@ -484,6 +501,21 @@ final class AICoachEngine: ObservableObject {
         guard !trimmed.isEmpty else { errorText = AICoachError.emptyQuestion.errorDescription; return }
         guard let key = resolvedKey else { errorText = AICoachError.noKey.errorDescription; return }
 
+        // A transcript from an earlier local day is retired before the new turn is appended (#1542,
+        // Kotlin twin merged first). `messages` outlives a night — the engine is held for the app's
+        // lifetime — so without this the coach answers TODAY's question inside YESTERDAY's
+        // conversation. The DATA was never stale: buildFullContext() re-reads on every send. It is the
+        // assistant's own earlier turns stating yesterday's figures, and the model staying consistent
+        // with them, which reads as "the coach only talks about my imported data" after a night of
+        // fresh strap data.
+        //
+        // Placed AFTER the guards on purpose: a send that never happens must not wipe a transcript.
+        let today = Self.localEpochDay()
+        if Self.isStaleConversation(lastEpochDay: conversationDay, todayEpochDay: today) {
+            messages = []
+        }
+        conversationDay = today
+
         errorText = nil
         appendMessage(ChatMessage(role: .user, text: trimmed))
         sending = true
@@ -555,7 +587,7 @@ final class AICoachEngine: ObservableObject {
     }
 
     /// One derived stress line for the coach context: the Baevsky Stress Index over TODAY's R-R, read
-    /// via the store exactly as `StressView` does (`storeHandle()` → `rrIntervals(deviceId:from:to:)`),
+    /// via the same device-aware repository R-R union as `StressView`,
     /// then summarised to a single number with `StressIndex.stressIndex(rr:)`. Returns nil when the
     /// store is unavailable or there are too few clean beats (the histogram needs >= 20), so the line is
     /// simply absent, never a fabricated value. Summary-only: the raw R-R never leaves the device.
@@ -563,9 +595,7 @@ final class AICoachEngine: ObservableObject {
         let cal = Calendar.current
         let from = Int(cal.startOfDay(for: Date()).timeIntervalSince1970)
         let to = Int(Date().timeIntervalSince1970)
-        guard let store = await repo.storeHandle() else { return nil }
-        let rr = (try? await store.rrIntervals(
-            deviceId: repo.deviceId, from: from, to: to, limit: 200_000)) ?? []
+        let rr = await repo.rrIntervals(from: from, to: to, limit: 200_000)
         guard let si = StressIndex.stressIndex(rr: rr) else { return nil }
         return Self.stressIndexSummary(si: si)
     }
@@ -585,13 +615,20 @@ final class AICoachEngine: ObservableObject {
 
         // 1. Strongest behaviour→outcome associations (EffectRanker over the journal × Charge).
         let entries = await repo.journalEntries()
+        // Yes days and NO days, kept apart. A day with no journal row for the question lands in
+        // neither, so an unanswered day is never counted as a No (BehaviorInsights.effect).
         var byBehaviour: [String: Set<String>] = [:]
-        for e in entries where e.answeredYes { byBehaviour[e.question, default: []].insert(e.day) }
+        var controls: [String: Set<String>] = [:]
+        for e in entries {
+            if e.answeredYes { byBehaviour[e.question, default: []].insert(e.day) }
+            else { controls[e.question, default: []].insert(e.day) }
+        }
         if !byBehaviour.isEmpty {
             let outcomeByDay = Dictionary(
                 repo.days.compactMap { d in d.recovery.map { (d.day, $0) } },
                 uniquingKeysWith: { _, last in last })
-            let ranked = EffectRanker.rank(behaviors: byBehaviour, outcomeByDay: outcomeByDay, outcome: "Charge")
+            let ranked = EffectRanker.rank(behaviors: byBehaviour, controls: controls,
+                                           outcomeByDay: outcomeByDay, outcome: "Charge")
                 .filter { $0.effect.significant }
                 .prefix(3)
             if !ranked.isEmpty {
@@ -639,6 +676,35 @@ final class AICoachEngine: ObservableObject {
     /// recent `maxHistoryMessages`, dropping the middle. Sending the whole growing history crowds out the
     /// reply on small-context local servers (Ollama defaults to a 2048-token window, the Custom
     /// provider's main use case) and balloons token cost/latency on cloud providers. (parity with Android)
+    /// True when a transcript last written on `lastEpochDay` should be retired before a question asked
+    /// on `todayEpochDay` — i.e. the conversation crossed into a new local day.
+    ///
+    /// STRICTLY forward (`>`, never `!=`): a clock that moves BACKWARDS — the user flying west, a
+    /// timezone change, an NTP correction — must not wipe a conversation they are in the middle of.
+    /// Only real elapsed days retire a transcript. A nil `lastEpochDay` (nothing sent yet) is never
+    /// stale. Kotlin twin: `CoachViewModel.isStaleConversation`.
+    ///
+    /// `nonisolated` because it is a pure function of its arguments. AICoachEngine is @MainActor, so
+    /// without this the rule inherits that isolation and cannot be called from a synchronous test —
+    /// which is exactly how the first attempt at this twin failed to compile. Isolating a function
+    /// that touches no state buys nothing and costs its testability.
+    nonisolated static func isStaleConversation(lastEpochDay: Int?, todayEpochDay: Int) -> Bool {
+        guard let lastEpochDay else { return false }
+        return todayEpochDay > lastEpochDay
+    }
+
+    /// Days since the epoch in the LOCAL calendar — the twin of Kotlin's `LocalDate.now().toEpochDay()`.
+    ///
+    /// Counted with calendar day arithmetic from `startOfDay`, not by dividing an interval by 86,400:
+    /// a day is not always 86,400 seconds (DST), and the rule only needs a value that increments
+    /// exactly once per local midnight and orders correctly. Injectable so the tests never depend on
+    /// the machine's clock or zone.
+    nonisolated static func localEpochDay(_ date: Date = Date(), calendar: Calendar = .current) -> Int {
+        let start = calendar.startOfDay(for: date)
+        let epoch = Date(timeIntervalSince1970: 0)
+        return calendar.dateComponents([.day], from: epoch, to: start).day ?? 0
+    }
+
     private static let maxHistoryMessages = 10
     private func windowedMessages() -> [ChatMessage] {
         guard messages.count > Self.maxHistoryMessages + 1,
@@ -684,7 +750,8 @@ final class AICoachEngine: ObservableObject {
         // Last ~14 days, newest first for readability.
         let recent = Array(days.suffix(14)).reversed()
         lines.append("")
-        lines.append("Recent days (newest first) — charge(0-100), effort(0-100), rest/sleep(h), HRV(ms), RHR(bpm):")
+        lines.append("Recent days (newest first) — charge(0-100), effort(0-100), rest/sleep(h), "
+                     + "deep/REM/light(h), eff(%), HRV(ms), RHR(bpm). A dash means NOT MEASURED, not zero:")
         for d in recent {
             lines.append("  " + dayLine(d))
         }
@@ -729,14 +796,55 @@ final class AICoachEngine: ObservableObject {
 
     // MARK: Formatting helpers
 
-    private func dayLine(_ d: DailyMetric) -> String {
+    /// `internal`, not private, so `AICoachSleepContextTests` can assert the emitted line directly.
+    /// Swift's `buildContext()` takes no arguments (it reads the repo), unlike the Kotlin twin which is
+    /// handed the day list — so without this the formatter has no seam and the Swift half of a change
+    /// with fifteen Kotlin tests would ship untested.
+    func dayLine(_ d: DailyMetric) -> String {
         var parts: [String] = [d.day + ":"]
         parts.append("charge " + (d.recovery.map { "\(Int($0.rounded()))" } ?? "—"))
         parts.append("effort " + (d.strain.map { String(format: "%.1f", $0) } ?? "—"))
         parts.append("rest " + (d.totalSleepMin.map { String(format: "%.1fh", $0 / 60) } ?? "—"))
+        // The stage breakdown and efficiency, which the coach could not see at all: a user asked why it
+        // said it had no access to sleep stages, and it was answering honestly — `rest 7.8h` was every
+        // word it got about a night. These four sit on the SAME DailyMetric the line already reads, so
+        // nothing new is plumbed; they were simply never included. (#124 widened this context once
+        // before, for the same reason.)
+        //
+        // Always emitted, "—" when absent, like every other field here. A night with no staging then
+        // says so rather than going quiet, which matters more than line length: the alternative — only
+        // appending stages when present — gives the model a schema that changes shape between days and
+        // invites it to read a missing field as a zero.
+        parts.append("deep " + hoursOrDash(d.deepMin))
+        parts.append("REM " + hoursOrDash(d.remMin))
+        parts.append("light " + hoursOrDash(d.lightMin))
+        parts.append("eff " + efficiencyPercentOrDash(d.efficiency))
         parts.append("HRV " + (d.avgHrv.map { "\(Int($0.rounded()))ms" } ?? "—"))
         parts.append("RHR " + (d.restingHr.map { "\($0)bpm" } ?? "—"))
         return parts.joined(separator: ", ")
+    }
+
+    /// Minutes as "1.4h", or "—" when the night has no value. Matches the `rest` field's format so a
+    /// stage total and the total it is part of read on the same scale.
+    private func hoursOrDash(_ minutes: Double?) -> String {
+        minutes.map { String(format: "%.1fh", $0 / 60) } ?? "—"
+    }
+
+    /// Efficiency as a percentage, NORMALISING the stored value first.
+    ///
+    /// `DailyMetric.efficiency` is not reliably a 0–1 fraction: it "arrives as % on some import paths",
+    /// which `SleepView` and `StagesCard` each guard against inline with this same `> 1.5` test. A bare
+    /// `* 100` would therefore hand the coach "eff 9400%" for an imported night — and a model given a
+    /// nonsense number reasons about it confidently rather than ignoring it.
+    ///
+    /// 1.5 rather than 1.0 because a genuine fraction can exceed 1.0 only by floating-point noise, while
+    /// a genuine percentage is 30–100 and nowhere near the threshold. Android's two copies of this guard
+    /// split at 1.0 instead, which is a pre-existing divergence and not this change's to settle.
+    func efficiencyPercentOrDash(_ raw: Double?) -> String {
+        guard var e = raw, e > 0 else { return "—" }
+        if e > 1.5 { e /= 100 }
+        guard e > 0, e <= 1 else { return "—" }
+        return "\(Int((e * 100).rounded()))%"
     }
 
     private func avgOne(_ xs: [Double]) -> String {

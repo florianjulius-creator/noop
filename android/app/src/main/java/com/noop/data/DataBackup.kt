@@ -46,8 +46,11 @@ object DataBackup {
 
     /** Entry name of the optional whitelisted-settings JSON (#1000). Matches the Apple exporter. */
     private const val SETTINGS_ENTRY_NAME = BackupSettingsCodec.ENTRY_NAME
+    // #1410: a `manifest.json` entry recording which build produced this file (read only to classify, never
+    // restored). Written LAST so older importers that stop at the first .sqlite entry are unaffected.
+    private const val MANIFEST_ENTRY_NAME = BackupManifest.ENTRY_NAME
 
-    private const val MAX_BACKUP_SQLITE_BYTES = 2_147_483_648L
+    internal const val MAX_BACKUP_SQLITE_BYTES = 2_147_483_648L
     private const val MAX_BACKUP_SETTINGS_BYTES = 1_048_576L
 
     /** First 16 bytes of every SQLite 3 file: "SQLite format 3\0". */
@@ -56,6 +59,36 @@ object DataBackup {
             0x53, 0x51, 0x4C, 0x69, 0x74, 0x65, 0x20, 0x66,
             0x6F, 0x72, 0x6D, 0x61, 0x74, 0x20, 0x33, 0x00,
         )
+
+    /**
+     * #1014 (write-side): cheaply confirm a JUST-WRITTEN `.noopbak` at [uri] is structurally intact — its
+     * DB entry is present and begins with the SQLite magic header. A torn write (truncated ZIP / a
+     * half-flushed SAF document on a full disk or flaky provider) otherwise leaves a `.noopbak` that
+     * silently "restores" into an empty store, caught only by the import-side quick_check much later. Fail
+     * HERE at write time instead. Twin of the Apple post-write check in `writeVerifiedBackupZip`.
+     * Best-effort: any read/format error returns false (treated as not-intact).
+     */
+    fun isWrittenBackupIntact(context: Context, uri: Uri): Boolean = runCatching {
+        context.contentResolver.openInputStream(uri)?.use { stream ->
+            ZipInputStream(stream).use { zip ->
+                var entry = zip.nextEntry
+                while (entry != null) {
+                    if (!entry.isDirectory && entry.name.substringAfterLast('/') == ZIP_ENTRY_NAME) {
+                        val header = ByteArray(SQLITE_MAGIC.size)
+                        var got = 0
+                        while (got < header.size) {
+                            val r = zip.read(header, got, header.size - got)
+                            if (r < 0) break
+                            got += r
+                        }
+                        return@runCatching got == header.size && header.contentEquals(SQLITE_MAGIC)
+                    }
+                    entry = zip.nextEntry
+                }
+                false
+            }
+        } ?: false
+    }.getOrDefault(false)
 
     /** First 4 bytes of every ZIP file: "PK\x03\x04". */
     private val ZIP_MAGIC: ByteArray =
@@ -68,7 +101,26 @@ object DataBackup {
 
         /** Import failed and the original database is untouched. */
         data class Failed(val message: String) : ImportResult
+
+        /**
+         * The restore stopped ONLY because an entry exceeds [MAX_BACKUP_SQLITE_BYTES]. Distinct from
+         * [Failed] so the caller can offer to go ahead: the cap is a decompression guard against a
+         * hostile archive, and a backup the user just picked out of their own files is a different
+         * threat model than the one it defends against. (#1807)
+         */
+        data class TooLarge(val message: String, val limitBytes: Long) : ImportResult
     }
+
+    /**
+     * What an export produced. [overRestoreCeiling] is true when the database is past the ceiling the
+     * RESTORE path enforces, so the caller can say so while the user still has their data — the
+     * alternative is finding out during a restore, which is the one moment the original is gone.
+     *
+     * Measured on the DATABASE, not the finished archive: the archive is deflated and the cap counts the
+     * DECOMPRESSED stream, so the zip's own size says nothing about whether it can be read back. That is
+     * also why compressing harder cannot help anyone past it. (#1807)
+     */
+    data class ExportOutcome(val bytes: Long, val overRestoreCeiling: Boolean, val limitBytes: Long)
 
     /**
      * Export the live database to [uri] as a compressed `.noopbak` (single-entry ZIP).
@@ -78,7 +130,7 @@ object DataBackup {
      * Throws on failure so the caller can surface the message in a toast/snackbar.
      */
     @Throws(IOException::class)
-    fun exportTo(context: Context, uri: Uri) {
+    fun exportTo(context: Context, uri: Uri): ExportOutcome {
         val appContext = context.applicationContext
 
         // Fold the WAL back into the main file so the snapshot is complete.
@@ -110,10 +162,20 @@ object DataBackup {
         // legacy single-entry ZIP. The DB entry stays FIRST — older importers stop at the first
         // `.sqlite` entry, so entry order is part of the cross-platform container contract.
         val settingsJson = BackupSettingsBridge.snapshotJson(appContext)
+        // #1410: build provenance for this export — which build wrote the file.
+        val manifestJson = BackupManifest.json(
+            appVersion = com.noop.BuildConfig.VERSION_NAME,
+            appBuild = com.noop.BuildConfig.VERSION_CODE.toString(),
+            platform = "android",
+            schemaVersion = WhoopDatabase.SCHEMA_VERSION,
+            exportedAtMs = System.currentTimeMillis(),
+        )
 
         val resolver = appContext.contentResolver
         val output = resolver.openOutputStream(uri)
             ?: throw IOException("Could not open the chosen file for writing.")
+        // Assigned inside the transaction below, where the entry is actually written.
+        var entryBytes = 0L
         output.use { out ->
             // #1014: copy the file while HOLDING Room's write transaction. In WAL mode the main
             // file is only rewritten by a checkpoint, and a checkpoint only runs on a commit — so
@@ -125,16 +187,31 @@ object DataBackup {
             db.runInTransaction {
                 ZipOutputStream(out).use { zip ->
                     zip.putNextEntry(ZipEntry(ZIP_ENTRY_NAME))
-                    dbFile.inputStream().use { input -> input.copyTo(zip) }
+                    // #1807: count what actually LANDS in the entry, rather than reading dbFile.length()
+                    // afterwards. The copy runs inside this transaction against a snapshot; once it
+                    // commits, Room can checkpoint again and the main file's length can move, so a later
+                    // read is a different number from the one the restore path will meet. The cap is
+                    // enforced on this entry, so this is the only measurement that answers the question.
+                    dbFile.inputStream().use { input -> entryBytes = input.copyTo(zip) }
                     zip.closeEntry()
                     if (settingsJson != null) {
                         zip.putNextEntry(ZipEntry(SETTINGS_ENTRY_NAME))
                         zip.write(settingsJson.toByteArray(Charsets.UTF_8))
                         zip.closeEntry()
                     }
+                    zip.putNextEntry(ZipEntry(MANIFEST_ENTRY_NAME))
+                    zip.write(manifestJson.toByteArray(Charsets.UTF_8))
+                    zip.closeEntry()
                 }
             }
         }
+        // #1807: the file is written and valid either way — this only reports whether restoring it will
+        // need the user to confirm.
+        return ExportOutcome(
+            bytes = entryBytes,
+            overRestoreCeiling = overRestoreCeiling(entryBytes),
+            limitBytes = MAX_BACKUP_SQLITE_BYTES,
+        )
     }
 
     /**
@@ -146,7 +223,7 @@ object DataBackup {
      * On any error the current database is left exactly as it was. On success the caller
      * MUST instruct the user to fully restart the app.
      */
-    fun importFrom(context: Context, uri: Uri): ImportResult {
+    fun importFrom(context: Context, uri: Uri, allowOversize: Boolean = false): ImportResult {
         val appContext = context.applicationContext
         val resolver = appContext.contentResolver
 
@@ -170,7 +247,8 @@ object DataBackup {
         val tempSettings = File(appContext.cacheDir, "import-settings.json")
         tempSettings.delete()
         try {
-            when (val staged = stageBackupSqlite(resolver.openInputStream(uri), header, tempSqlite, tempSettings)) {
+            when (stageBackupSqlite(resolver.openInputStream(uri), header, tempSqlite, tempSettings,
+                                    allowOversize = allowOversize)) {
                 StageResult.OK -> Unit
                 StageResult.CANNOT_OPEN -> return ImportResult.Failed("Could not open the chosen file.")
                 StageResult.NO_DB_IN_ZIP -> {
@@ -180,7 +258,14 @@ object DataBackup {
                 StageResult.ENTRY_TOO_LARGE -> {
                     tempSqlite.delete()
                     tempSettings.delete()
-                    return ImportResult.Failed("The backup archive is too large to restore safely.")
+                    // #1807: recoverable, so the caller gets a case it can offer to override rather than
+                    // a dead-end message.
+                    // Carries the SAME sentence the old Failed branch showed, deliberately: it is already
+                    // in the audit baseline, so surfacing the override needs no new untranslated copy.
+                    return ImportResult.TooLarge(
+                        "The backup archive is too large to restore safely.",
+                        MAX_BACKUP_SQLITE_BYTES,
+                    )
                 }
                 StageResult.NOT_A_BACKUP -> return ImportResult.Failed(
                     "That file is not a NOOP backup - it doesn't look like a .noopbak archive or a SQLite database."
@@ -361,6 +446,8 @@ object DataBackup {
         header: ByteArray,
         dest: File,
         settingsDest: File? = null,
+        /** #1807: lift the SQLite cap for a file the USER chose. See [ImportResult.TooLarge]. */
+        allowOversize: Boolean = false,
     ): StageResult {
         if (input == null) return StageResult.CANNOT_OPEN
         input.use { stream ->
@@ -375,7 +462,7 @@ object DataBackup {
                                 !entry.isDirectory && !foundDb &&
                                     entry.name.substringAfterLast('/') == ZIP_ENTRY_NAME -> {
                                     FileOutputStream(dest).use { out ->
-                                        if (!copyBounded(zip, out, MAX_BACKUP_SQLITE_BYTES)) {
+                                        if (!copyBounded(zip, out, sqliteCap(allowOversize))) {
                                             dest.delete()
                                             return StageResult.ENTRY_TOO_LARGE
                                         }
@@ -402,7 +489,7 @@ object DataBackup {
                 }
                 header.startsWith(SQLITE_MAGIC) -> {
                     FileOutputStream(dest).use { out ->
-                        if (!copyBounded(stream, out, MAX_BACKUP_SQLITE_BYTES)) {
+                        if (!copyBounded(stream, out, sqliteCap(allowOversize))) {
                             dest.delete()
                             return StageResult.ENTRY_TOO_LARGE
                         }
@@ -413,6 +500,20 @@ object DataBackup {
             }
         }
     }
+
+    /**
+     * Whether a database of [entryBytes] is past the ceiling the RESTORE path enforces (#1807).
+     *
+     * Strictly greater: a database exactly at the cap still restores, because `copyBounded` refuses only
+     * when a write would take it OVER. Extracted so the boundary is testable — proving it end to end
+     * would need a >2 GiB fixture, and a test that recomputes the comparison and asserts its own
+     * arithmetic proves nothing.
+     */
+    internal fun overRestoreCeiling(entryBytes: Long): Boolean = entryBytes > MAX_BACKUP_SQLITE_BYTES
+
+    /** The SQLite cap, lifted when the user has chosen to go ahead for a file they picked. (#1807) */
+    internal fun sqliteCap(allowOversize: Boolean): Long =
+        if (allowOversize) Long.MAX_VALUE else MAX_BACKUP_SQLITE_BYTES
 
     private fun copyBounded(input: java.io.InputStream, out: java.io.OutputStream, cap: Long): Boolean {
         val buffer = ByteArray(DEFAULT_BUFFER_SIZE)

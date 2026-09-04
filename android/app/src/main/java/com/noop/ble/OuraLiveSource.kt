@@ -52,6 +52,32 @@ import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 
 /**
+ * The label a discovered ring is listed under: its advertised local name, or [fallback] when it did not
+ * advertise one.
+ *
+ * A BONDED ring routinely stops advertising a local name, so the blank case is the NORMAL case for the
+ * ring a user most wants to reconnect to (#1776), not an error path - the scan's ScanFilter is the only
+ * gate and the name is a label. Callers therefore never see a blank `DiscoveredRing.name`, which is why
+ * the wizard renders it unguarded on both platforms (#1783 reads that as a missing guard; the guard is
+ * here, at the single construction site).
+ *
+ * BLANK, not empty. `isBlank` treats an all-whitespace name as absent; the Swift twin
+ * `ouraAdvertisedLabel` in `Strand/BLE/OuraLiveSource.swift` used `isEmpty`, which does not, so a ring
+ * advertising `" "` listed as "Oura" here and blank there - the exact silent Kotlin/Swift divergence the
+ * parity contract calls out. Both sides now treat whitespace as absent and return the name UNTRIMMED
+ * when it is present, and `OuraNamelessRingDiscoveryTest` pins this function against the Swift twin's
+ * own output. The two agree over ASCII whitespace, ordinary names, and U+00A0. `ifBlank` does NOT test
+ * `Character.isWhitespace`, which would indeed exclude U+00A0; it tests Kotlin's `Char.isWhitespace`,
+ * defined as `Character.isWhitespace(c) || Character.isSpaceChar(c)`, and the second disjunct restores
+ * every non-breaking space the first drops. The pair parts only on U+0085 (blank on Apple, not here)
+ * and U+001C-U+001F (blank here, not on Apple), which no BLE local name carries - stated rather than
+ * silently overclaimed.
+ */
+internal fun ouraAdvertisedLabel(advertisedName: String, fallback: String): String =
+    advertisedName.ifBlank { fallback }
+
+
+/**
  * EXPERIMENTAL, ISOLATED live-BLE source for the Oura ring (gen3 / gen4 / gen5).
  *
  * Faithful Kotlin twin of Strand/BLE/OuraLiveSource.swift. This replaced an earlier honest dead-end
@@ -105,6 +131,9 @@ class OuraLiveSource(
      *  Oura's SleepNet staging win over NOOP's sparse-motion computed night. Wired to
      *  `repository.upsertSleepSessions`; default no-op so the discovery-only scanner + tests stay inert. */
     private val persistSleepSession: (OuraSleepSession, String) -> Unit = { _, _ -> },
+    /** #1284 residual 3 (default OFF): read live at persist — when true, an Oura hypnogram night is keyed on
+     *  its rounded 0x49 onset (stable per-night anchor) instead of the end-anchored first-code time. */
+    private val onsetKeying: () -> Boolean = { false },
     /** Diagnostic sink for the connect/auth/stream lifecycle - the SAME exportable strap log (#421).
      *  Every line is prefixed "Oura: ". Statuses / UUIDs / counts only, NEVER a device address. Default
      *  no-op keeps existing call sites compiling and tests silent. */
@@ -227,7 +256,8 @@ class OuraLiveSource(
      * connecting, so the fresh per-connection driver is built with `allowKeyInstall == true` and the
      * dangerous install can run for exactly that session. It takes effect on the next connect (the driver
      * is re-created per connection); a connection already mid-flight is not retro-granted. Default-false
-     * everywhere else keeps the dangerous opcode unreachable. Kotlin twin of Swift's `setAdoptIntent`.
+     * everywhere else keeps the dangerous opcode unreachable. On Swift, the architectural counterpart is
+     * the immutable `OuraLiveSource.adoptIntent` initializer input; there is no setter twin.
      */
     fun setAdoptIntent(intent: Boolean) {
         adoptIntent = intent
@@ -249,6 +279,11 @@ class OuraLiveSource(
      *  of the Swift `OuraMotionDump`. Null when there is no device id. */
     private val motionDump: OuraMotionDump? =
         if (deviceId.isNotEmpty()) OuraMotionDump(appContext, deviceId, log) else null
+
+    /** 0x7E/0x7F real_steps research corpus (Tier-B), for offline investigation. Kotlin twin of the Swift
+     *  `OuraRealStepsDump`. Null when there is no device id. */
+    private val realStepsDump: OuraRealStepsDump? =
+        if (deviceId.isNotEmpty()) OuraRealStepsDump(appContext, deviceId, log) else null
     private val scanner: BluetoothLeScanner? get() = adapter?.bluetoothLeScanner
 
     private var gatt: BluetoothGatt? = null
@@ -276,6 +311,14 @@ class OuraLiveSource(
     private var loggedFirstTemp = false
     /** Logs the FIRST SpO2 sample decoded this session only. Twin of [loggedFirstTemp]. */
     private var loggedFirstSpo2 = false
+    /** The 0x13 SyncTime reply parked because nothing yet available could disambiguate its unit (ticks vs
+     *  seconds x10): the resume cursor was 0 (fresh pair / post-reboot full pull) or so stale the ring's
+     *  clock had run past the window. Retried against the drain's maxSeenRingTime as the first batch lands
+     *  (2026-09-02/03 captures). The ORIGINAL receipt wall-clock is carried along, because THAT is the instant the ring's
+     *  counter pairs with - re-stamping at retry time would skew the anchor by the drain's latency.
+     *  Twin of Swift's pendingSyncTime. */
+    private var pendingSyncTime: Triple<Long, Int, Long>? = null
+
     /** Logs the FIRST ring-time -> UTC anchor of this session only (s5.5); reset on stop/disconnect. */
     private var loggedAnchor = false
     /** Tier-B (UNVERIFIED) kinds ("activity" / "real_steps" / "sleep_summary" / "spo2_smoothed") already
@@ -507,6 +550,16 @@ class OuraLiveSource(
      */
     private val recentSleepWindows049 = ArrayList<Triple<Long, Int, Int>>()
 
+    /**
+     * #1284 residual 3 (duplicate-generation diagnostic): the [start, end] window of each sleep session
+     * banked THIS connection. The session PK is (deviceId, startTs) and the burst end moves with the 0x49
+     * drain, so an early partial drain can bank a short session that a later full burst then nests inside,
+     * minting a second row that the #899 heal only cleans up afterwards. Comparing each new persist against
+     * this list surfaces the GENERATION in the strap log (the heal side is #899's own line). Diagnostic only,
+     * nothing is skipped. Bounded; cleared on disconnect with the 0x49 windows. Twin of Swift's.
+     */
+    private val recentPersistedSessionWindows = ArrayList<Pair<Long, Long>>()
+
     /** 0x71 fixture capture (#287): per-session count + observed payload lengths; log cap vs flooding. */
     private var greenIbiAmpCount = 0
     private val greenIbiAmpLengths = sortedSetOf<Int>()
@@ -706,8 +759,16 @@ class OuraLiveSource(
         // Reconstruct the time axis; `sleepStart` (the 0x49 onset, or null) clips leading pre-window codes
         // in the PURE assembler (never emptying the night). Testable there; the app just logs the trim.
         val laid = burst.codesWithTimes(endUnixSeconds = end, sleepStartUnixSeconds = sleepStart)
+        // #1246: an all-unwritten burst (every hypnogram page erased) reconstructs to nothing. Note the
+        // resume cursor so the ring stops re-serving it, but persist no blank/awake session.
+        if (laid.isEmpty()) {
+            log("Oura: hypnogram burst entirely unwritten (0xFF) - ${burst.totalCodes} code(s), no stageable sleep; skipped")
+            drain.noteStoredRingTime(burst.lastRingTimestamp, resumeCursorAtFetchStart)
+            return
+        }
         if (laid.size < burst.totalCodes) {
-            log("Oura: hypnogram start clamped to 0x49 onset - dropped ${burst.totalCodes - laid.size} pre-window code(s)")
+            // Fewer laid than decoded = unwritten (#1246, 0xFF pages) and/or pre-0x49-onset epochs trimmed.
+            log("Oura: hypnogram trimmed ${burst.totalCodes - laid.size} code(s) - unwritten (0xFF) and/or pre-onset")
         }
         for (code in laid) enqueue(listOf(OuraEvent.SleepPhaseEvent(code.phase)), code.ts.toInt())
         drain.noteStoredRingTime(burst.lastRingTimestamp, resumeCursorAtFetchStart)
@@ -719,10 +780,44 @@ class OuraLiveSource(
         // breakdown) under the ring's own deviceId, so mergeSleepRichness surfaces Oura's SleepNet staging
         // over NOOP's computed night (#325 persist). Uses the anchored+0x49-refined `end` via `laid`. The
         // confirmation line makes the persist self-evident in the strap log for on-device validation.
-        OuraSleepSessionMapping.session(laid.map { it.ts to it.phase.stage })?.let {
-            persistSleepSession(it, deviceId)
-            val effStr = it.efficiency?.let { e -> "${(e * 100).toInt()}%" } ?: "n/a"
-            log("Oura: sleep session persisted [${laid.first().ts} -> $end] eff=$effStr -> $deviceId (ring-provided night; wins merge over computed)")
+        OuraSleepSessionMapping.session(laid.map { m -> m.ts to m.phase.stage })?.let { mapped ->
+            // #1284 residual 3: when onset keying is on and a 0x49 onset was applied, key the session's
+            // startTs on the ROUNDED onset (stable across the ring's re-serves) rather than the end-anchored
+            // first-code time — so re-serves of one night share a PK and the bedtime is the true onset. The
+            // completeness guard in the persist closure then suppresses/replaces any duplicate.
+            val onset = sleepStart
+            val session = if (onsetKeying() && onset != null) {
+                mapped.copy(startTs = com.noop.analytics.SleepSessionDedup.keyedStart(onset))
+            } else {
+                mapped
+            }
+            val start = session.startTs
+            // #1284 residual 3: log when this persist lands wholly inside — or overlapping — a session already
+            // banked this connection. That is the duplicate GENERATION (an early partial drain banked a short
+            // session; this fuller burst nests it), which the #899 heal only cleans up afterward. Include the
+            // 0x49 anchor state, since a persist with NO 0x49 anchor is the prime suspect for the short row.
+            // Diagnostic only — nothing is skipped here; the fix is 0x49-window session keying (hardware-gated).
+            recentPersistedSessionWindows.firstOrNull { (s, e) -> start < e && end > s }?.let { (s, e) ->
+                val nested = start >= s && end <= e
+                val anchor = if (sleepStart != null) "0x49 onset=$sleepStart" else "no 0x49 onset (start derived from burst end)"
+                log("Oura: duplicate-gen(#1284) new session [$start -> $end] ${if (nested) "NESTED IN" else "OVERLAPS"} " +
+                    "already-banked [$s -> $e] this connection - $anchor; PK=(deviceId,startTs) mints a 2nd row")
+            }
+            recentPersistedSessionWindows.add(start to end)
+            if (recentPersistedSessionWindows.size > RECENT_PERSISTED_SESSIONS_CAP) {
+                recentPersistedSessionWindows.subList(0, recentPersistedSessionWindows.size - RECENT_PERSISTED_SESSIONS_CAP).clear()
+            }
+            persistSleepSession(session, deviceId)
+            val effStr = session.efficiency?.let { e -> "${(e * 100).toInt()}%" } ?: "n/a"
+            // #1284 residual 3: stamp the 0x49 anchor state on EVERY persist, so an unanchored early-drain row
+            // (the prime suspect for the short nested duplicate) is self-evident even when it is the FIRST
+            // persist, before the duplicate-gen line above can fire.
+            // #1284: log the SESSION's STORED window, not the pre-trim burst window. The #1293
+            // trailing-run trim shortens the persisted end, so [$start -> $end] (from the burst) reads
+            // ~tens of minutes wider than the row — every future capture then reads the wrong window out
+            // of the log. session.startTs/.endTs are exactly what persistSleepSession banks.
+            val anchorTag = if (sleepStart != null) "0x49-onset" else "no-0x49-onset"
+            log("Oura: sleep session persisted [${session.startTs} -> ${session.endTs}] eff=$effStr [$anchorTag] -> $deviceId (ring-provided night; wins merge over computed)")
         }
     }
 
@@ -748,27 +843,71 @@ class OuraLiveSource(
     }
 
     /**
+     * The ring-time floor the 0x13 unit test disambiguates against: the persisted resume cursor, or the
+     * largest envelope ring-time this drain has seen when that is further along. maxSeenRingTime is the
+     * half that breaks the deadlock (2026-09-02/03 captures) — it counts EVERY history record, anchored or not, so it is
+     * readable with no anchor, whereas the cursor can only advance once an anchor exists.
+     * Twin of Swift's syncTimeAnchorLowerBound.
+     */
+    private val syncTimeAnchorLowerBound: Long
+        get() = maxOf(historyCursor, drain.maxSeenRingTime)
+
+    /**
+     * Try to turn a 0x13 SyncTime reply into this session's UTC anchor, returning whether it stuck.
+     * [receivedAt] is the host wall-clock at the moment the reply ARRIVED (not now), since that is the
+     * instant the ring's counter pairs with. Shared by the at-connect attempt and the retry.
+     * Twin of Swift's adoptSyncTimeAnchor.
+     */
+    private fun adoptSyncTimeAnchor(
+        d: OuraDriver,
+        deviceTimestamp: Long,
+        status: Int,
+        receivedAt: Long,
+        source: String,
+    ): Boolean {
+        val rt = OuraDriver.syncTimeAnchorCandidate(deviceTimestamp, syncTimeAnchorLowerBound)
+            ?: return false
+        if (!d.adoptSyncTimeAnchor(ringTimestamp = rt, unixSeconds = receivedAt)) return false
+        val unit = if (rt == deviceTimestamp) "ticks" else "seconds x10"
+        val raw = "0x%08x".format(deviceTimestamp)
+        if (!loggedAnchor) {
+            loggedAnchor = true
+            log("Oura: UTC anchor from SyncTime response (0x13) $source - device rt $rt [$unit, " +
+                "raw $raw, status $status] = its receipt time; no 0x42 needed this session")
+        }
+        drainPendingAnchorEvents()
+        drainPendingHypnogramBursts()
+        return true
+    }
+
+    /**
      * Anchor from the 0x13 SyncTime response (ringverse: the ring's clock counter when it processed
-     * our SyncTime, paired with host wall-clock at receipt). The tick unit is disambiguated against
-     * the persisted resume cursor; no unambiguous reading → log the raw value and adopt NOTHING (an
-     * honest missing anchor beats a guessed one). Kotlin twin of Swift's handleSyncTimeResponse.
+     * our SyncTime, paired with host wall-clock at receipt). The tick unit is disambiguated against a
+     * known-earlier ring-time. At connect the only reference is the resume cursor, which is 0 on a fresh
+     * pair and may be far staler than the ring's clock; rather than discard the reply, PARK it and retry
+     * once history starts landing (2026-09-02/03 captures). Still adopts NOTHING on ambiguity — an honest missing anchor
+     * beats a guessed one. Kotlin twin of Swift's handleSyncTimeResponse.
      */
     private fun handleSyncTimeResponse(d: OuraDriver, resp: com.noop.oura.SyncTimeResponse) {
         val now = System.currentTimeMillis() / 1000L
+        if (adoptSyncTimeAnchor(d, resp.deviceTimestamp, resp.status, now, "at connect")) return
+        pendingSyncTime = Triple(resp.deviceTimestamp, resp.status, now)
         val raw = "0x%08x".format(resp.deviceTimestamp)
-        val rt = OuraDriver.syncTimeAnchorCandidate(resp.deviceTimestamp, historyCursor)
-        if (rt != null && d.adoptSyncTimeAnchor(ringTimestamp = rt, unixSeconds = now)) {
-            val unit = if (rt == resp.deviceTimestamp) "ticks" else "seconds x10"
-            if (!loggedAnchor) {
-                loggedAnchor = true
-                log("Oura: UTC anchor from SyncTime response (0x13) - device rt $rt [$unit, raw $raw, " +
-                    "status ${resp.status}] = now; no 0x42 needed this session")
-            }
-            drainPendingAnchorEvents()
-            drainPendingHypnogramBursts()
-        } else {
-            log("Oura: SyncTime response (0x13) raw $raw status ${resp.status} - no unambiguous tick " +
-                "reading vs cursor $historyCursor; anchor NOT adopted (investigation)")
+        log("Oura: SyncTime response (0x13) raw $raw status ${resp.status} - no unambiguous tick " +
+            "reading vs ring-time floor $syncTimeAnchorLowerBound; parked, retrying as history lands " +
+            "(investigation)")
+    }
+
+    /**
+     * Retry a parked 0x13 reply now that the drain has seen real ring-times. Silent on failure (the
+     * parked reply simply waits for a better floor); one line on success, from [adoptSyncTimeAnchor].
+     * Twin of Swift's retryPendingSyncTimeAnchor.
+     */
+    private fun retryPendingSyncTimeAnchor(d: OuraDriver) {
+        val parked = pendingSyncTime ?: return
+        if (drain.maxSeenRingTime <= 0) return
+        if (adoptSyncTimeAnchor(d, parked.first, parked.second, parked.third, "resolved against history")) {
+            pendingSyncTime = null
         }
     }
 
@@ -809,8 +948,9 @@ class OuraLiveSource(
             log("Oura: Bluetooth adapter is off - cannot scan")
             return
         }
-        // Filter by the ring's base service so a broad scan does not surface unrelated peripherals; the
-        // callback further confirms the advertised name reads as an Oura ring.
+        // Filter by the ring's base service so a broad scan does not surface unrelated peripherals. This
+        // ScanFilter is the ONLY discovery gate — the callback does not re-filter on the advertised name,
+        // because a bonded ring often advertises none; see the note in `scanCallback`.
         val filter = ScanFilter.Builder()
             .setServiceUuid(ParcelUuid(SERVICE_UUID))
             .build()
@@ -866,6 +1006,7 @@ class OuraLiveSource(
         loggedFirstTemp = false
         loggedFirstSpo2 = false
         loggedAnchor = false
+        pendingSyncTime = null
         loggedTierBKinds.clear()
         loggedFeatureStatuses.clear()
         loggedProductInfo.clear()
@@ -882,6 +1023,7 @@ class OuraLiveSource(
         hypnogramAssembler.reset()        // never replay a half-accumulated burst from a dead session
         pendingUnanchoredBursts.clear()
         recentSleepWindows049.clear()
+        recentPersistedSessionWindows.clear()
         greenIbiAmpCount = 0
         greenIbiAmpLengths.clear()
         // Resume the GetEvents cursor from where the LAST connection to this ring left off (s5.1/5.3), so a
@@ -935,6 +1077,18 @@ class OuraLiveSource(
         hypnogramAssembler.flush()?.let { persistHypnogramBurst(it) }
         drainPendingAnchorEvents()
         dropUnanchoredHypnogramBursts()
+        // #1526 follow-up, twin of the Swift `stop()` call: cancelling the re-engage does NOT stop the
+        // ring. That is the "just stop poking it" assumption #1526's captures falsified -- daytime-HR
+        // left in mode 0x01 kept pushing green 0x80 all night, and the ring's ~20 s auto-revert never
+        // fired. A teardown that only cancels the timer therefore hands back a ring still in daytime
+        // mode, blocking its own sleep suite. Send the same disable + unsubscribe pair before the link
+        // goes, and BEFORE driver.stop() so the phase check below still sees Streaming.
+        //
+        // Best-effort by nature: WRITE_TYPE_NO_RESPONSE goes to the controller immediately, but the
+        // disconnect follows in the next statement and nothing guarantees a flush. It closes the common
+        // cases -- user disconnect, source switch, Bluetooth off -- and a process kill cannot be covered
+        // at all, which is a transport limit rather than a gap in this fix.
+        disableLiveHR()
         driver?.stop()
         gatt?.let { runCatching { it.disconnect(); it.close() } }
         gatt = null
@@ -945,6 +1099,7 @@ class OuraLiveSource(
         loggedFirstTemp = false
         loggedFirstSpo2 = false
         loggedAnchor = false
+        pendingSyncTime = null
         loggedTierBKinds.clear()
         loggedFeatureStatuses.clear()
         loggedProductInfo.clear()
@@ -1025,16 +1180,21 @@ class OuraLiveSource(
             val device = result.device ?: return
             val address = device.address ?: return
             val name = result.scanRecord?.deviceName ?: runCatching { device.name }.getOrNull() ?: ""
-            // Confirm the advertised name reads as an Oura ring (the service filter is the primary gate;
-            // this rejects anything that slipped through advertising the same base service).
-            if (ExperimentalBrand.recognise(name) != ExperimentalBrand.OURA) return
             val firstSight = seen.put(address, device) == null   // null → not seen before this scan
-            if (firstSight) log("Oura: found $name ($address) rssi ${result.rssi}")
-            // Best-effort generation guess from the advertised name (confirmed by the model the user picks).
+            if (firstSight) log("Oura: found ${ouraAdvertisedLabel(name, "Oura ring")} ($address) rssi ${result.rssi}")
+            // Best-effort generation guess from the advertised name — a LABEL only (the wizard falls back
+            // to GEN3 when it is null). Nothing is dropped here: startScan's ScanFilter pins SERVICE_UUID in
+            // the BT stack, so that is the gate, and a ring is listed even when it advertises no local name
+            // at all. This callback USED TO drop a nameless device (`ExperimentalBrand.recognise(name) !=
+            // OURA`, and `recognise("")` is null because no brand token is a substring of ""), so a BONDED
+            // ring — which often stops advertising a local name, and whose Android `device.name` bond-cache
+            // fallback is empty when the bond lives elsewhere — was the one ring the wizard could not show.
+            // Twin of the Apple side (Strand/BLE/OuraLiveSource.swift), which has always listed on the
+            // service filter alone. Do not re-add a name-based drop here.
             val detectedGen = OuraRingGen.recognise(name)
             val ring = DiscoveredRing(
                 address = address,
-                name = name.ifBlank { "Oura" },
+                name = ouraAdvertisedLabel(name, "Oura"),
                 rssi = result.rssi,
                 detectedGen = detectedGen,
             )
@@ -1085,6 +1245,7 @@ class OuraLiveSource(
                     loggedFirstTemp = false
                     loggedFirstSpo2 = false
                     loggedAnchor = false
+                    pendingSyncTime = null
                     loggedTierBKinds.clear()
         loggedFeatureStatuses.clear()
         loggedProductInfo.clear()
@@ -1340,6 +1501,22 @@ class OuraLiveSource(
         }
     }
 
+    /**
+     * Hand the ring back out of daytime-HR mode: the feature-mode write plus the unsubscribe the enable
+     * triplet leaves standing. Twin of Swift `OuraLiveSource.disableLiveHR`.
+     *
+     * `liveHRDisable` alone only touches the MODE byte, so without the unsubscribe the notification
+     * channel stays open for the ring's own adaptive sampling to push through -- which is why #1526
+     * corrected the byte (0x01 "automatic" was never "off") and added the pair. The Streaming guard
+     * covers the callers: there is nothing to disable if the session never got that far.
+     */
+    private fun disableLiveHR() {
+        val d = driver ?: return
+        if (d.phase != OuraDriverPhase.Streaming) return
+        write(OuraCommands.liveHRDisable())
+        write(OuraCommands.liveHRUnsubscribe())
+    }
+
     /** Write one built command to the ring's write characteristic (Write Without Response). Logged by its
      *  short label only (never bytes or an address). */
     private fun write(cmd: OuraCommand) = guardedCallback("write") {
@@ -1452,6 +1629,10 @@ class OuraLiveSource(
                 for (e in events) {
                     e.envelopeRingTimestamp?.let { drain.noteSeenRingTime(it) }
                 }
+                // The drain now has a ring-time reference that needs no anchor, so a 0x13 reply parked at
+                // connect may be resolvable. Retry BEFORE emit, so this batch anchors straight away
+                // instead of parking into pendingAnchorEvents and being drained a moment later (2026-09-02/03 captures).
+                retryPendingSyncTimeAnchor(d)
                 if (pendingContinuation && events.isNotEmpty()) {
                     handler.removeCallbacks(batchQuietRunnable)
                     handler.postDelayed(batchQuietRunnable, batchQuietMs)
@@ -1719,8 +1900,10 @@ class OuraLiveSource(
                     // Other Tier-B tags (real_steps / activity-summary / sleep-summary / smoothed-SpO2,
                     // OURA_PROTOCOL.md s7.3; PR #960): logged ONCE PER KIND with the raw bytes so we can
                     // see whether the ring sends these tags at all and collect capture material - e.g.
-                    // real_steps 0x7E/0x7F is server-flag-gated OFF by default ([open_oura-feat]), so its
-                    // continued absence here is the ring's doing, not a decode gap.
+                    // real_steps 0x7E/0x7F was assumed server-flag-gated OFF ([open_oura-feat]), which
+                    // made its absence self-explanatory. That no longer holds: the ring's own status read
+                    // came back ENABLED on-device (#1629), so gating does NOT explain why these tags never
+                    // arrive, and whether that is the ring's doing or a decode gap is currently unknown.
                     if (loggedTierBKinds.add(e.value.kind)) {
                         val hex = e.value.rawPayload.joinToString(" ") { "%02x".format(it) }
                         log("Oura: Tier-B ${e.value.kind} seen (tag 0x${e.value.tag.toString(16)}) - raw: $hex")
@@ -1742,6 +1925,49 @@ class OuraLiveSource(
                         secPerSample = 60, met = e.value.met, // 60 s = assumed MET cadence (s6.13)
                     )
                 }
+            }
+            is OuraEvent.RealStepsFields -> {
+                // INVESTIGATION ONLY (0x7E/0x7F real_steps_features, Tier B - a cited third-party unpack
+                // formula [oura-rs], NOT ground-truth-validated; see OuraRealStepsFields). Logged once per
+                // kind (like the other raw Tier-B tags) rather than every occurrence - this stream runs at
+                // a much higher rate than 0x50 MET, so the JSONL corpus is the real record; the strap log
+                // just confirms the ring sends it at all. Never persisted, never scored, and NEVER
+                // converted into steps (OuraStreamMapping drops RealStepsFields unconditionally) - not
+                // even from fields[0]/fields[8], which ground truth showed are movement FEATURES, not a
+                // count (a 13,349-step day; every field large and non-zero asleep - OURA_PROTOCOL.md s6.13).
+                if (loggedTierBKinds.add("real_steps_fields")) {
+                    log("Oura: Tier-B real_steps_fields seen (tag 0x${e.value.tag.toString(16)}) - first fields: ${e.value.fields}")
+                }
+                d.unixSeconds(forRingTimestamp = e.value.ringTimestamp)?.let { utc ->
+                    realStepsDump?.record(tag = e.value.tag, ringTs = e.value.ringTimestamp, utc = utc, fields = e.value.fields)
+                }
+            }
+            is OuraEvent.SleepPeriodInfo -> {
+                // 0x6A sleep_period_info (Tier B - third-party field NAMES [open_ring] over offsets our
+                // own s6.12 already had; see OuraSleepPeriodInfo). Logged with the DECODED values every
+                // time, like 0x50 MET rather than once-per-kind: its cadence is a modest ~5 min and the
+                // series is what the respiration ledger is reconstructed from, sample by sample.
+                //
+                // The record's `breath` field is also PERSISTED, and on a ring night it is what
+                // `dailyMetric.respRateBpm` is scored from: anchored to its own ring-time and enqueued
+                // exactly like the sibling banked streams (Hrv/Temp/Spo2), so a night's ~5-min windows
+                // land where they were MEASURED and never at the drain-arrival moment. OuraStreamMapping
+                // maps that ONE field onto a `respSample` row in milli-bpm; everything else in this record
+                // stays here in the log. The logging is kept as well as the row: it covers records no
+                // anchor can place, and it carries the fields the store deliberately does not.
+                //
+                // Twin of Swift's `.sleepPeriodInfo` log line, with one deliberate difference: Swift
+                // prints a formatted clock time because that source already holds a formatter, and this
+                // one holds none - the anchored epoch seconds correlate just as well, and adding a
+                // formatter here only to match a log string would be the wrong kind of parity.
+                val v = e.value
+                val whenUtc = d.unixSeconds(forRingTimestamp = v.ringTimestamp)?.toString() ?: "no anchor yet"
+                log(
+                    "Oura: sleep_period (Tier-B) [$whenUtc] hr=${v.averageHrBpm} trend=${v.hrTrend} " +
+                        "breath=${v.breathsPerMin} breathV=${v.breathVariability} " +
+                        "motion=${v.motionCount} state=${v.sleepState}",
+                )
+                enqueueAnchoredOrPark(e, v.ringTimestamp, d)
             }
             is OuraEvent.MotionVectorEvent -> {
                 // 0x47 averaged accel vector (Tier-A). Persisted as an OURA_MOTION event (same event-table
@@ -1891,6 +2117,9 @@ class OuraLiveSource(
 
         /** Bound on stashed 0x49 windows (twin of Swift's recentSleepWindows049Cap). */
         private const val RECENT_SLEEP_WINDOWS_049_CAP = 16
+
+        /** Bound on the #1284 duplicate-generation window list (twin of Swift's). */
+        private const val RECENT_PERSISTED_SESSIONS_CAP = 16
 
         /**
          * The 0x49 window in [windows] whose envelope ring-time is nearest [rt] and within [tolerance]

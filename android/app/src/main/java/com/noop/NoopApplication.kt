@@ -12,13 +12,16 @@ import com.noop.data.DeviceRegistry
 import com.noop.data.WhoopDatabase
 import com.noop.data.WhoopRepository
 import com.noop.ui.NoopPrefs
+import com.noop.ui.AppLanguagePrefs
+import com.noop.push.SelfHostedPushScheduler
 import kotlinx.coroutines.runBlocking
 
 /**
  * Application entry point.
  *
  * NOOP is a fully on-device WHOOP companion: it connects to the strap over BLE and persists
- * everything locally via Room. There is no network layer (the opt-in AI Coach aside).
+ * everything locally via Room. Network access is opt-in: the AI Coach and the experimental,
+ * one-way self-hosted push are both disabled by default.
  *
  * The data layer ([WhoopRepository]) and the BLE client ([WhoopBleClient]) are owned **here**, at the
  * process level, rather than by the Activity-scoped AppViewModel. That is what lets a connection keep
@@ -30,7 +33,7 @@ import kotlinx.coroutines.runBlocking
 class NoopApplication : Application() {
 
     override fun attachBaseContext(base: Context) {
-        super.attachBaseContext(base)
+        super.attachBaseContext(AppLanguagePrefs.wrap(base))
         // UI resource lookup is intentionally available before onCreate: data-driven presentation
         // helpers (release notes, metric catalogs) can resolve a resource without becoming
         // @Composable or retaining an Activity. The Application is process-scoped, so this does not
@@ -40,37 +43,68 @@ class NoopApplication : Application() {
 
     override fun onCreate() {
         super.onCreate()
+        // Install before any app-owned startup work so even an early failure is preserved for the
+        // recovery screen on the next launch.
+        CrashCapture.install(this)
         // #1008: pin the pre-change Overnight-only default for existing installs before anything
         // reads it. Idempotent; a no-op on fresh installs and on every launch after the first.
         com.noop.ui.NoopPrefs.migrateContinuousHrvOvernightDefault(this)
-        // Record any uncaught crash to a file so it rides along in the shareable strap log — a
-        // device-specific crash (e.g. Insights #224/#267) is otherwise lost to an unreachable logcat.
-        CrashCapture.install(this)
     }
 
     /** Process-wide Room-backed store. One instance shared by the UI and the background service. */
     val repository: WhoopRepository by lazy {
-        WhoopRepository(WhoopDatabase.get(this).whoopDao())
+        WhoopRepository(WhoopDatabase.get(this))
     }
 
     /** Process-wide device registry over the same Room DB — the single source of the active device id. */
     val deviceRegistry: DeviceRegistry by lazy { DeviceRegistry(WhoopDatabase.get(this)) }
 
     /**
-     * Active device id resolved once at startup from the registry, falling back to the legacy
-     * "my-whoop" if the registry has none yet (so behaviour is unchanged today). Read with a guarded
-     * blocking call — a one-off indexed `LIMIT 1` query at composition time. Any failure (e.g. an early
-     * read before migration) is swallowed and falls back, so startup can never be broken by this.
+     * Active device id, resolved once at startup from the registry and falling back to the legacy
+     * "my-whoop" if the registry has none yet. Read with a guarded blocking call — a one-off indexed
+     * `LIMIT 1` query at composition time. Any failure (e.g. an early read before migration) is swallowed
+     * and falls back, so startup can never be broken by this.
+     *
+     * #1303: NOT a `by lazy`. Serial adoption re-points the ACTIVE device mid-process, and a lazy is
+     * frozen for the life of the process — so every consumer below kept the pre-adoption id until the next
+     * cold start, and the engine went on deriving days under it. Field-confirmed on a 5/MG: the registry
+     * read `whoop-<serial>` while the diagnostics export, and the scoring pass, still used the old
+     * address-based id, splitting the computed history across both until the phone was restarted. Adoption
+     * now calls [onActiveDeviceAdopted] and the handle follows within the process.
      */
-    val activeDeviceId: String by lazy {
-        runCatching { runBlocking { deviceRegistry.activeDeviceId() } }
-            .onFailure { Log.w("NoopApplication", "activeDeviceId resolve failed; using fallback", it) }
-            .getOrNull() ?: WhoopBleClient.DEFAULT_DEVICE_ID
+    @Volatile
+    var activeDeviceId: String = ""
+        get() {
+            if (field.isEmpty()) {
+                field = runCatching { runBlocking { deviceRegistry.activeDeviceId() } }
+                    .onFailure { Log.w("NoopApplication", "activeDeviceId resolve failed; using fallback", it) }
+                    .getOrNull() ?: WhoopBleClient.DEFAULT_DEVICE_ID
+            }
+            return field
+        }
+        private set
+
+    /**
+     * Point this process at the id a strap just adopted (#1303).
+     *
+     * Only the handle moves: the registry write and the row migration have already happened inside
+     * `adoptSerialIdentity`, and the BLE client is re-pointed by its own caller. Kept narrow and
+     * idempotent so a reconnect that re-adopts the same id costs nothing.
+     */
+    fun onActiveDeviceAdopted(newId: String) {
+        if (newId.isNotEmpty() && newId != activeDeviceId) activeDeviceId = newId
     }
 
     /** Process-wide BLE client. Owns the GATT connection and outlives any single Activity/ViewModel. */
     val ble: WhoopBleClient by lazy {
-        WhoopBleClient(applicationContext, repository = repository, deviceId = activeDeviceId).apply {
+        WhoopBleClient(
+            applicationContext,
+            repository = repository,
+            deviceId = activeDeviceId,
+            successfulOffloadSink = {
+                SelfHostedPushScheduler.enqueueAfterSuccessfulOffload(applicationContext)
+            },
+        ).apply {
             // Apply the persisted "Debug logging" preference at the composition root so the low-level
             // client never has to read the UI/prefs layer. Default OFF — see WhoopBleClient.debugLogcat.
             debugLogcat = NoopPrefs.debugLogging(applicationContext)
@@ -117,6 +151,7 @@ class NoopApplication : Application() {
             straplog = { ble.externalLog(it) },
             // A generic strap's standard battery (0x180F) → the same live battery field the WHOOP uses.
             batterySink = { pct -> ble.publishExternalBattery(pct) },
+            initialActiveDeviceId = activeDeviceId,
         )
     }
 

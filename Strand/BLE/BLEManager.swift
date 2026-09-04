@@ -148,9 +148,13 @@ struct PostBondTimeoutLoopDetector {
 /// The streak accumulates across the reconnect loop (a disconnect does NOT reset it) and is cleared only by
 /// a genuine bond or an explicit user reconnect, exactly like BLEManager's existing `bondRefusalStreak`.
 struct BondRefusalGiveUp {
-    /// Consecutive bond refusals before we pause auto-reconnect + write the epitaph. 5 (not 2, where the
+    /// Consecutive bond refusals before we PAUSE auto-reconnect + write the epitaph. 5 (not 2, where the
     /// pairing HINT already shows): the hint asks the user to act; we give them several reconnect cycles to
     /// do it before we stop hammering. A genuinely held/stale strap reaches 5 within a couple of minutes.
+    ///
+    /// This is the AUTH-REFUSAL number specifically, and `recordRefusal` takes a per-refusal override for
+    /// that reason: an unanswered handshake asks the user for nothing, so waiting five cycles for a decision
+    /// they cannot make just buys ~4.8s link drops. See `giveUpThresholdFor`.
     let giveUpThreshold: Int
 
     private(set) var refusals = 0
@@ -162,9 +166,9 @@ struct BondRefusalGiveUp {
 
     /// Record one bond refusal. Returns true if THIS refusal freshly crossed the give-up threshold (so the
     /// caller pauses the reconnect + writes the epitaph exactly once).
-    mutating func recordRefusal() -> Bool {
+    mutating func recordRefusal(threshold: Int? = nil) -> Bool {
         refusals += 1
-        if !gaveUp && refusals >= giveUpThreshold {
+        if !gaveUp && refusals >= (threshold ?? giveUpThreshold) {
             gaveUp = true
             return true
         }
@@ -189,6 +193,41 @@ struct BondRefusalGiveUp {
     /// to get going again. Pure; no em-dash. Byte-identical to the Android twin.
     static func pausedHint() -> String {
         "NOOP stopped retrying because your strap keeps refusing to pair. It is likely still held by the official WHOOP app, or your phone is holding an old pairing. Close the WHOOP app, put the strap in pairing mode (tap until the LEDs flash blue), and if it is listed in your Bluetooth settings choose Forget This Device. Then tap Connect to try again."
+    }
+
+    /// #1635: the log epitaph for the SUPPRESSION path.
+    ///
+    /// Separate from [epitaphLine] because that one asserts a cause ("almost certainly held by the
+    /// official WHOOP app") that only an auth refusal supports. Reusing it here would print a confident
+    /// explanation for a write that simply vanished.
+    ///
+    /// Pure. Byte-identical to the Kotlin `BondRefusalGiveUp.helloSuppressedEpitaph`.
+    static func helloSuppressedEpitaph(refusals: Int, opaqueId: String) -> String {
+        "Bond epitaph: the strap [\(opaqueId)] never acknowledged the secure handshake \(refusals)x in a row, and the attempt is what drops the link - leaving the handshake off so live heart rate keeps streaming. Tap Connect to try it again."
+    }
+
+    /// #1635: the hint shown when the hello is switched off and the link is KEPT.
+    ///
+    /// Nothing is paused on this branch, so it must not say auto-reconnect stopped. It names what was lost
+    /// (history sync) and the one action that restores the attempt, without asserting a cause.
+    ///
+    /// Pure. Byte-identical to the Kotlin `BondRefusalGiveUp.helloSuppressedHint`.
+    static func helloSuppressedHint() -> String {
+        "The secure handshake with your strap never completes, and the attempt itself is what drops the link. NOOP has switched it off for this strap so live heart rate keeps streaming. History sync stays unavailable until it pairs, and so do motion, skin temperature, SpO₂ and respiratory rate — so sleep is staged from heart rate alone, and HRV and resting heart rate are unavailable. Tap Connect to try the handshake again."
+    }
+
+    /// The paused hint for a bond that failed WITHOUT the strap ever answering (#1635).
+    ///
+    /// [pausedHint] names a cause — the strap still held by the official WHOOP app, or a stale OS pairing —
+    /// which is well founded when the refusal arrived as INSUFFICIENT_AUTHENTICATION or
+    /// INSUFFICIENT_ENCRYPTION: the strap actively said no. It is NOT founded when the CLIENT_HELLO simply
+    /// goes unanswered and the link drops on a timer, which is a different observation with several
+    /// possible causes. Telling that user to close the WHOOP app would be a guess dressed as instruction,
+    /// and if it is wrong they have no way to know.
+    ///
+    /// Pure. Byte-identical to the Kotlin `BondRefusalGiveUp.pausedHintHandshakeUnanswered`.
+    static func pausedHintHandshakeUnanswered() -> String {
+        "NOOP stopped retrying because the secure handshake with your strap never completes: the strap does not answer, and the link drops a few seconds later. Auto-reconnect is paused so it stops draining both batteries. Tap Connect to try again, and if it keeps happening please share your strap log."
     }
 
     /// #750: a short OPAQUE token from a CoreBluetooth-local peripheral UUID for the epitaph. The CB UUID is
@@ -332,6 +371,26 @@ struct BackfillContinuation {
     /// legitimate banks records two days ahead of the phone's clock.
     static let defaultFutureSkewSeconds = 48 * 3600
 
+    /// #1598: may a GET_CLOCK correlation be chased and DERIVED for this family? WHOOP 4.0 only.
+    ///
+    /// A 5/MG never establishes one **by design**: its historical (type-47) and live (puffin REALTIME)
+    /// records both carry the strap RTC's own real-unix seconds, so the identity ref the Backfiller falls
+    /// back to (device == wall ⇒ offset 0) is the CORRECT decode for it, not a degraded one. Two things
+    /// followed from not knowing that here:
+    ///
+    ///  * `beginBackfill` re-sent GET_CLOCK up to 3× on every 5/MG offload, chasing a reply that is never
+    ///    coming, and logged each attempt as a failure — so every 5/MG strap log carried clock-retry noise
+    ///    plus an `IDENTITY fallback` line naming the #700 misdating bug it did NOT have.
+    ///  * worse, the #700 Data-Range fallback then installed a NON-identity ref derived from
+    ///    `strapNewestTs`. On a 4.0 that difference IS the RTC skew, which is the whole point. On a 5/MG
+    ///    `newest` is already real-unix, so `wall - newest` is merely HOW LONG THE STRAP WENT UNRECORDED
+    ///    (unworn, charging, flat). Applied as a clock offset it silently shifts that offload's history
+    ///    forward by exactly that gap once it clears `histStaleClockThresholdSec` (1 day) — a strap off
+    ///    the wrist for a weekend would land its next backfill on the wrong days.
+    ///
+    /// Pure so the Kotlin twin (`WhoopBleClient.derivesClockCorrelation`) can assert the same rule.
+    static func derivesClockCorrelation(_ family: DeviceFamily) -> Bool { family == .whoop4 }
+
     /// #1012: is the strap-reported "newest banked record" FUTURE-dated beyond the skew allowance — more
     /// than `futureSkewSeconds` past the wall clock? The strap's clock is then almost certainly set in the
     /// future (#928), so its range answer AND its freshly-persisted rows are untrustworthy as backlog
@@ -354,7 +413,7 @@ struct BackfillContinuation {
                                    strapNewestTs: Int?,
                                    ourFrontierTs: Int?,
                                    wallNowUnix: Int,
-                                   rowsPersistedThisSession: Int = 0,
+                                   persistedSensorRows: Bool = false,
                                    lastTrimAdvanced: Bool,
                                    consecutiveCount: Int,
                                    maxAutoContinues: Int = defaultMaxAutoContinues,
@@ -363,6 +422,21 @@ struct BackfillContinuation {
         guard stillConnected else { return false }                 // 1
         guard consecutiveCount < maxAutoContinues else { return false }   // 4 (cap)
         guard lastTrimAdvanced else { return false }               // 3 (don't spin on a frozen cursor)
+        // 3b (#1144/#1146): a session that persisted NO NEW sensor rows never auto-continues, whatever the
+        // reported frontier gap. When the strap advertises a `newest` AHEAD of our frontier but the offload
+        // for that range banks no new rows (a PHANTOM gap — a timestamp it won't actually offload, a
+        // console-only tail, or a dup re-offload of already-synced data), 2a below would latch `true` forever:
+        // the frontier can't advance without new rows, so `newest - frontier` stays > gap and it re-fires to
+        // the full cap in empty offloads (the storm re-observed on a real 4.0 in the 260810 capture — 145
+        // re-kicks/hr). Guard 3 doesn't catch it — the trim u32 climbs on empty ENDs. `persistedSensorRows` is
+        // `sessionRowsPersisted > 0` (the frontier ADVANCED this pass) captured ONCE in exitBackfilling — NOT
+        // a fresh `backfiller.sessionRowsPersisted` re-read at the decision site (that live counter, mutated
+        // by trailing frames / a re-kicked session across the offload boundary, disagreed with the empty
+        // verdict and spun to the cap), and NOT decodedChunks/bankedSensorRecords (a dup-only or reject-frame
+        // re-offload DECODES frames but banks 0 NEW rows — it must also stop, not spin on already-synced data).
+        // Stop and let the periodic floor retry; a real backlog pass persists new rows so this only bites the
+        // empty/dup spin.
+        guard persistedSensorRows else { return false }
         // #928: a strap clock set in the FUTURE makes "newest" read ahead of ANY real frontier, so 2a
         // would report backlog forever and drive up to the full cap in EMPTY offloads on every connect.
         // A newest more than futureSkewSeconds past the wall clock is implausible: exclude it from 2a.
@@ -387,10 +461,10 @@ struct BackfillContinuation {
         // epochs, and the data-range "newest" can latch an OLD one (e.g. 2024 when the real newest is 2026).
         // That false "we're already past it" would stop the drain after ONE session and make the user
         // tap the strap to re-trigger (exactly #364 / #451). But guard #3 already proved the trim advanced,
-        // so if this session also PERSISTED REAL SENSOR ROWS the strap is demonstrably still handing over
-        // real backlog — keep going. Empty / console-only ENDs persist 0 rows, so a genuinely stuck or
-        // caught-up strap still won't spin, and the consecutive cap bounds it either way.
-        return rowsPersistedThisSession > 0
+        // so if this session also PERSISTED NEW SENSOR ROWS the strap is demonstrably still handing over
+        // real backlog — keep going. Empty / console-only / dup ENDs persist no new rows, so a genuinely stuck
+        // or caught-up strap still won't spin, and the consecutive cap bounds it either way.
+        return persistedSensorRows
     }
 }
 
@@ -472,6 +546,17 @@ public final class BLEManager: NSObject, ObservableObject {
     static let disService       = CBUUID(string: "180A")
     static let disSerialChar    = CBUUID(string: "2A25") // Serial Number String
     static let disHwRevChar     = CBUUID(string: "2A27") // Hardware Revision String
+    static let disFwRevChar     = CBUUID(string: "2A26") // Firmware Revision String
+    static let disManufacturerChar = CBUUID(string: "2A29") // Manufacturer Name String
+    static let disModelNumberChar  = CBUUID(string: "2A24") // Model Number String
+    static let disSwRevChar     = CBUUID(string: "2A28") // Software Revision String
+    /// Every DIS characteristic NOOP reads, in ONE place. The failure reporter tests membership here, so
+    /// a characteristic added beside these cannot go silently unreported — the exact "a refused read is
+    /// indistinguishable from one never issued" gap the reporter exists to close. Kotlin twin: DIS_CHARS.
+    static let disChars: Set<CBUUID> = [
+        disSerialChar, disHwRevChar, disFwRevChar,
+        disManufacturerChar, disModelNumberChar, disSwRevChar,
+    ]
 
     static let restoreID = "com.openwhoop.ble.central"
 
@@ -480,6 +565,11 @@ public final class BLEManager: NSObject, ObservableObject {
     private let router: FrameRouter
     private var collector: Collector?
     /// #716: stored on bootstrap so the scan callback can fix the seeded "WHOOP" model label.
+    /// #1303: fired after the strap's history has been re-pointed onto its stable `whoop-<serial>` id.
+    /// The live persist paths are already re-pointed inline by then; this exists so the OBSERVABLE spine
+    /// (`DeviceRegistry`, and the coordinator that watches it) follows too — the store write above is not
+    /// observable, so without this the UI would keep showing the old id until relaunch.
+    var onSerialIdentityAdopted: ((String) -> Void)?
     private var registryStore: DeviceRegistryStore?
     /// #716: true once the seeded "WHOOP" model has been stamped to the correct family.
     private var modelStamped = false
@@ -522,13 +612,28 @@ public final class BLEManager: NSObject, ObservableObject {
     /// high-freq-sync), so each periodic tick just routes through requestSync(.periodic) → beginBackfill
     /// (SEND_HISTORICAL_DATA + watchdog), subject to the BackfillPolicy floor.
     private var backfillTimer: DispatchSourceTimer?
+    /// User-elected hourly background-sync cadence (Settings → Power saving → "Low refresh"). Default off.
+    private var lowRefreshMode = false
     // The timer fires this often, but BackfillPolicy.periodicFloorSeconds is the real floor (a recent
     // event-triggered sync defers the next periodic tick). 900s = 15 min, matching WHOOP.
     static let backfillIntervalSeconds = 900
+    /// Scheduling flexibility for the long-running periodic offload timer. The offload remains no
+    /// earlier than its battery-adaptive deadline; this only lets Darwin coalesce the wake with nearby
+    /// system work instead of waking the CPU at an unnecessarily exact instant.
+    static let backfillTimerLeewaySeconds = 60
     /// #477: stretched offload cadence while low on power (45 min). The strap banks to flash meanwhile,
     /// so this only delays sync (larger batches), never loses data. Mirrors Android
     /// `LOW_BATTERY_BACKFILL_INTERVAL_MS`.
     static let lowBatteryBackfillIntervalSeconds = 2700
+    /// Low-refresh cadence (60 min): the user-elected sub-option of Power saving. Unlike the battery
+    /// lever above it is NOT battery-gated — once chosen it is the baseline the other levers stretch
+    /// FROM, so a quiet strap stays quiet at any charge. Same no-loss property: the strap banks to flash
+    /// and only trims on our ack, so this delays sync into larger batches, it never drops history.
+    /// Deliberately cadence-ONLY: it does not touch the keep-alive (that tick re-arms the WHOOP 4
+    /// realtime burst every cycle and evaluates the 120 s stall fuse — see `startKeepAlive`) and it does
+    /// not touch continuous HRV capture (that is what "Pause HRV capture" and #927's overnight window
+    /// are for). Fewer periodic offloads = fewer reconnect bursts, which is the measured 4.0 drain.
+    static let lowRefreshBackfillIntervalSeconds = 3600
 
     /// Pure battery-adaptive gate (#477), the twin of Android `WhoopBleClient.idleThrottleActive`. Keyed
     /// on the STRAP's battery: armed by `thresholdPct` > 0, engages while the strap is discharging at/below
@@ -544,11 +649,69 @@ public final class BLEManager: NSObject, ObservableObject {
             ? max(baseSeconds, lowSeconds) : baseSeconds
     }
 
+    /// Pure baseline-cadence decision: low refresh replaces the 15-min BASE with the hourly one, and every
+    /// other lever composes on top with `max`, so a lever can only ever make the cadence QUIETER, never
+    /// restore a faster one the user asked to slow down. Unit-testable without a CoreBluetooth seam.
+    static func baseBackfillInterval(lowRefresh: Bool) -> Int {
+        lowRefresh ? lowRefreshBackfillIntervalSeconds : backfillIntervalSeconds
+    }
+
+    /// #battery: is a keep-alive tick due to poll the strap's battery?
+    ///
+    /// Normally every SECOND 30 s tick (~60 s), which is plenty while the charge only creeps downward. A
+    /// CHARGING strap is the exception: the value climbs visibly, the user is usually watching it on the
+    /// puck, and the window is short and bounded — so poll every tick (~30 s) instead. It costs one extra
+    /// read per minute, only while charging, and nothing at all the rest of the time.
+    ///
+    /// The charge state itself rides bit 0 of the BATTERY_LEVEL event, so it is only learned FROM a poll:
+    /// docking is still noticed on the ordinary ~60 s cadence, and the faster rate applies from the next
+    /// tick onward. Twin of the Kotlin `batteryPollDue`.
+    static func batteryPollDue(tick: Int, charging: Bool) -> Bool {
+        charging || tick % 2 == 0
+    }
+
+    /// #battery: pure 5/MG battery-read throttle decision, unit-testable without a CoreBluetooth seam.
+    /// Returns true when no prior read exists (the first read of a connection, or post-disconnect re-seed)
+    /// OR when at least `whoop5BatteryReadMinIntervalSeconds` has elapsed since the last read — HALVED
+    /// while the strap is charging, for the reason given on `batteryPollDue` above. Stops the 30 s
+    /// keep-alive tick from re-reading 0x2A19 every cycle. Twin of the Android `keepAliveTick % 2 == 0`
+    /// ~60 s cadence (WhoopBleClient keepAliveFire).
+    static func shouldPollWhoop5Battery(lastReadAt: Date?, now: Date = Date(),
+                                        charging: Bool = false) -> Bool {
+        guard let last = lastReadAt else { return true }
+        // #battery: same reasoning as `batteryPollDue` — a charging strap earns the finer cadence, so the
+        // 5/MG time throttle halves while charging rather than leaving it a minute behind the 4.0.
+        let minInterval = charging
+            ? whoop5BatteryReadMinIntervalSeconds / 2
+            : whoop5BatteryReadMinIntervalSeconds
+        return now.timeIntervalSince(last) >= minInterval
+    }
+
+    /// #battery: pure periodic-offload interval for a 5/MG whose history is known-empty, unit-testable
+    /// without a CoreBluetooth seam. Stretches to the low-battery floor (45 min) regardless of battery %,
+    /// because an experimental-history 5/MG banks nothing per pass. Stacks with the BackfillPolicy
+    /// empty-backoff (which engages one cycle later, at 3 empties). Twin of Android `nextBackfillDelayMs`'s
+    /// `whoop5EmptyOffload.historyEmpty` branch.
+    static func whoop5EmptyHistoryBackfillInterval(baseSeconds: Int, lowSeconds: Int,
+                                                   historyEmpty: Bool) -> Int {
+        historyEmpty ? max(baseSeconds, lowSeconds) : baseSeconds
+    }
+
     /// Keep-alive: re-arm realtime, poll battery, and bounce a stalled link so streaming
     /// never silently dies. Started on bond, cancelled on disconnect.
     private var keepAliveTimer: DispatchSourceTimer?
     static let keepAliveIntervalSeconds = 30
     private var keepAliveTick = 0
+    /// #battery: minimum gap between 5/MG 0x2A19 battery reads. `enableLiveNotifications` fires from the
+    /// 30 s keep-alive tick AND once each from the CLIENT_HELLO-ack / post-bond callers, so without a
+    /// throttle a 5/MG was READ every ~30 s — 2 880 GATT reads/day, 2× the Android twin's ~60 s cadence
+    /// (WhoopBleClient keepAliveFire polls 5/MG battery on `keepAliveTick % 2 == 0`) and 20× finer than
+    /// the BatteryEstimator's own 600 s same-% throttle can consume. The post-bond / CLIENT_HELLO-ack
+    /// reads still fire promptly (the first read of a connection has `lastBatteryReadAt == nil`); only
+    /// the repeating keep-alive ticks are spaced to this floor. Reset to nil on disconnect so the next
+    /// connect reads immediately. Parity fix — Android was already at ~60 s, this brings iOS to match.
+    static let whoop5BatteryReadMinIntervalSeconds: TimeInterval = 60
+    private var lastBatteryReadAt: Date?
     /// If a persisted/missing strap-family preference points at the wrong service, a service-filtered
     /// BLE scan can run forever even though the strap is nearby (the common "won't reconnect after an
     /// update" report). Rotate between WHOOP families after a short miss and persist whichever family
@@ -563,6 +726,25 @@ public final class BLEManager: NSObject, ObservableObject {
     /// DIAGNOSTIC ONLY — it never cancels or retries; recovery is separate work.
     private var pendingConnectProbe: DispatchWorkItem?
     static let pendingConnectProbeSeconds: TimeInterval = 15
+    /// #1809: per-connection inbound accounting for the link epitaph. A strap log could not say whether
+    /// the strap transmitted anything; these three make it a measurement. Reset in `didConnect`, so they
+    /// describe THIS link and never carry a previous session's traffic into its epitaph.
+    private var inboundFrames = 0
+    private var inboundBytes = 0
+    private var cmdChannelFrames = 0
+    /// #1635: rows ACCEPTED per stream on this link — the database-side companion to the three above.
+    /// The epitaph counts frames, which reads healthy on an unbonded 5/MG streaming heart rate over the
+    /// standard profile while every bond-gated stream banks nothing. Cleared with them, so they describe
+    /// THIS link. Plain vars like their neighbours: `Collector` hands them up on the main actor.
+    private var bankedHr = 0
+    private var bankedRr = 0
+    private var bankedGravity = 0
+    private var bankedResp = 0
+    private var bankedSkinTemp = 0
+    private var bankedSpo2 = 0
+    private var bankedBattery = 0
+    /// Uptime clock for the epitaph. Monotonic, so a wall-clock change mid-link cannot make it negative.
+    private var linkUpSince: DispatchTime?
     /// Last time ANY notification arrived — drives the liveness watchdog.
     private var lastDataAt = Date()
     /// True while a Live/Health screen is on-screen and wants the realtime stream. One of the two
@@ -654,6 +836,14 @@ public final class BLEManager: NSObject, ObservableObject {
     /// (its else path, under the cap) and on disconnect — NOT unconditionally on every HISTORY_COMPLETE,
     /// so a strap that slices one offload into many completions can't reset the cap each slice (#25).
     private var consecutiveAutoContinues = 0
+    /// #battery: consecutive offload sessions that banked ZERO sensor rows — a clean HISTORY_COMPLETE-empty
+    /// OR an idle-timeout STALL. Feeds BackfillPolicy's exponential backoff so the 15-min periodic poll
+    /// stops spinning the radio on a strap returning nothing (a capture showed ~6 empty stalls/hour with no
+    /// backoff, because only HISTORY_COMPLETE fed emptySyncTracker). SEPARATE from that tracker — which
+    /// stays console-only-specific for the clock-lost banner — so counting stalls can never falsely fire
+    /// that banner. Any banked rows reset it; the productive auto-continue tail doesn't count. Twin of
+    /// Android `consecutiveEmptyOffloads`.
+    private var consecutiveEmptyOffloads = 0
     /// #364 spin-detector: the trim cursor as of the END of the previous backfill session this
     /// connection. exitBackfilling compares the current Backfiller.lastAckedTrim against this to decide
     /// whether the just-ended session actually advanced the strap's trim (progress) or froze (stop
@@ -685,6 +875,8 @@ public final class BLEManager: NSObject, ObservableObject {
     /// Re-entrancy guard for captureRawAccel: true while a bounded on-demand window is running.
     /// A second tap is a no-op until the active capture's asyncAfter block fires and clears this.
     private var rawCaptureInFlight = false
+    private var rawCaptureStoppedAt = Date.distantPast
+    private var unexpectedImuStopAt = Date.distantPast
     /// Ordered queue of frames awaiting drain through the serial Backfiller task.
     private var backfillFrameQueue: [[UInt8]] = []
     /// True while the drain task is running (prevents a second drain task from launching).
@@ -704,7 +896,9 @@ public final class BLEManager: NSObject, ObservableObject {
     private lazy var puffinDeepBufferLog = PuffinDeepBufferLog()
 
     /// Force the puffin capture buffer to disk so the Settings export/reveal targets a current file.
-    public func flushPuffinCaptures() { puffinRecorder.flush() }
+    /// `async` because the actual encode + write now happens off the main actor (#652); callers that
+    /// need the file to be current when this returns (export, reveal) must await it.
+    public func flushPuffinCaptures() async { await puffinRecorder.flush() }
 
     /// Record a local physical-phase marker for the passive optical experiment. This deliberately has
     /// no peripheral/write path: it only appends to `puffin-deepbuffers.jsonl` when capture is enabled.
@@ -753,6 +947,11 @@ public final class BLEManager: NSObject, ObservableObject {
     /// callback (the settle resolved); if it fires instead, the state never settled — the wedged-grant
     /// shape (#429) — and the #295 re-grant banner is shown after all.
     private var unauthorizedSettleWork: DispatchWorkItem?
+    /// When the 5/MG CLIENT_HELLO went out, or nil when none is outstanding. Consumed ONLY by a
+    /// completion on the hello's own characteristic (or a failed one, or the link dropping) — never by an
+    /// unrelated command's callback, which would otherwise either inherit the window or close it out from
+    /// under a genuine ack still in flight (#1635). Kotlin twin: `WhoopBleClient.clientHelloWriteAtMs`.
+    private var clientHelloWriteAt: Date?
     private var cmdCharacteristic: CBCharacteristic?
     /// #613: true when a command would ACTUALLY reach the strap right now — the same condition `send()`
     /// requires (connected peripheral + a discovered command characteristic). The alarm-arm log and the
@@ -772,14 +971,35 @@ public final class BLEManager: NSObject, ObservableObject {
     private var dataNotifyCharacteristic: CBCharacteristic?
     private var heartRateCharacteristic: CBCharacteristic?
     private var batteryCharacteristic: CBCharacteristic?
-    /// #520 DIS: remembered at discovery, READ post-bond (see the #490 note — a 5/MG refuses standard
-    /// reads before the link is encrypted). Serial + hardware revision are immutable, so they are read
-    /// ONCE per connection (`disRead`), never re-polled like the battery.
+    /// #520 DIS: remembered at discovery, READ post-bond — and since #1635 also on a SUPPRESSED link that
+    /// will never bond, which is now a permanent state rather than a transient one. The #490 note (a 5/MG
+    /// refuses standard reads before the link is encrypted) is the open question that attempt settles
+    /// either way. Serial + hardware revision are immutable, so they are read ONCE per connection
+    /// (`disRead`), never re-polled like the battery.
+    /// Peripheral whose GATT tree has already been dumped, so the ~30-line enumeration is emitted once per
+    /// device rather than once per connect (#1635). Not persisted: a fresh launch is exactly when the tree
+    /// is worth seeing again, and a strap whose firmware changed between runs may expose something new.
+    private var gattTreeDumpedFor: UUID?
+
     private var disSerialCharacteristic: CBCharacteristic?
     private var disHwRevCharacteristic: CBCharacteristic?
     private var disRead = false
+    /// 3.0s — the Kotlin twin's `BATTERY_ON_CONNECT_DELAY_MS * 2` (1500 × 2), and the same 1.5s on-connect
+    /// pacing this file already uses before `requestSync(.connect)`. Long enough that the link has settled
+    /// after the suppression decision, short enough to land in the same session. Pinned to the twin's
+    /// number rather than an independently chosen one: this read can cost the link, so the two platforms
+    /// should not be probing at different moments when a field capture has to explain a drop.
+    static let unbondedDisReadDelay: TimeInterval = 3.0
     private var disSerial: String?
     private var disHwRev: String?
+    /// #1635 follow-up: the DIS identity extras (firmware, manufacturer, model, software revision) as
+    /// discovered. Held as a list rather than one property each because nothing branches on them
+    /// individually — they are read as a set and reported as a set.
+    private var disExtraCharacteristics: [CBCharacteristic] = []
+    /// The DIS firmware string (0x2A26), which is the ONLY firmware source an unbonded 5/MG has: the
+    /// puffin report needs the bond that never happens. Published only as a fallback, never as an
+    /// override — see `shouldPublishDisFirmware`.
+    private var disFirmware: String?
     /// EXPERIMENTAL WHOOP 5.0/MG puffin notify chars (fd4b0003/4/5/7), remembered at discovery so we
     /// can re-subscribe them AFTER bonding — the strap refuses them ("Authentication is insufficient")
     /// until the link is encrypted (issue #17).
@@ -787,6 +1007,11 @@ public final class BLEManager: NSObject, ObservableObject {
     private var reassembler = Reassembler()
     private var seq: UInt8 = 0
     private var didBond = false
+    /// #1635: one explicit Connect grants one fresh CLIENT_HELLO even when the suppression latch is set.
+    /// Consumed unconditionally by the write site, so the retry belongs to THIS session — leaving it set
+    /// would hand a stale retry to some later automatic reconnect and restart the loop the suppression
+    /// exists to end. Kotlin twin: `WhoopBleClient.helloRetryRequested`.
+    private var helloRetryRequested = false
     /// WHOOP 5/MG only: realtime HR has been armed (puffin TOGGLE_REALTIME_HR sent) once for this
     /// connection, so the post-bond callback re-firing on later `.withResponse` writes doesn't re-send it.
     private var whoop5RealtimeArmed = false
@@ -816,6 +1041,117 @@ public final class BLEManager: NSObject, ObservableObject {
     /// successful connect; grows the reschedule delay so a strap that's genuinely out of range doesn't
     /// hammer Bluetooth (vs the disconnect path's flat 3s, which is fine for an already-bonded drop).
     private var failedConnectAttempts = 0
+
+    // MARK: - Standing-connect reconnect regime (#1413 — twin of OuraLiveSource's #1286 fix)
+    //
+    // The old reconnect armed a `DispatchQueue.main.asyncAfter` backoff, which does not fire in a suspended
+    // app AND — the real damage — left NOTHING outstanding with CoreBluetooth after a failed connect, so iOS
+    // had no reason to ever wake the app. Overnight that meant the strap stayed unreachable for hours
+    // (measured 10h46m on a 5/MG). The reconnect hands off to a STANDING `central.connect`, which has no
+    // timeout, stays outstanding, and lets iOS wake the app when the strap re-advertises — from suspension.
+    //
+    // #1413 follow-up: it hands off on the FIRST drop, not the third. Gating the handoff behind three
+    // consecutive failures made it unreachable in the case it was written for. A drop while suspended wakes
+    // the app just long enough to run the disconnect callback; that armed a 3-second timer and returned to
+    // suspension, where the timer never fires — so the attempt counter never reached two, let alone three,
+    // and nothing was outstanding with CoreBluetooth in the meantime. The escalation could only be reached
+    // by an app that was already awake, which is exactly when it is least needed. Reported with a measured
+    // overnight failure and this diagnosis by @justinjor-bit.
+    //
+    // A standing connect is passive — no timeout, no scan, nothing written to the strap — so issuing it
+    // immediately costs nothing that a timed retry was protecting against. The one shape that can hot-loop,
+    // a connect that fails near-instantly, is still broken by `standingConnectAfter`, and that can only
+    // happen with the app awake.
+
+    /// Floor between two standing connects, used ONLY for a near-instant failure (proves the app is awake).
+    nonisolated static let standingConnectRetryFloor: TimeInterval = 30
+    /// A standing connect that stayed outstanding at least this long before failing was not a hot loop —
+    /// re-issue it immediately so something is ALWAYS outstanding, even heading into suspension.
+    nonisolated static let standingConnectFastFailureS: TimeInterval = 2
+    /// When the current standing connect was issued, nil when none is outstanding.
+    private var standingConnectAt: Date?
+
+    /// What to do after an involuntary drop or a failed connect. Pure so the policy is unit-testable with no
+    /// CoreBluetooth (`BLEManagerReconnectPolicyTests`). Twin of `OuraLiveSource.ReconnectStep`.
+    enum ReconnectStep: Equatable, Sendable {
+        case standingConnect
+        case standingConnectAfter(delay: TimeInterval)
+    }
+
+    /// - Parameter secondsSinceStandingConnect: age of the outstanding standing connect, nil when none is.
+    ///
+    /// The consecutive-failure count used to gate this and no longer does: see the note above. It is not a
+    /// parameter any more precisely so the handoff cannot be made conditional on being awake again.
+    nonisolated static func reconnectStep(secondsSinceStandingConnect: TimeInterval?) -> ReconnectStep {
+        // No standing connect outstanding reads as "long ago", so the first drop hands off immediately.
+        let since = secondsSinceStandingConnect ?? .greatestFiniteMagnitude
+        // Anything but a near-instant failure re-issues NOW, so suspension can never catch us holding nothing.
+        guard since < standingConnectFastFailureS else { return .standingConnect }
+        return .standingConnectAfter(delay: standingConnectRetryFloor - since)
+    }
+
+    /// The single reconnect entry after an involuntary drop or a failed connect. Both callback sites route
+    /// through here so the standing-connect handoff applies to both (the disconnect path is where the night
+    /// died). Preserves the intentional-teardown and bond-loop-pause guards.
+    private func scheduleReconnect() {
+        guard !intentionalDisconnect, !autoReconnectPausedForBondLoop else { return }
+        failedConnectAttempts += 1
+        switch Self.reconnectStep(
+            secondsSinceStandingConnect: standingConnectAt.map { Date().timeIntervalSince($0) }) {
+        case .standingConnect:
+            issueStandingConnect()
+        case .standingConnectAfter(let wait):
+            // A standing connect failed NEAR-INSTANTLY — the one shape that can hot-loop, and it only
+            // happens with the app awake. Break it with a timer, safe precisely because the app is awake.
+            log("Standing connect failed instantly — re-issuing in \(Int(wait))s (attempt \(failedConnectAttempts))")
+            standingConnectAt = nil
+            DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+                guard let self, !self.intentionalDisconnect, !self.autoReconnectPausedForBondLoop else { return }
+                self.issueStandingConnect()
+            }
+        }
+    }
+
+    /// Hand the reconnect to CoreBluetooth: `central.connect` has NO timeout, so it stays outstanding and iOS
+    /// wakes the app when the strap advertises again, including while SUSPENDED — the whole point. Same call
+    /// `connectFromSystem`'s targeted path already makes: no new outbound command, nothing written to the
+    /// strap, so the BLE safety contract is unaffected. Twin of `OuraLiveSource.issueStandingConnect`.
+    private func issueStandingConnect(whilePausedForBondLoop: Bool = false) {
+        guard !intentionalDisconnect else { return }
+        // #1539: the bond-loop pause suppresses this by default, but the paused paths deliberately opt in —
+        // a parked, timeout-free connect is what lets that pause end without the user.
+        guard whilePausedForBondLoop || !autoReconnectPausedForBondLoop else { return }
+        guard central.state == .poweredOn else {
+            log("Standing reconnect deferred — Bluetooth not powered on (state=\(central.state.rawValue))")
+            return
+        }
+        // Resolve the target: the held peripheral if it's the pinned strap, else retrieve the pinned UUID.
+        let target: CBPeripheral? = {
+            if let p = peripheral, isPreferredPeripheral(p) { return p }
+            if let id = preferredPeripheralUUID { return central.retrievePeripherals(withIdentifiers: [id]).first }
+            return peripheral
+        }()
+        guard let p = target else {
+            // #1539: while the bond-loop pause is latched this must stay PASSIVE. The scanning fallback is
+            // active radio work, which is precisely what the pause exists to stop, so with no cached
+            // peripheral to park against there is nothing safe to do here — the foreground probe remains
+            // the escape, exactly as on Android. Outside the pause the fallback is unchanged.
+            guard !whilePausedForBondLoop else {
+                log("Bond-loop pause: no cached strap to park a standing connect against — staying passive (#1539)")
+                return
+            }
+            // No cached peripheral to hand CoreBluetooth — fall back to the scanning connect path.
+            log("No cached strap for a standing connect — scanning instead")
+            connectFromSystem()
+            return
+        }
+        preparePeripheral(p)
+        standingConnectAt = Date()
+        log("Leaving a STANDING connect outstanding for \(p.identifier) — CoreBluetooth will reconnect "
+            + "whenever the strap is reachable, including while the app is suspended (#1413)")
+        central.connect(p, options: nil)
+    }
+
     /// Multi-WHOOP stale-pin recovery (#52). The identifier of the last peripheral that reached a GENUINE
     /// encrypted bond this run. When the pinned strap keeps refusing the bond but THIS one bonds fine, it's
     /// the live working strap the registry pin should point at. nil until any strap genuinely bonds.
@@ -917,7 +1253,10 @@ public final class BLEManager: NSObject, ObservableObject {
         // before any BLE data arrives.
         self.collector = nil
         super.init()
-        state.lastSyncedAt = UserDefaults.standard.object(forKey: "lastSyncedAt") as? Double
+        // Deliberately NOT seeded from the global key here. It belongs to whichever strap synced last,
+        // which on a two-strap install is not the one the screens are scoped to — the misattribution this
+        // whole change removes. `seedLastSyncFromActiveStrap` fills it from the ACTIVE strap once the
+        // registry exists (bootstrapStore); a blank moment is honest, another strap's timestamp is not.
         // Restore identifier + background-capable central (foundation for M3 state restoration).
         #if os(iOS)
         // iOS background state preservation/restoration: the restore identifier is what makes
@@ -937,6 +1276,40 @@ public final class BLEManager: NSObject, ObservableObject {
 
     /// Build the WhoopStore + Collector + Backfiller asynchronously. Safe to call multiple
     /// times — bails out early if the collector is already initialised.
+    /// Seed the last-sync display from the ACTIVE strap's own stamp — PR #556's intent, correctly attributed.
+    ///
+    /// Resolved against the registry's active row, exactly as the debug export resolves firmware. NOT from
+    /// the legacy global key, which belongs to whichever strap synced last: on a two-strap install that is
+    /// not the strap the screens are scoped to, and seeding from it would put one strap's sync time on the
+    /// other's Today screen — the defect this change exists to remove.
+    ///
+    /// The legacy global still applies when exactly one strap is paired, because only then can it not be
+    /// ambiguous (see `LastSyncAttribution.resolve`). Called from `bootstrapStore` because that is the
+    /// first point the registry exists; the initialisers deliberately seed nothing.
+    ///
+    /// Never overwrites a value this session has already earned: a HISTORY_COMPLETE landing while this
+    /// runs is newer than anything persisted and must win.
+    private func seedLastSyncFromActiveStrap(registry: DeviceRegistryStore) {
+        // Registry + defaults resolved off-actor, then a single hop to publish. The `lastSyncedAt == nil`
+        // check lives INSIDE that hop and nowhere else: checking it out here as well would be a
+        // check-then-act across an await, and the value it guards is exactly the one a HISTORY_COMPLETE
+        // can set while this runs.
+        let rows = (try? registry.all()) ?? []
+        let activeId = (try? registry.activeDeviceId()) ?? nil
+        let activeAddr = rows.first(where: { $0.id == activeId })?.peripheralId
+        let d = UserDefaults.standard
+        guard let seed = LastSyncAttribution.resolve(
+            perDevice: LastSyncAttribution.prefKey(peripheralId: activeAddr)
+                .flatMap { d.object(forKey: $0) as? Double },
+            legacyGlobal: d.object(forKey: "lastSyncedAt") as? Double,
+            pairedCount: rows.count) else { return }
+        Task { @MainActor [state] in
+            // Never overwrite a value this session earned: a HISTORY_COMPLETE landing while the registry
+            // read was in flight is newer than anything persisted, and must win.
+            if state.lastSyncedAt == nil { state.lastSyncedAt = seed }
+        }
+    }
+
     func bootstrapStore() async {
         guard collector == nil else { return }
         // Surface store-open failures instead of swallowing them with `try?` (#222): a silent failure
@@ -966,16 +1339,30 @@ public final class BLEManager: NSObject, ObservableObject {
         // its own concurrency).
         let registry = DeviceRegistryStore(dbQueue: store.registryWriter)
         self.registryStore = registry
+        seedLastSyncFromActiveStrap(registry: registry)
         if let activeId = try? registry.activeDeviceId(),
            !activeId.isEmpty {
             self.deviceId = activeId
         }
-        try? await store.upsertDevice(id: deviceId, mac: nil, name: "WHOOP 4.0")
+        // Look up the active device's real brand/model instead of a hardcoded string — this predated
+        // multi-device support and mislabeled every non-"WHOOP 4.0" device (a WHOOP 5.0/MG strap, an Oura
+        // ring, …) with the same literal "WHOOP 4.0". `device.name` has no production reader today (only
+        // the `deviceRowForTest` helper), so this is dormant, but still wrong data on disk.
+        let registeredName = (try? registry.all())?.first(where: { $0.id == deviceId })?.displayName
+        try? await store.upsertDevice(id: deviceId, mac: nil, name: registeredName)
         // Research toggle — OFF by default. When disabled the app is decoded-only and never
         // persists raw frames. Flip "enableRawCapture" in UserDefaults to capture raw again.
         let enableRawCapture = UserDefaults.standard.bool(forKey: "enableRawCapture")
         collector = Collector(store: store, deviceId: deviceId,
-                              enableRawCapture: enableRawCapture)
+                              enableRawCapture: enableRawCapture,
+                              log: { [weak self] line in self?.log(line) },
+                              onBanked: { [weak self] c in
+                                  guard let self else { return }
+                                  self.bankedHr += c.hr; self.bankedRr += c.rr
+                                  self.bankedGravity += c.gravity; self.bankedResp += c.resp
+                                  self.bankedSkinTemp += c.skinTemp; self.bankedSpo2 += c.spo2
+                                  self.bankedBattery += c.battery
+                              })
         // The store can finish bootstrapping AFTER connect(model:) already ran (both wait on
         // poweredOn), so apply the family/clock configuration here too — whichever runs last wins.
         configureCollectorFamily()
@@ -1048,7 +1435,10 @@ public final class BLEManager: NSObject, ObservableObject {
         self.router = FrameRouter(state: state)
         self.collector = collector
         super.init()
-        state.lastSyncedAt = UserDefaults.standard.object(forKey: "lastSyncedAt") as? Double
+        // Deliberately NOT seeded from the global key here. It belongs to whichever strap synced last,
+        // which on a two-strap install is not the one the screens are scoped to — the misattribution this
+        // whole change removes. `seedLastSyncFromActiveStrap` fills it from the ACTIVE strap once the
+        // registry exists (bootstrapStore); a blank moment is honest, another strap's timestamp is not.
         // Restore identifier + background-capable central (mirrors the production initializer
         // so a restored manager matches by identifier; only exercised by tests/previews).
         #if os(iOS)
@@ -1066,6 +1456,12 @@ public final class BLEManager: NSObject, ObservableObject {
 
     // MARK: Public API
 
+    /// Give buffered standard-HR rows a persistence attempt before app suspension/termination.
+    /// Kept on BLEManager so the app lifecycle reaches the live Collector owned by this connection.
+    func flushStandardHRForLifecycle(reason: LivePersistTrace.StandardHRFlushReason) async {
+        await collector?.flushStandardHR(reason: reason)
+    }
+
     /// USER-initiated connect (the Connect button, the scan flow, Add-a-WHOOP). The ONLY entry that
     /// re-arms a bond-loop give-up: a user gesture is an explicit "try again", so the streak + pause
     /// clear and auto-reconnect works again if it bonds. System-initiated paths (Bluetooth poweredOn,
@@ -1081,6 +1477,17 @@ public final class BLEManager: NSObject, ObservableObject {
             autoReconnectPausedForBondLoop = false
             bondLoopPausedAt = nil
         }
+        // #1635: the suppression path pauses NOTHING, so the reset above never fires for it. An explicit
+        // Connect is exactly the signal that the user has acted (pairing mode, closed the WHOOP app), so
+        // it must grant a fresh handshake regardless. Be exact about what that does and does not do: it
+        // grants ONE connect's worth of hello and leaves the latch standing, so if the strap still will
+        // not answer, the automatic reconnects behind this attempt stay suppressed. The latch is cleared
+        // by the attempt SUCCEEDING (didWriteValueFor's genuine ack) or by forgetDevice, never by the tap
+        // itself — Kotlin `pairingHintClearDropsSuppressionLatch` is the twin of that rule, and it had to
+        // be made one: clearing on the tap there re-paid the whole give-up on every press.
+        // Deliberately NOT in connectCore: a system-initiated reconnect must not.
+        helloRetryRequested = true
+        bondGiveUp.reset()
         connectCore(model: model)
     }
 
@@ -1109,6 +1516,7 @@ public final class BLEManager: NSObject, ObservableObject {
         // and tell the router which decoder to use. Fresh per connection so no stale bytes carry over.
         reassembler = Reassembler(family: model.deviceFamily)
         router.family = model.deviceFamily
+        router.deviceId = deviceId   // #1706: attribute this connection's alarm readback
         // Live 5/MG persistence: point the Collector's decode at the selected family and install the
         // identity clock ref for a 5/MG (its live timestamps are already real unix). WHOOP 4.0 keeps
         // the GET_CLOCK correlation flow untouched. Re-applied after bootstrapStore builds the
@@ -1186,8 +1594,9 @@ public final class BLEManager: NSObject, ObservableObject {
         readoptingTo = nil   // #52: a clean teardown abandons any in-flight pin handoff
         standardHRFallback = false
         state.standardHRMode = nil
+        standingConnectAt = nil   // #1413: drop the standing-connect marker; the cancel below also cancels a pending one
         if let p = peripheral {
-            central.cancelPeripheralConnection(p)
+            central.cancelPeripheralConnection(p)   // cancels a live OR a pending (standing) connect
         }
         central.stopScan()
     }
@@ -1202,6 +1611,9 @@ public final class BLEManager: NSObject, ObservableObject {
     public func forgetDevice(_ peripheralId: String?) {
         let target = peripheralId.flatMap { UUID(uuidString: $0) }
         let isCurrent = target == nil || peripheral?.identifier == target
+        // Captured BEFORE the teardown below nils `peripheral`, since a nil argument means "the current
+        // strap" and that is the only place its identifier can still be read.
+        let releasedUUID = peripheralId ?? peripheral?.identifier.uuidString
         intentionalDisconnect = true            // defuses the disconnect→3s-reconnect loop's guard
         cancelScanFallback()
         readoptingTo = nil                       // abandon any in-flight #52 pin handoff
@@ -1222,6 +1634,12 @@ public final class BLEManager: NSObject, ObservableObject {
         }
         // #747/#750 invariant: releasing a strap fully resets the give-up + pause (like disconnect()) so
         // a paused state can never outlive the strap it belonged to and wedge a later re-add.
+        //
+        // #1635: the hello-suppression latch is exactly that kind of state, and it is PERSISTED - so
+        // without this it outlives the strap it belonged to, silently suppressing the handshake on a
+        // re-add and leaving a stale key behind for a strap the user removed. Re-latching costs the same
+        // five refusals it always did, so a strap that genuinely cannot bond is no worse off.
+        HelloSuppressionStore.setSuppressed(releasedUUID, false)
         bondGiveUp.reset()
         autoReconnectPausedForBondLoop = false
         bondLoopPausedAt = nil
@@ -1276,6 +1694,29 @@ public final class BLEManager: NSObject, ObservableObject {
         return s >= bondLoopSalvageFloorSeconds
     }
 
+    /// #1539: may the bond-loop pause hand CoreBluetooth a STANDING connect right now?
+    ///
+    /// The pause deliberately stops active rescanning, but before this it also suppressed
+    /// `issueStandingConnect`, which removed the one mechanism capable of ending it without the user: the
+    /// salvage probe fires on app-foreground, so a phone in a pocket at 23:19 never runs it. A strap freed
+    /// at midnight stayed unclaimed until someone opened the app — six hours in the report, and unbounded
+    /// in principle, which becomes real data loss once the gap outlives the strap's own buffer.
+    ///
+    /// A standing connect is the right escape because it is NOT hammering: `central.connect` has no
+    /// timeout, so it is one request the OS parks until the strap is reachable, with nothing written to the
+    /// strap and no wakeups in between. The floor still applies to REFRESHES, so a strap that is reachable
+    /// and keeps refusing the bond cannot spin connect → refuse → pause → connect; it gets one attempt per
+    /// window exactly as the foreground probe does. A nil elapsed time means the pause has only just
+    /// tripped, which is when the first standing connect must be armed.
+    nonisolated static func shouldStandingConnectWhilePaused(pausedForBondLoop: Bool,
+                                                             connected: Bool,
+                                                             intentionalDisconnect: Bool,
+                                                             secondsSincePauseTripped: TimeInterval?) -> Bool {
+        guard pausedForBondLoop, !connected, !intentionalDisconnect else { return false }
+        guard let s = secondsSincePauseTripped else { return true }
+        return s >= bondLoopSalvageFloorSeconds
+    }
+
     /// #78 hole-1: classify a "the strap refused the encrypted bond" error by its ATT CODE first,
     /// locale-proof. Foundation LOCALIZES CoreBluetooth error strings, so the old
     /// `localizedDescription.contains("encryption"/"authentication")` check silently never matched on a
@@ -1310,6 +1751,23 @@ public final class BLEManager: NSObject, ObservableObject {
         bondLoopPausedAt = now   // re-floor: max one probe per foreground AND per 10-min window
         log("Bond-loop pause: one salvage probe (the strap may have been freed since the give-up) - the give-up stays latched")
         connectFromSystem()
+    }
+
+    /// #1539: park a standing connect while the bond-loop pause is latched, so the pause can end without
+    /// the user. Called from the paused disconnect branch and from the trip itself — both run while the app
+    /// is backgrounded, which is exactly where the foreground probe cannot reach. Re-stamps
+    /// `bondLoopPausedAt` so a strap that is reachable and still refusing gets one attempt per window
+    /// rather than a connect/refuse spin.
+    func standingConnectWhilePausedIfDue(now: Date = Date(), justTripped: Bool = false) {
+        let since = justTripped ? nil : bondLoopPausedAt.map { now.timeIntervalSince($0) }
+        guard BLEManager.shouldStandingConnectWhilePaused(
+            pausedForBondLoop: autoReconnectPausedForBondLoop,
+            connected: state.connected,
+            intentionalDisconnect: intentionalDisconnect,
+            secondsSincePauseTripped: since) else { return }
+        bondLoopPausedAt = now
+        log("Bond-loop pause: parking a standing connect so the strap is claimed the moment it is reachable (#1539) - the give-up stays latched")
+        issueStandingConnect(whilePausedForBondLoop: true)
     }
 
     /// Observe the app-foreground notification and run the salvage probe. Installed once per manager from
@@ -1471,8 +1929,14 @@ public final class BLEManager: NSObject, ObservableObject {
         rawCaptureInFlight = true
         let secs = RawCaptureWindow.clamp(seconds)
         collector?.beginRawCapture(seconds: secs)
-        send(.startRawData, payload: [0x01])
-        send(.toggleIMUMode, payload: [0x01])
+        // Hardware-verified on WHOOP 5/MG: opcode 106 alone acknowledges but does not start the
+        // producer. START_RAW_DATA must precede the two-byte realtime IMU selector.
+        send(.startRawData, payload: [0x01], writeType: .withResponse)
+        if selectedModel.deviceFamily == .whoop5 {
+            send(.toggleIMUMode, payload: [0x01, 0x01], writeType: .withResponse)
+        } else {
+            send(.toggleIMUMode, payload: [0x01], writeType: .withResponse)
+        }
         log("Raw-accel capture: started for \(secs)s")
         DispatchQueue.main.asyncAfter(deadline: .now() + secs) { [weak self] in
             guard let self else { return }
@@ -1480,7 +1944,10 @@ public final class BLEManager: NSObject, ObservableObject {
             // continuous stream must keep running — we just flush/upload the bounded window we
             // captured without halting the wider session.
             if !UserDefaults.standard.bool(forKey: "enableRawCapture") {
-                self.send(.stopRawData, payload: [0x01])
+                self.send(.stopRawData, payload: [0x01], writeType: .withResponse)
+                if self.selectedModel.deviceFamily == .whoop5 {
+                    self.send(.toggleIMUMode, payload: [0x01, 0x00], writeType: .withResponse)
+                }
             }
             self.rawCaptureInFlight = false
             Task { @MainActor in
@@ -1488,6 +1955,50 @@ public final class BLEManager: NSObject, ObservableObject {
             }
             self.log("Raw-accel capture: stopped + flushed")
         }
+    }
+
+    /// Start a manually stopped 5/MG raw-data session. Returns false when another capture is active.
+    @discardableResult
+    public func startGroundTruthRawCapture(sessionId: String) -> Bool {
+        guard !rawCaptureInFlight else { return false }
+        rawCaptureInFlight = true
+        send(.startRawData, payload: [0x01], writeType: .withResponse)
+        send(.toggleIMUMode,
+             payload: selectedModel.deviceFamily == .whoop5 ? [0x01, 0x01] : [0x01],
+             writeType: .withResponse)
+        log("Raw-data session: started")
+        return true
+    }
+
+    /// Stop and flush the current manually controlled raw-data session.
+    public func stopGroundTruthRawCapture() async {
+        if rawCaptureInFlight && !UserDefaults.standard.bool(forKey: "enableRawCapture") {
+            send(.stopRawData, payload: [0x01], writeType: .withResponse)
+            if selectedModel.deviceFamily == .whoop5 {
+                send(.toggleIMUMode, payload: [0x01, 0x00], writeType: .withResponse)
+            }
+        }
+        rawCaptureInFlight = false
+        rawCaptureStoppedAt = Date()
+        log("Raw-data session: stopped + flushed")
+    }
+
+    /// Stop a realtime IMU producer left armed after a crash, lost stop write, or another client.
+    private func stopUnexpectedRealtimeImu(_ frame: [UInt8], isOffload: Bool, now: Date = Date()) {
+        guard selectedModel.deviceFamily == .whoop5, !isOffload, frame.count > 8,
+              frame[8] == 43 || frame[8] == 51,
+              !rawCaptureInFlight, !UserDefaults.standard.bool(forKey: "enableRawCapture"),
+              now.timeIntervalSince(rawCaptureStoppedAt) >= 3,
+              now.timeIntervalSince(unexpectedImuStopAt) >= 30 else { return }
+        unexpectedImuStopAt = now
+        send(.stopRawData, payload: [0x01], writeType: .withResponse)
+        send(.toggleIMUMode, payload: [0x01, 0x00], writeType: .withResponse)
+        log("Raw IMU fail-safe: unexpected realtime packet type \(frame[8]) while capture was off; stop requested")
+    }
+
+    public func groundTruthHistoryCSV(from: Int, to: Int) async -> Data {
+        await collector?.historySensorsCSV(from: from, to: to)
+            ?? Data("stream,unix_s,v1,v2,v3,v4\n".utf8)
     }
 
     /// Send a command to the WHOOP strap.
@@ -1572,6 +2083,10 @@ public final class BLEManager: NSObject, ObservableObject {
                 || (DeviceConfigReadProbe.isReadOnlyOpcode(command.rawValue) && deviceConfigReport != nil)
                 || command == .sendHistoricalData || command == .historicalDataResult
                 || command == .setClock || command == .getClock
+                // Bounded Raw Data Collector only. These writes remain impossible unless the explicit
+                // user-started capture window is in flight; normal sync never enables this gate.
+                || (rawCaptureInFlight && (command == .startRawData
+                    || command == .stopRawData || command == .toggleIMUMode))
                 // SET_CONFIG / SET_FF_VALUE (120), ENABLE direction — the R22 deep-stream unlock. Allowed
                 // only while the deep-data experiment is opted in, and only for a KEY and a VALUE the gate
                 // recognises: one of the sixteen R22 flags carrying that key's own enable value. The clause
@@ -1596,10 +2111,22 @@ public final class BLEManager: NSObject, ObservableObject {
                 // in flight, exactly like the read probes' 121/128 clause above, so a default install can
                 // never form these bytes. The write ack is not trusted; this is what proves the clear.
                 || (FeatureFlagWriteGate.isReadBackOpcode(command.rawValue) && r22DisableRun != nil)
-                // SET_DEVICE_CONFIG (the Broadcast-HR flag) is allowed ONLY while that opt-in is on —
-                // it writes one persistent device-config value so the strap advertises standard HR.
-                // Reversible; driven only by setBroadcastHr(_:). (#181)
-                || (command == .setDeviceConfig && PuffinExperiment.broadcastHrEnabled)
+                // SET_DEVICE_CONFIG (119) is KEY-AWARE now (#891): the opcode is shared between the
+                // Broadcast-HR flag (#181) and the ECG raw-data gate, so an opcode-only clause would admit
+                // ANY device-config key whenever EITHER opt-in happened to be on. `admitsSend` parses the
+                // key out of the body and admits exactly the two named keys, each only under its own opt-in
+                // — and the ECG key additionally only on an attested MG. Every other enumerated key, and
+                // SET_FF_VALUE(120), is refused. This is a tightening of the old broadcast-HR-only clause.
+                || DeviceConfigWriteGate.admitsSend(opcode: command.rawValue,
+                                                    payload: payload,
+                                                    ecgGateOptIn: PuffinExperiment.ecgRawDataEnabled,
+                                                    isMG: isWhoop5MG,
+                                                    broadcastHrOptIn: PuffinExperiment.broadcastHrEnabled)
+                // GET_DEVICE_CONFIG_VALUE(121) as a gate's mandatory READ-BACK — gated on a write being
+                // verified, exactly like the R22 read-back above. The write ack is never the proof. Both the
+                // ECG gate (#891) and the Broadcast-HR gate (#1061) read themselves back over this opcode.
+                || (DeviceConfigWriteGate.isReadBackOpcode(command.rawValue)
+                    && (ecgGateReport != nil || broadcastHrGateReport != nil))
                 // The WHOOP MG ECG ("Labrador") family — allowed ONLY when BOTH gates hold: the
                 // Experimental opt-in is on AND the strap has POSITIVELY attested itself an MG over the
                 // Device Information Service. A plain 5.0 has no electrodes and an unidentified strap
@@ -1618,7 +2145,16 @@ public final class BLEManager: NSObject, ObservableObject {
             // 4-byte boundary, which this 12-byte payload needs. WHOOP 4.0 is untouched (79 + its own frame).
             let isHaptics = command == .runHapticsPattern
             let puffinCmd: UInt8 = isHaptics ? 0x13 : command.rawValue
-            let puffinPayload: [UInt8] = isHaptics ? [0x01, 47, 152, 0, 0, 0, 0, 0, 0, 0, 0, 0] : payload
+            // #926: build the body through the shared `MaverickHaptics.notificationBuzz` rather than a
+            // literal, so the caller's repeat count reaches the wire. The literal that used to sit here
+            // pinned overallLoop to 0, which is why every BuzzPattern — and the Breathe inhale/exhale cue,
+            // and the live-session long/short cues — felt identical on a 5/MG. The 4.0 payload this
+            // substitutes for is `[patternId, loops, …]`, so the count is byte 1. A single buzz still
+            // rebuilds the old literal EXACTLY (overallLoop = 1 - 1 = 0), so nothing changes for a caller
+            // that asked for one. Kotlin twin: `WhoopBleClient.maverickHapticBody`.
+            let buzzLoops = payload.count >= 2 ? Int(payload[1]) : 1
+            let puffinPayload: [UInt8] = isHaptics
+                ? MaverickHaptics.notificationBuzz(loops: buzzLoops) : payload
             seq = seq &+ 1
             let frame = puffinCommandFrame(cmd: puffinCmd, seq: seq, payload: puffinPayload)
             p.writeValue(Data(frame), for: ch, type: writeType)
@@ -1707,26 +2243,31 @@ public final class BLEManager: NSObject, ObservableObject {
     /// flag, kick the strap with sendHistoricalData, and arm the idle timeout.
     @discardableResult
     private func beginBackfill() -> Bool {
-        // #700: if backfill is about to start and we STILL have no clock correlation, re-send
-        // GET_CLOCK. The strap may have silently dropped the first response (observed on a reporter's
-        // WHOOP 4.0 — GET_CLOCK sent, no reply, entire session decodes under IDENTITY fallback, all
-        // rows land on the current day). Capped at 3 retries to avoid flooding.
-        if clockRef == nil && clockRetries < 3 {
-            clockRetries += 1
-            log("Clock: no correlation yet — re-sending GET_CLOCK (retry \(clockRetries)/3)")
-            send(.getClock, payload: [])
-            send(.getClock, payload: [0x00])
-        } else if clockRef == nil, let newest = strapNewestTs {
-            // #700 fallback: GET_CLOCK never responded even after retries. Derive a rough correlation
-            // from the Data Range's newest-banked timestamp (already parsed, always answered). The
-            // offset is approximate (the newest record could be minutes old) but vastly better than
-            // identity (offset 0), which mis-dates entire nights.
-            let wall = Int(Date().timeIntervalSince1970)
-            let ref = ClockRef(device: newest, wall: wall)
-            clockRef = ref
-            collector?.clockRef = ref
-            backfiller?.clockRef = ref
-            log("Clock: GET_CLOCK unresponsive — derived rough correlation from Data Range (device=\(newest) wall=\(wall), offset \(wall - newest)s)")
+        // #1598: this whole block is WHOOP 4.0 ONLY. A 5/MG has no GET_CLOCK correlation to chase —
+        // identity is its correct decode — and deriving one from the Data Range would misdate its
+        // history. See BackfillContinuation.derivesClockCorrelation for why.
+        if BackfillContinuation.derivesClockCorrelation(selectedModel.deviceFamily) {
+            // #700: if backfill is about to start and we STILL have no clock correlation, re-send
+            // GET_CLOCK. The strap may have silently dropped the first response (observed on a reporter's
+            // WHOOP 4.0 — GET_CLOCK sent, no reply, entire session decodes under IDENTITY fallback, all
+            // rows land on the current day). Capped at 3 retries to avoid flooding.
+            if clockRef == nil && clockRetries < 3 {
+                clockRetries += 1
+                log("Clock: no correlation yet — re-sending GET_CLOCK (retry \(clockRetries)/3)")
+                send(.getClock, payload: [])
+                send(.getClock, payload: [0x00])
+            } else if clockRef == nil, let newest = strapNewestTs {
+                // #700 fallback: GET_CLOCK never responded even after retries. Derive a rough correlation
+                // from the Data Range's newest-banked timestamp (already parsed, always answered). The
+                // offset is approximate (the newest record could be minutes old) but vastly better than
+                // identity (offset 0), which mis-dates entire nights.
+                let wall = Int(Date().timeIntervalSince1970)
+                let ref = ClockRef(device: newest, wall: wall)
+                clockRef = ref
+                collector?.clockRef = ref
+                backfiller?.clockRef = ref
+                log("Clock: GET_CLOCK unresponsive — derived rough correlation from Data Range (device=\(newest) wall=\(wall), offset \(wall - newest)s)")
+            }
         }
         // Never offload before the connect handshake has run: a racing foreground/restore trigger
         // firing SEND_HISTORICAL ahead of hello/SET_CLOCK was part of the storm that stopped serving.
@@ -1914,13 +2455,17 @@ public final class BLEManager: NSObject, ObservableObject {
         if let bf = backfiller,
            let summary = Backfiller.sessionSummaryLine(rows: bf.sessionRowsPersisted, motion: bf.sessionMotionRows, skinTemp: bf.sessionSkinTempRows, nights: bf.sessionNights) {
             log(summary)
+            // #1008/#1118: the pre-storage R-R census for this offload. Emitted next to the persisted
+            // tally so one line pair says what the decoder OFFERED and what the store KEPT.
+            if let rrLine = bf.sessionRrEmissionLine() { log(rrLine) }
             // #67: WHERE the rows landed + WHY (the clock ref that decoded them). A reset-RTC strap banks
             // last night into the past; this line makes the misdating self-evident in the strap log instead
             // of leaving "persisted N rows across 1 night(s)" looking like a clean sync.
             if let diag = Backfiller.sessionClockDiagLine(nightKeys: bf.sessionNightKeys,
                                                           device: bf.sessionClockDevice,
                                                           wall: bf.sessionClockWall,
-                                                          usedIdentityRef: bf.sessionUsedIdentityRef) {
+                                                          usedIdentityRef: bf.sessionUsedIdentityRef,
+                                                          family: bf.family) {
                 log(diag)
             }
         }
@@ -1940,7 +2485,12 @@ public final class BLEManager: NSObject, ObservableObject {
             let rows = bf.sessionRowsPersisted
             let result: String
             if reason == "timeout" {
-                result = "stalled (idle timeout, rows=\(rows) so far)"
+                // #1466: an idle timeout that banked rows is a productive end, not a stall — the strap
+                // simply went quiet after handing everything over. Only rows=0 is a genuine stall. Calling
+                // both "stalled" made a healthy 17k-row night read as a failure in the log.
+                result = rows > 0
+                    ? "idle-timeout after rows=\(rows)"
+                    : "stalled (idle timeout, rows=0)"
             } else if reason == "HISTORY_COMPLETE" {
                 result = rows > 0
                     ? "complete rows=\(rows) nights=\(bf.sessionNights)"
@@ -1978,6 +2528,17 @@ public final class BLEManager: NSObject, ObservableObject {
         // HISTORY_COMPLETE stamps lastSyncedAt + clears any error; the idle-watchdog timeout surfaces
         // a non-silent error. A disconnect mid-sync bypasses this path (didDisconnectPeripheral resets
         // the flags directly) — that's not a sync failure, and the next connect re-offloads.
+        // #battery: maintain the empty-offload backoff counter for EVERY exit reason (twin of Android
+        // consecutiveEmptyOffloads). A 0-row session — clean HISTORY_COMPLETE-empty OR an idle-timeout STALL
+        // — feeds BackfillPolicy's exponential backoff so the periodic poll stops spinning on a strap
+        // handing over nothing; any banked rows reset it, and a productive auto-continue tail doesn't count.
+        // #1146: snapshot THIS completed session's persisted-row verdict ONCE (frontier advanced iff a new
+        // sensor row landed) at function scope, so the auto-continue decision below gates on this snapshot —
+        // never a fresh `backfiller.sessionRowsPersisted` re-read that a re-kicked session / trailing frames
+        // could have mutated across the offload boundary.
+        let persistedSensorRows = (backfiller?.sessionRowsPersisted ?? 0) > 0
+        if persistedSensorRows { consecutiveEmptyOffloads = 0 }
+        else if consecutiveAutoContinues == 0 { consecutiveEmptyOffloads += 1 }
         if reason == "HISTORY_COMPLETE" {
             state.lastSyncedAt = Date().timeIntervalSince1970
             // #77 / #91: a sync that COMPLETED but discarded records must not read as a clean
@@ -2009,8 +2570,27 @@ public final class BLEManager: NSObject, ObservableObject {
             // STALLED on a persist failure" — the latter (usually a restore without a restart) is otherwise
             // invisible in a report that just shows "0 synced".
             let du = UserDefaults.standard
-            if (backfiller?.sessionRowsPersisted ?? 0) > 0 { du.set(Date().timeIntervalSince1970, forKey: "sync.lastWriteOkAt") }
-            if backfiller?.persistStalled == true { du.set(Date().timeIntervalSince1970, forKey: "sync.lastWriteStalledAt") }
+            // Per strap, not per install. The global keys reported one strap's write health on another's
+            // screen — see LastSyncAttribution. This site has the peripheral, so it is the one place that
+            // can attribute them honestly (same argument as #1634's firmware write).
+            let whoOk = LastSyncAttribution.writeHealthPrefKey(peripheralId: peripheral?.identifier.uuidString,
+                                                               kind: "lastWriteOkAt")
+            let whoStalled = LastSyncAttribution.writeHealthPrefKey(peripheralId: peripheral?.identifier.uuidString,
+                                                                    kind: "lastWriteStalledAt")
+            // The global keys are STILL written, deliberately, exactly as `noop.lastFirmware` still is
+            // (FrameRouter). DebugDataDiagnostics.strapStateLines is sync and prefs-only by contract, so it
+            // cannot resolve per device — and dropping the global write would not make that line
+            // per-device, it would freeze it at whatever it held before the upgrade and then read "no rows
+            // ever persisted" forever, for everyone. A stale global is the smaller lie than a dead one, and
+            // every reader that CAN attribute prefers the per-device key.
+            if (backfiller?.sessionRowsPersisted ?? 0) > 0 {
+                du.set(Date().timeIntervalSince1970, forKey: "sync.lastWriteOkAt")
+                if let k = whoOk { du.set(Date().timeIntervalSince1970, forKey: k) }
+            }
+            if backfiller?.persistStalled == true {
+                du.set(Date().timeIntervalSince1970, forKey: "sync.lastWriteStalledAt")
+                if let k = whoStalled { du.set(Date().timeIntervalSince1970, forKey: k) }
+            }
             if unarchived > 0 {
                 state.lastSyncError = "Synced, but \(archived + unarchived) record(s) couldn't be decoded (unrecognised strap firmware layout), and the on-device archive is full - the \(unarchived) newest weren't preserved. Please share a strap log so the layout can be mapped."
             } else if archived > 0 {
@@ -2025,8 +2605,31 @@ public final class BLEManager: NSObject, ObservableObject {
                     ? "console-only across \(state.consoleChunksThisSession) chunks"
                     : "metadata-only, 0 sensor rows persisted"
                 log("Backfill: completed but the strap banked no sensor history (\(detail)); consecutive empty syncs = \(emptySyncTracker.consecutiveEmptySyncs).")
+                // #1683: say HOW OLD the strap's newest stored record is. Without it the line above reads
+                // identically for a strap that is caught up and one that stopped banking three weeks ago -
+                // GET_DATA_RANGE already told us the difference and we simply never said so, which is why
+                // #1541 stayed open and unactionable. Rare-event evidence, so always-on.
+                let wallNowUnix = Int(Date().timeIntervalSince1970)
+                // Read the field ONCE: it feeds both the log line and the banner below, and they must not
+                // disagree about whether the strap is stale.
+                // WHOOP4 only, explicitly, on BOTH platforms. Redundant here today - `strapNewestTs` is
+                // only assigned when `feedsSync` (#695), which is WHOOP4 - but stated so a later widening
+                // of feedsSync cannot make this fire where the Android twin does not. A 5/MG that cannot
+                // offload has no business being told it stopped saving to flash.
+                let staleNewest: Int? = selectedModel.deviceFamily == .whoop4
+                    ? strapNewestTs.flatMap {
+                        Backfiller.isStaleNewestRecord(newestUnix: $0, wallNowUnix: wallNowUnix) ? $0 : nil
+                    }
+                    : nil
+                if let newest = staleNewest {
+                    log(Backfiller.staleRecordLine(newestUnix: newest, wallNowUnix: wallNowUnix))
+                }
+                // #1683: when the strap's own newest record dates the silence, SAY it. The generic copy
+                // below omits that and promises a recovery the charge advice has already been retried for
+                // every session; the dated version is the one a stuck user can act on.
                 state.lastSyncError = sustainedEmpty
-                    ? "Synced, but your strap had no stored history to hand over - only its diagnostic output. This usually means its clock has lost sync, so it isn't saving data to flash. Fully charge it to 100%, then reconnect, and it should start banking again."
+                    ? (staleNewest.map { Backfiller.staleRecordBanner(newestUnix: $0, wallNowUnix: wallNowUnix) }
+                        ?? "Synced, but your strap had no stored history to hand over - only its diagnostic output. This usually means its clock has lost sync, so it isn't saving data to flash. Fully charge it to 100%, then reconnect, and it should start banking again.")
                     : nil
             } else if let futureBanner = futureClockBanner {
                 // #324/#928: the strap banked records but its newest is dated implausibly in the FUTURE
@@ -2044,6 +2647,16 @@ public final class BLEManager: NSObject, ObservableObject {
                 whoop5EmptyOffload.reset()
                 state.historySyncExperimental = false
             }
+            // Stamped against the strap that actually completed this offload, never globally: the single
+            // key reported one strap's sync on another's screen, and it read as reassuring rather than
+            // wrong — see LastSyncAttribution. Kotlin twin: NoopPrefs.setLastSyncAtFor.
+            if let key = LastSyncAttribution.prefKey(peripheralId: peripheral?.identifier.uuidString) {
+                UserDefaults.standard.set(state.lastSyncedAt, forKey: key)
+            }
+            // Global kept for the same reason as the write-health pair above: the prefs-only debug header
+            // is its only remaining reader and cannot resolve per device, so dropping this write would
+            // freeze that line rather than fix it. It is also what `seedLastSyncFromActiveStrap`'s
+            // single-strap fallback reads across the upgrade.
             UserDefaults.standard.set(state.lastSyncedAt, forKey: "lastSyncedAt")
             // NOTE: the auto-continue streak is NOT reset here. A HISTORY_COMPLETE is no longer assumed to
             // mean "caught up" (#25): a strap whose firmware segments a deep offload into many small
@@ -2056,9 +2669,10 @@ public final class BLEManager: NSObject, ObservableObject {
             // 5/MG case isn't a failure — live HR is streaming fine over 0x2A37, the history offload is
             // just experimental/empty on that firmware. "Banked" = this offload made ANY offload progress
             // (chunks acked, rows persisted, or deep packets seen); an empty 5/MG offload has none.
-            let bankedThisOffload = state.syncChunksThisSession > 0
-                || (backfiller?.sessionRowsPersisted ?? 0) > 0
-                || state.deepPacketsThisSession > 0
+            let bankedThisOffload = BLEManager.offloadBankedAnything(
+                chunks: state.syncChunksThisSession,
+                rows: backfiller?.sessionRowsPersisted ?? 0,
+                deepPackets: state.deepPacketsThisSession)
             if selectedModel.deviceFamily == .whoop5 {
                 let crossed = whoop5EmptyOffload.recordOffload(bankedRecords: bankedThisOffload)
                 if whoop5EmptyOffload.historyEmpty {
@@ -2079,8 +2693,16 @@ public final class BLEManager: NSObject, ObservableObject {
                 // #324/#928: a future-dated strap TIMES OUT on its deep future-dated backlog — that's not
                 // "the strap went quiet", it's the clock being set ahead. Prefer the honest future-clock
                 // banner so the reporter's timeout case (the common one) names the real cause + remedy.
-                state.lastSyncError = futureClockBanner
-                    ?? "Sync interrupted - the strap went quiet. It will retry on the next sync."
+                //
+                // #1466: past that, only claim the strap went quiet when this offload actually handed over
+                // NOTHING. A WHOOP 4.0 routinely ends a full, successful night on the idle timeout rather
+                // than HISTORY_COMPLETE — one field log shows a session banking 17,205 rows across a night
+                // and still exiting reason=timeout. Announcing "sync interrupted" there tells the user a
+                // sync that worked had failed, which is worse than saying nothing: it trains them to
+                // distrust the one banner that matters when a sync really does stall. `bankedThisOffload`
+                // was already computed above for the 5/MG path and simply never consulted here.
+                state.lastSyncError = BLEManager.timeoutSyncError(futureClockBanner: futureClockBanner,
+                                                                  bankedThisOffload: bankedThisOffload)
             }
         }
         checkStrapLiveness()         // safety-net: strap ahead of us AND our frontier frozen ⇒ stuck?
@@ -2094,8 +2716,14 @@ public final class BLEManager: NSObject, ObservableObject {
         // returns false and stops; that else path is also where the consecutive streak is cleared. Bounded
         // by the consecutive-cap and the spin-detector inside the pure predicate either way.
         if reason == "timeout" || reason == "HISTORY_COMPLETE" {
+            // #1146: pass the ONCE-captured `persistedSensorRows` verdict (snapshotted at function scope
+            // above) — NOT a fresh `backfiller.sessionRowsPersisted` read. The live counter can be mutated by
+            // trailing frames / a re-kicked session across the offload boundary, so re-reading it here let an
+            // empty session (which persisted 0 new rows) still look like real backlog and spin to the cap.
+            // Snapshotting `> 0` = the auto-continue can't disagree with the empty verdict, and a dup-only
+            // re-offload (0 new rows) stops instead of spinning on already-synced data.
             maybeAutoContinueBackfill(trimAdvanced: trimAdvanced,
-                                      rowsPersisted: backfiller?.sessionRowsPersisted ?? 0)
+                                      persistedSensorRows: persistedSensorRows)
         }
     }
 
@@ -2110,7 +2738,7 @@ public final class BLEManager: NSObject, ObservableObject {
     /// `trimAdvanced` is the spin-detector signal computed in exitBackfilling (did this session move the
     /// trim cursor vs the previous one) — passed in because exitBackfilling has already advanced
     /// `lastSessionEndTrim` past the comparison point by the time this Task runs.
-    private func maybeAutoContinueBackfill(trimAdvanced: Bool, rowsPersisted: Int) {
+    private func maybeAutoContinueBackfill(trimAdvanced: Bool, persistedSensorRows: Bool) {
         // Cheap pre-checks first (no Task if we already know we won't continue): still connected, under
         // the cap, and the trim moved. The frontier read only happens when those already hold.
         guard state.connected, state.bonded else { return }
@@ -2125,7 +2753,7 @@ public final class BLEManager: NSObject, ObservableObject {
                 strapNewestTs: newest,
                 ourFrontierTs: frontier,
                 wallNowUnix: wallNow,
-                rowsPersistedThisSession: rowsPersisted,
+                persistedSensorRows: persistedSensorRows,
                 lastTrimAdvanced: trimAdvanced,
                 consecutiveCount: count) else {
                 // #1012: name the stop honestly when the future-clock gate is what ended the chain —
@@ -2133,7 +2761,7 @@ public final class BLEManager: NSObject, ObservableObject {
                 // tell "caught up" from "future-dated range refused". Fires ONLY when 2b would otherwise
                 // have continued (still connected, rows banked, trim advanced, under the cap), so a
                 // frozen-trim / cap / disconnect stop is never misattributed to the clock.
-                if stillConnected, rowsPersisted > 0, trimAdvanced,
+                if stillConnected, persistedSensorRows, trimAdvanced,
                    count < BackfillContinuation.defaultMaxAutoContinues,
                    BackfillContinuation.isFutureDatedNewest(newest, wallNowUnix: wallNow) {
                     let aheadH = ((newest ?? wallNow) - wallNow) / 3600
@@ -2219,6 +2847,36 @@ public final class BLEManager: NSObject, ObservableObject {
     /// (that flag guards the once-per-connect INITIAL kick); the periodic re-trigger is separate.
     static func shouldRunPeriodicBackfill(connected: Bool, bonded: Bool, backfilling: Bool) -> Bool {
         connected && bonded && !backfilling
+    }
+
+    /// #1466: did this offload hand over anything at all? Acked chunks, persisted rows, or deep packets.
+    ///
+    /// Deliberately NOT a frame count. A stalled session still receives frames — three in one field log ran
+    /// 66–109s and took 42, 51 and 59 frames while banking ZERO rows. Gating the "strap went quiet" banner
+    /// on frames would therefore silence it on exactly the sessions it exists for. Twin of the Kotlin
+    /// `offloadBankedAnything`; both platforms must answer this the same way or one of them goes quiet on a
+    /// real stall.
+    nonisolated static func offloadBankedAnything(chunks: Int, rows: Int, deepPackets: Int) -> Bool {
+        chunks > 0 || rows > 0 || deepPackets > 0
+    }
+
+    /// #1466: the banner (if any) for an offload that ended on the idle TIMEOUT rather than
+    /// HISTORY_COMPLETE, for a non-5/MG strap. Pure so the decision is unit-testable — the surrounding
+    /// method is a long side-effecting BLE callback.
+    ///
+    /// A WHOOP 4.0 routinely ends a full, successful night this way: a field log shows a session banking
+    /// 17,205 rows across a night and still exiting `reason=timeout`. So "the strap went quiet" is only
+    /// honest when the offload handed over NOTHING; saying it after a productive sync reports a success as
+    /// a failure, and teaches the user to ignore the banner that matters when a sync really does stall.
+    ///
+    /// A future-dated clock still wins: it names a cause and a remedy, and #324/#928 showed that strap
+    /// times out precisely BECAUSE of the bad clock. Twin of the Kotlin `timeoutSyncError`.
+    nonisolated static func timeoutSyncError(futureClockBanner: String?,
+                                             bankedThisOffload: Bool) -> String? {
+        if let futureClockBanner { return futureClockBanner }
+        return bankedThisOffload
+            ? nil
+            : "Sync interrupted - the strap went quiet. It will retry on the next sync."
     }
 
     /// Pure classification of a COMPLETED (HISTORY_COMPLETE) offload, extracted from exitBackfilling so
@@ -2308,6 +2966,13 @@ public final class BLEManager: NSObject, ObservableObject {
         lowBatteryOffloadPct = thresholdPct
     }
 
+    /// Settings sub-option of Power saving: the user-elected hourly background cadence. Applies on the
+    /// NEXT re-arm exactly like the battery lever beside it, so a sync already in flight is never
+    /// interrupted (the cadence is re-read at each re-arm). Twin of Android `setLowRefreshMode`.
+    public func setLowRefreshMode(_ enabled: Bool) {
+        lowRefreshMode = enabled
+    }
+
     /// #477 (Settings): pause the background continuous-HRV stream when the strap is low. Keyed on the
     /// STRAP's battery like the offload lever — pass the same threshold; engages at/below it (0 = off).
     /// Reconciles now.
@@ -2328,12 +2993,30 @@ public final class BLEManager: NSObject, ObservableObject {
 
     /// The next periodic-offload interval — normally `backfillIntervalSeconds`, stretched when low on
     /// power (#477). Reads the battery snapshot only when the lever is armed (threshold > 0).
+    /// #battery: a 5/MG whose history offload is known-empty (`whoop5EmptyOffload.historyEmpty`, crossed
+    /// after 2 consecutive empty offloads) is stretched to the low-battery cadence (45 min) regardless of
+    /// battery % — history sync is experimental on 5.0 and such a strap banks nothing per pass, so a 15-min
+    /// periodic kick just holds the link ~60 s for zero data. The BackfillPolicy empty-backoff also
+    /// stretches (after 3 empties, doubling to a 1-hr cap), but this engages one cycle earlier (the
+    /// tracker's quietThreshold is 2) and at a fixed 45-min floor that stacks with it. Twin of Android
+    /// `nextBackfillDelayMs`. Resets with `whoop5EmptyOffload` on disconnect (a fresh connect re-probes).
     private func nextBackfillInterval() -> Int {
-        guard lowBatteryOffloadPct > 0 else { return BLEManager.backfillIntervalSeconds }
+        // Low refresh moves the BASE the other levers stretch from; each one composes with `max`, so the
+        // cadence can only get quieter, never faster than the user asked for.
+        let base = BLEManager.baseBackfillInterval(lowRefresh: lowRefreshMode)
+        // #battery: known-empty-history 5/MG → stretch to the 45-min floor before any battery lever.
+        if selectedModel.deviceFamily == .whoop5 {
+            let stretched = BLEManager.whoop5EmptyHistoryBackfillInterval(
+                baseSeconds: base,
+                lowSeconds: max(base, BLEManager.lowBatteryBackfillIntervalSeconds),
+                historyEmpty: whoop5EmptyOffload.historyEmpty)
+            if stretched != base { return stretched }
+        }
+        guard lowBatteryOffloadPct > 0 else { return base }
         let (pct, charging) = batteryPctAndCharging()
         return BLEManager.offloadInterval(
-            baseSeconds: BLEManager.backfillIntervalSeconds,
-            lowSeconds: BLEManager.lowBatteryBackfillIntervalSeconds,
+            baseSeconds: base,
+            lowSeconds: max(base, BLEManager.lowBatteryBackfillIntervalSeconds),
             batteryPct: pct, charging: charging, thresholdPct: lowBatteryOffloadPct)
     }
 
@@ -2656,11 +3339,163 @@ public final class BLEManager: NSObject, ObservableObject {
         guard state.connected, state.bonded else {
             log("Broadcast HR: connect and bond a 5/MG strap first — ignored."); return
         }
-        let value: UInt8 = on ? 0x31 : 0x30   // ASCII '1' / '0'
-        send(.setDeviceConfig,
-             payload: [0x01] + Whoop5Config.deviceConfigBody(name: "whoop_live_hr_in_adv_ind_pkt", value: value),
-             writeType: .withResponse)
-        log("Broadcast HR: wrote whoop_live_hr_in_adv_ind_pkt=\(on ? "1" : "0")")
+        // Mutually exclusive with the ECG gate: both verify over the SAME 121 read-back opcode, so if both
+        // were in flight one strap reply would be consumed by both handlers and cross-contaminate the other's
+        // verdict (its key isn't echoed → a spurious notClaimed). Only one device-config write verifies at once.
+        guard broadcastHrGateReport == nil, ecgGateReport == nil else {
+            log("Broadcast HR: a device-config write is already being verified — ignored."); return
+        }
+        let payload = [0x01] + Whoop5Config.deviceConfigBody(name: DeviceConfigWriteGate.broadcastHrKey,
+                                                             value: DeviceConfigWriteGate.value(on: on))
+        // #1061: `send` SILENTLY drops a command the 5/MG gate refuses, so consult the SAME gate and log
+        // honestly instead of a fire-and-forget "wrote". (The gate's OFF-write fix means the disable is now
+        // admitted; this keeps the log truthful if a write is ever refused.)
+        guard DeviceConfigWriteGate.admitsSend(opcode: DeviceConfigWriteGate.setDeviceConfigValueCmd,
+                                               payload: payload,
+                                               ecgGateOptIn: PuffinExperiment.ecgRawDataEnabled,
+                                               isMG: isWhoop5MG,
+                                               broadcastHrOptIn: PuffinExperiment.broadcastHrEnabled) else {
+            log("Broadcast HR: write whoop_live_hr_in_adv_ind_pkt=\(on ? "1" : "0") REFUSED by the 5/MG send gate — strap unchanged.")
+            return
+        }
+        // #1061: write, then READ IT BACK — the ack is not the proof. A reporter on FW 50.36.2.0 saw the
+        // flag written yet the strap never advertised 0x180D, with no way to tell "accepted but not
+        // advertised" from "write ignored". The 121 read-back settles that, same discipline as the ECG gate.
+        broadcastHrGateReport = BroadcastHrGateReport(on: on)
+        log("Broadcast HR: writing \(DeviceConfigWriteGate.broadcastHrKey)='\(DeviceConfigWriteGate.valueString(on: on))' via SET_DEVICE_CONFIG_VALUE(119); the ack is NOT the result — a GET_DEVICE_CONFIG_VALUE(121) read-back follows.")
+        send(.setDeviceConfig, payload: payload, writeType: .withResponse)
+
+        broadcastHrGateStep &+= 1
+        let armed = broadcastHrGateStep
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
+            guard let self, self.broadcastHrGateReport != nil, self.broadcastHrGateStep == armed else { return }
+            self.send(.getDeviceConfigValue,
+                      payload: DeviceConfigReadProbe.requestBody(key: DeviceConfigWriteGate.broadcastHrKey))
+            DispatchQueue.main.asyncAfter(deadline: .now() + BLEManager.ecgGateReadBackTimeout) { [weak self] in
+                guard let self, self.broadcastHrGateReport != nil, self.broadcastHrGateStep == armed else { return }
+                self.broadcastHrGateReport?.noteReadBackTimeout(seconds: Int(BLEManager.ecgGateReadBackTimeout))
+                self.finishBroadcastHrWrite()
+            }
+        }
+    }
+
+    /// Non-nil only while a Broadcast-HR write is being verified (#1061) — same single-flight discipline as
+    /// the ECG gate. The send allowlist consults it so the 121 read-back can go out; the frame router routes
+    /// the ack + read-back replies here.
+    private var broadcastHrGateReport: BroadcastHrGateReport?
+    private var broadcastHrGateStep = 0
+
+    private func finishBroadcastHrWrite() {
+        guard let report = broadcastHrGateReport else { return }
+        broadcastHrGateReport = nil
+        log("Broadcast HR (#1061):\n\(report.render())")
+    }
+
+    /// The write's own COMMAND_RESPONSE — recorded, never treated as proof. Routed here when a 119 reply
+    /// lands while a Broadcast-HR write is being verified.
+    private func handleBroadcastHrGateWriteAck(_ frame: [UInt8], cmdOff: Int) {
+        guard broadcastHrGateReport != nil else { return }
+        let resultIndex = cmdOff + 2
+        let code: Int? = frame.count > resultIndex ? Int(frame[resultIndex]) : nil
+        broadcastHrGateReport?.noteWriteAck(resultCode: code)
+    }
+
+    /// The 121 read-back — the ONLY thing that decides the verdict. Routed here from the frame router.
+    private func handleBroadcastHrGateReadBack(_ frame: [UInt8], isWhoop5: Bool) {
+        guard broadcastHrGateReport != nil else { return }
+        let family: DeviceFamily = isWhoop5 ? .whoop5 : .whoop4
+        switch DeviceConfigReadProbe.parse(frame: frame, family: family,
+                                           expecting: DeviceConfigWriteGate.getDeviceConfigValueCmd) {
+        case .success(let r): broadcastHrGateReport?.noteReadBack(r)
+        case .failure(let f): broadcastHrGateReport?.noteReadBackFailure(f)
+        }
+        finishBroadcastHrWrite()
+    }
+
+    // MARK: - ECG raw-data gate (#891) — an opt-in write with a MANDATORY read-back
+
+    private static let ecgGateReadBackTimeout: TimeInterval = 8
+
+    /// Non-nil only while a write is being verified. The send allowlist consults it so the 121 read-back
+    /// can go out, and the frame router consults it to route the ack + read-back replies here.
+    private var ecgGateReport: EcgRawDataGateReport?
+    private var ecgGateStep = 0
+
+    /// Write `enable_raw_data_w_ecg`='1'/'0' on an attested MG, then read it back — the ack is NOT the
+    /// result (#891). Preconditions match the gate: the experiment opt-in, an MG-attested strap, a full
+    /// bond. Reversible in one tap; the two directions differ only in the value byte.
+    public func setEcgRawDataGate(_ on: Bool) {
+        guard selectedModel.deviceFamily == .whoop5 else {
+            log("ECG gate (#891): needs a WHOOP 5/MG strap selected — ignored."); return
+        }
+        guard PuffinExperiment.ecgRawDataEnabled else {
+            log("ECG gate (#891): the experiment is off — enable it in Settings → Experimental first."); return
+        }
+        let variant = whoop5Variant
+        guard variant.isMG else {
+            log("ECG gate (#891): the strap has not attested itself an MG over DIS (variant=\(variant.label)) — ignored. A plain WHOOP 5.0 has no ECG electrodes.")
+            return
+        }
+        // The full encrypted bond, not the live-HR-only link — a config write over the latter silently
+        // fails (#269). Matches the R22 write paths and the button's own `ecgGateReady` gate in Settings.
+        guard state.connected, state.encryptedBond else {
+            log("ECG gate (#891): needs the full encrypted bond, not the live-HR-only link — close the official WHOOP app and pair the strap to NOOP first. Ignored."); return
+        }
+        // Mutually exclusive with the Broadcast-HR gate (#1061): both verify over the same 121 read-back.
+        guard ecgGateReport == nil, broadcastHrGateReport == nil else {
+            log("ECG gate (#891): a device-config write is already being verified — ignored."); return
+        }
+
+        ecgGateReport = EcgRawDataGateReport(on: on)
+        state.ecgRawDataGate = ecgGateReport
+        log("ECG gate (#891): writing \(DeviceConfigWriteGate.ecgRawDataKey)='\(DeviceConfigWriteGate.valueString(on: on))' via SET_DEVICE_CONFIG_VALUE(119) on an attested MG; the write ack will NOT be reported as the result — a GET_DEVICE_CONFIG_VALUE(121) read-back follows.")
+        send(.setDeviceConfig, payload: DeviceConfigWriteGate.writePayload(on: on), writeType: .withResponse)
+
+        // Settle before the read-back, the same spacing the R22 sequence uses; then bound the whole
+        // verification with a single read-back window. `ecgGateStep` fences a stale timer from a prior run.
+        ecgGateStep &+= 1
+        let armed = ecgGateStep
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(200)) { [weak self] in
+            guard let self, self.ecgGateReport != nil, self.ecgGateStep == armed else { return }
+            self.send(.getDeviceConfigValue, payload: DeviceConfigWriteGate.readBackPayload())
+            DispatchQueue.main.asyncAfter(deadline: .now() + BLEManager.ecgGateReadBackTimeout) { [weak self] in
+                guard let self, self.ecgGateReport != nil, self.ecgGateStep == armed else { return }
+                self.ecgGateReport?.noteReadBackTimeout(seconds: Int(BLEManager.ecgGateReadBackTimeout))
+                self.finishEcgGateWrite()
+            }
+        }
+    }
+
+    private func finishEcgGateWrite() {
+        guard let report = ecgGateReport else { return }
+        ecgGateReport = nil
+        state.ecgRawDataGate = report
+        log("ECG gate (#891):\n\(report.render())")
+    }
+
+    /// Clear the #891 result (Settings row dismissed / disconnect). Twin of Android clearEcgRawDataGate().
+    public func clearEcgRawDataGate() { state.ecgRawDataGate = nil }
+
+    /// The write's own COMMAND_RESPONSE — recorded, never treated as proof (#891). Routed here from the
+    /// frame router when a 119 reply lands while a write is being verified.
+    private func handleEcgGateWriteAck(_ frame: [UInt8], cmdOff: Int) {
+        guard ecgGateReport != nil else { return }
+        let resultIndex = cmdOff + 2
+        let code: Int? = frame.count > resultIndex ? Int(frame[resultIndex]) : nil
+        ecgGateReport?.noteWriteAck(resultCode: code)
+        state.ecgRawDataGate = ecgGateReport
+    }
+
+    /// The 121 read-back — the ONLY thing that decides the verdict. Routed here from the frame router.
+    private func handleEcgGateReadBack(_ frame: [UInt8], isWhoop5: Bool) {
+        guard ecgGateReport != nil else { return }
+        let family: DeviceFamily = isWhoop5 ? .whoop5 : .whoop4
+        switch DeviceConfigReadProbe.parse(frame: frame, family: family,
+                                           expecting: DeviceConfigWriteGate.getDeviceConfigValueCmd) {
+        case .success(let r): ecgGateReport?.noteReadBack(r)
+        case .failure(let f): ecgGateReport?.noteReadBackFailure(f)
+        }
+        finishEcgGateWrite()
     }
 
     /// Read the strap's current BLE advertising name (WHOOP 4.0 / Harvard). The reply lands as a
@@ -3055,9 +3890,18 @@ public final class BLEManager: NSObject, ObservableObject {
             switch FeatureFlagProbe.parseStart(frame: frame, family: family) {
             case .success(let r):
                 featureFlagReport?.noteStart(r)
-                sendFeatureFlagStep(.sendNextFeatureFlag)
+                // A firmware that REFUSED 117 has nothing to enumerate; sending 118 anyway would spend a
+                // round-trip to learn what the refusal already said. `hasStopped` is the report's own
+                // named reason, so the driver never has to re-derive one.
+                if featureFlagReport?.hasStopped == true {
+                    finishFeatureFlagProbe()
+                } else {
+                    sendFeatureFlagStep(.sendNextFeatureFlag)
+                }
             case .failure(let f):
-                featureFlagReport?.noteFailure(f, command: Int(awaiting))
+                // Pass the frame: a reply that failed to decode is the one whose RAW bytes matter most,
+                // and a report that kept only the parsed fields cannot be re-examined later.
+                featureFlagReport?.noteFailure(f, command: Int(awaiting), frame: frame)
                 finishFeatureFlagProbe()
             }
             return
@@ -3070,7 +3914,9 @@ public final class BLEManager: NSObject, ObservableObject {
                 finishFeatureFlagProbe()
             }
         case .failure(let f):
-            featureFlagReport?.noteFailure(f, command: Int(awaiting))
+            // Log the whole frame on a 118 decode failure too — the START (117) arm above already does,
+            // and a reply that failed to decode is the only evidence of what the strap put on the wire.
+            featureFlagReport?.noteFailure(f, command: Int(awaiting), frame: frame)
             finishFeatureFlagProbe()
         }
     }
@@ -3160,6 +4006,20 @@ public final class BLEManager: NSObject, ObservableObject {
         }
         guard state.connected else {
             log("ECG probe: ignored — not connected")
+            return false
+        }
+        // #1635: the MG check above used to block this incidentally on a suppressed strap, because the
+        // variant could only resolve from a POST-BOND DIS read and so stayed `.unknown` forever. Now that
+        // DIS is read on an unbonded link too, a suppressed MG can attest itself — and this gate would
+        // have let the probe write puffin frames to fd4b0002, the very characteristic whose write tears
+        // the link down. That would spend the stable link the suppression exists to buy, on commands the
+        // strap cannot answer unbonded anyway.
+        //
+        // The ECG GATE-WRITE path already required this and says why (#269: a config write over the
+        // live-HR-only link silently fails). The probe needs it for the same reason, and now also to stay
+        // out of the way of #1635.
+        guard state.encryptedBond else {
+            log("ECG probe: ignored — needs the full encrypted bond, not the live-HR-only link (#1635/#269)")
             return false
         }
         return true
@@ -3411,6 +4271,11 @@ public final class BLEManager: NSObject, ObservableObject {
         keepAliveTimer?.cancel()
         let s = BLEManager.keepAliveIntervalSeconds
         let t = DispatchSource.makeTimerSource(queue: .main)
+        // Kept EXACT (no leeway): this tick isn't just a liveness check — `keepAliveFire` re-arms the
+        // WHOOP 4 realtime burst (R10/R11) and re-subscribes notifications every cycle so streaming can't
+        // lapse. Coalescing it up to a few seconds late risks a brief realtime-stream gap, for a battery
+        // gain that rounds to nothing on a 30 s timer. The real coalescing win is the offload timer's 60 s
+        // leeway (#1052), which is genuinely loose because the strap banks to flash between syncs.
         t.schedule(deadline: .now() + .seconds(s), repeating: .seconds(s))
         t.setEventHandler { [weak self] in self?.keepAliveFire() }
         t.resume()
@@ -3418,22 +4283,37 @@ public final class BLEManager: NSObject, ObservableObject {
     }
 
     private func keepAliveFire() {
-        guard state.connected, didBond else { return }
-        enableLiveNotifications(reason: "keepalive")
+        // #1635: a SUPPRESSED 5/MG never bonds, so a bare `didBond` gate switches this whole timer off for
+        // exactly the link that now stays up for hours - taking the liveness watchdog below with it and
+        // leaving a stalled stream with nothing to bounce it. That would quietly break the "stable live HR"
+        // the suppression exists to deliver. Android gates its twin on `bonded` (the live-HR shortcut, #69)
+        // and so reaches the same watchdog.
+        //
+        // Deliberately NARROWER than Android's gate: admitted only for a streaming 5/MG, and only as far as
+        // the watchdog. Everything past it needs the encrypted bond, so a second `didBond` guard closes the
+        // door again rather than letting an unbonded link issue puffin work that cannot land.
+        guard keepAliveMayRun(connected: state.connected, didBond: didBond,
+                              bonded: state.bonded, family: selectedModel.deviceFamily) else { return }
+        if didBond { enableLiveNotifications(reason: "keepalive") }
         // Liveness watchdog: if NOTHING has arrived for a while, the stream/link stalled.
         // Bounce the connection — the auto-rescan on disconnect re-bonds and resumes streaming.
-        // #580: a known history-empty 5/MG (firmware serves no offload) gets a far longer fuse. The
-        // standard 0x2A37 HR profile keeps the link genuinely alive, but its packets can lull for >120s
-        // when the strap is off-wrist / resting, and an empty offload leaves the data channel quiet — so
-        // the old 120s rule disconnected/rescanned a perfectly healthy link every ~2 min (the thrash this
-        // fixes). A WHOOP 4 (real "not recording" path) keeps the tight 120s fuse unchanged.
+        // #580 / #1414: the standard 0x2A37 HR profile keeps the link genuinely alive, but its packets can
+        // lull for >120s when the wearer is at rest / off-wrist, so the old 120s rule disconnected/rescanned
+        // a perfectly healthy 5/MG link every ~2 min (the thrash #580 fixed). That lull is a FAMILY trait of
+        // the 5/MG HR profile, independent of whether history offload serves data — #580 mistakenly gated the
+        // wide fuse on `historyEmpty`, so a 5/MG that DID serve history still thrashed on the 120s fuse
+        // (#1414). Widen to the whole 5/MG family; WHOOP 4 (real "not recording" path) keeps the tight 120s.
+        // (`historyEmpty` still gates the battery-backfill interval below — a separate concern, left as-is.)
         let bounceFuse: TimeInterval =
-            (selectedModel.deviceFamily == .whoop5 && whoop5EmptyOffload.historyEmpty) ? 600 : 120
+            selectedModel.deviceFamily == .whoop5 ? 600 : 120
         if Date().timeIntervalSince(lastDataAt) > bounceFuse {
             log("No data for >\(Int(bounceFuse))s — bouncing link to resume streaming")
             if let p = peripheral { central.cancelPeripheralConnection(p) }
             return
         }
+        // The watchdog above is the whole of the keep-alive an unbonded 5/MG can use. Everything below
+        // sends puffin-framed work that needs the encrypted bond.
+        guard didBond else { return }
         guard !backfilling else { return }            // never poke the strap mid-offload
         // #927: continuous capture can be overnight-only, which makes the want TIME-dependent; nothing
         // else re-evaluates it while the app just sits connected, so the keep-alive tick re-derives it.
@@ -3464,7 +4344,10 @@ public final class BLEManager: NSObject, ObservableObject {
             send(.toggleRealtimeHR, payload: [0x01])
         }   // re-arm so it can't lapse
         keepAliveTick += 1
-        if keepAliveTick % 2 == 0 { send(.getBatteryLevel, payload: []) }  // ~every 60s
+        // #battery: ~60 s normally, ~30 s while charging (see `batteryPollDue`).
+        if BLEManager.batteryPollDue(tick: keepAliveTick, charging: state.charging == true) {
+            send(.getBatteryLevel, payload: [])
+        }
     }
 
     private func startBackfillTimer() {
@@ -3473,7 +4356,8 @@ public final class BLEManager: NSObject, ObservableObject {
         // each tick — so the cadence can stretch/relax as power state changes (was a fixed repeating timer).
         let interval = nextBackfillInterval()
         let t = DispatchSource.makeTimerSource(queue: .main)
-        t.schedule(deadline: .now() + .seconds(interval))
+        t.schedule(deadline: .now() + .seconds(interval),
+                   leeway: .seconds(BLEManager.backfillTimerLeewaySeconds))
         t.setEventHandler { [weak self] in self?.triggerPeriodicBackfill() }
         t.resume()
         backfillTimer = t
@@ -3493,7 +4377,10 @@ public final class BLEManager: NSObject, ObservableObject {
         // the .strap/.periodic triggers entirely for such a strap (the .connect pass still re-checks it).
         let clockUntrusted = BackfillContinuation.isFutureDatedNewest(strapNewestTs, wallNowUnix: Int(now))
         guard BackfillPolicy.shouldRun(trigger: trigger, now: now, lastBackfillAt: last,
-                                       emptyStreak: emptySyncTracker.consecutiveEmptySyncs,
+                                       // #battery: back off on EITHER a console-only streak (clock-lost) OR a
+                                       // plain empty-offload streak incl. idle-timeout stalls — the latter is
+                                       // what stops the 15-min poll spinning on a caught-up strap.
+                                       emptyStreak: max(emptySyncTracker.consecutiveEmptySyncs, consecutiveEmptyOffloads),
                                        clockUntrusted: clockUntrusted) else {
             log("Backfill: \(trigger) skipped (rate-limited; last \(last.map { Int(now - $0) } ?? -1)s ago)")
             return
@@ -3573,9 +4460,11 @@ public final class BLEManager: NSObject, ObservableObject {
         batteryCharacteristic = nil
         disSerialCharacteristic = nil
         disHwRevCharacteristic = nil
+        disExtraCharacteristics = []
         disRead = false
         disSerial = nil
         disHwRev = nil
+        disFirmware = nil
         whoop5NotifyCharacteristics.removeAll()
     }
 
@@ -3589,6 +4478,7 @@ public final class BLEManager: NSObject, ObservableObject {
         selectedModel = model
         reassembler = Reassembler(family: model.deviceFamily)
         router.family = model.deviceFamily
+        router.deviceId = deviceId   // #1706: attribute this connection's alarm readback
         configureCollectorFamily()
         central.stopScan()
         log("Scanning for \(model.displayName)…")
@@ -3671,15 +4561,20 @@ public final class BLEManager: NSObject, ObservableObject {
         // before the link is encrypted) and is never retried, so `batteryPct` stays nil from connect — and
         // the 5/MG sends NO unsolicited battery notification (so the notify subscription above never fills
         // it on its own). Re-issue the read here: every caller is post-bond (CLIENT_HELLO-ack, post-bond,
-        // keep-alive), so the link is encrypted and the read succeeds; the keep-alive caller also RE-polls
-        // it (~every 30 s) so the reading stays current as the strap drains and BatteryEstimator gets its
-        // discharge samples on any screen. This is the iOS parity for Android's post-handshake read +
-        // ~60 s keep-alive poll (WhoopBleClient BATTERY_ON_CONNECT_DELAY_MS / refreshBattery). 4.0 is
-        // EXCLUDED — its 0x2A19 is a stub constant 100 (real value = GET_BATTERY_LEVEL; re-reading the stub
-        // would revert the true reading, #77). The 600 s same-% throttle in LiveState guards the estimator.
+        // keep-alive), so the link is encrypted and the read succeeds. #battery: THROTTLED to
+        // `whoop5BatteryReadMinIntervalSeconds` (~60 s) so the 30 s keep-alive tick no longer re-reads it
+        // every cycle — matching the Android twin's `keepAliveTick % 2 == 0` ~60 s cadence and the
+        // BatteryEstimator's 600 s same-% throttle (a 30 s poll was 20× finer than the estimator uses).
+        // The first read of a connection (`lastBatteryReadAt == nil`, reset on disconnect) always fires,
+        // so the post-bond / CLIENT_HELLO-ack callers still seed the reading promptly. 4.0 is EXCLUDED —
+        // its 0x2A19 is a stub constant 100 (real value = GET_BATTERY_LEVEL; re-reading the stub would
+        // revert the true reading, #77). The 600 s same-% throttle in LiveState guards the estimator.
         if let b = batteryCharacteristic, b.properties.contains(.read),
-           selectedModel.deviceFamily != .whoop4 {
+           selectedModel.deviceFamily != .whoop4,
+           BLEManager.shouldPollWhoop5Battery(lastReadAt: lastBatteryReadAt,
+                                              charging: state.charging == true) {
             p.readValue(for: b)
+            lastBatteryReadAt = Date()
         }
         // #520 DIS identity read — same post-bond reasoning as the #490 battery read above: on a 5/MG the
         // link must be encrypted first. Gated to 5/MG (a 4.0 issues NO new reads, exactly like the battery
@@ -3695,7 +4590,78 @@ public final class BLEManager: NSObject, ObservableObject {
             disRead = true
             p.readValue(for: serialChar)
             if let c = disHwRevCharacteristic, c.properties.contains(.read) { p.readValue(for: c) }
+            readDisExtras(p)
         }
+    }
+
+    /// Read the DIS identity extras — firmware above all, which an unbonded 5/MG has no other source for.
+    ///
+    /// DIVERGENCE FROM ANDROID (deliberate, platform): the Kotlin twin CHAINS these one read per callback,
+    /// because its GATT queue runs a single operation at a time and a second read issued early is simply
+    /// dropped. CoreBluetooth queues reads itself, so chaining here would add a state machine to serialise
+    /// something already serialised. Same characteristics, same data, no chain.
+    ///
+    /// A strap need not implement all of DIS: a missing or unreadable characteristic is skipped, because
+    /// "not implemented" is per-characteristic and the ones it DOES publish should still be read.
+    private func readDisExtras(_ p: CBPeripheral) {
+        for c in disExtraCharacteristics where c.properties.contains(.read) {
+            p.readValue(for: c)
+        }
+    }
+
+    /// The UNBONDED DIS attempt (#1635 follow-up). Deliberately separate from the post-bond identity read,
+    /// which runs only inside the handshake and therefore never runs at all on a strap that will not bond.
+    ///
+    /// Delayed for the same reason the Kotlin twin delays it: this is only safe in the settled state the
+    /// suppression leaves behind — no handshake outstanding, nothing else in flight, the link holding.
+    private func scheduleUnbondedDisRead() {
+        DispatchQueue.main.asyncAfter(deadline: .now() + BLEManager.unbondedDisReadDelay) { [weak self] in
+            self?.readDisIdentityUnbonded()
+        }
+    }
+
+    private func readDisIdentityUnbonded() {
+        // `peripheral` is only cleared by forgetDevice, so it OUTLIVES a disconnect - and this read is
+        // scheduled with a delay, on a strap whose entire failure mode is dropping the link. Without the
+        // connected check the reads would be issued into a dead link and the line below would claim an
+        // attempt that never happened, which is precisely what a diagnostic may not do.
+        guard state.connected, let p = peripheral else { return }
+        let refused = disRefusedPrefKey(p.identifier.uuidString)
+            .map { UserDefaults.standard.bool(forKey: $0) } ?? false
+        guard shouldReadDisUnbonded(isWhoop5: selectedModel.deviceFamily == .whoop5,
+                                    bonded: didBond,
+                                    alreadyReadThisLink: disRead,
+                                    previouslyRefused: refused) else { return }
+        guard let serialChar = disSerialCharacteristic, serialChar.properties.contains(.read) else {
+            log("DIS: serial characteristic unavailable — hardware variant stays unknown")
+            return
+        }
+        log("DIS: trying the identity read on an UNbonded link — unproven, and a refusal is itself the answer to whether DIS needs an encrypted bond (#490)")
+        disRead = true
+        p.readValue(for: serialChar)
+        if let c = disHwRevCharacteristic, c.properties.contains(.read) { p.readValue(for: c) }
+        readDisExtras(p)
+    }
+
+    /// A DIS read that came back with a failure status.
+    ///
+    /// Scoped to the DIS characteristics: they are the reads whose refusal is a FINDING (it settles #490
+    /// and means the firmware cannot be had without a bond). The refusal is latched per device, so a strap
+    /// that declines says so once instead of on every reconnect forever.
+    private func noteDisReadFailure(_ uuid: CBUUID, _ error: Error) {
+        guard BLEManager.disChars.contains(uuid) else { return }
+        log(disReadFailureLine(uuid: uuid.uuidString, status: error.localizedDescription))
+        // Report it, but latch it ONLY for an unbonded attempt. The latch is persisted and permanent, so a
+        // transient failure on a BONDED link would disable the unbonded read for this strap for good and
+        // blame the strap for something that was never its policy. This is the analogue of the Kotlin
+        // twin's explicit-bond guard: same reasoning, different thing to exclude, because the bonded read
+        // is the only way a DIS failure reaches here without being the finding we are looking for.
+        guard !didBond else {
+            log("DIS: not latching that refusal — the link is bonded, so the failure is not attributable to the strap's unbonded-read policy")
+            return
+        }
+        guard let key = disRefusedPrefKey(peripheral?.identifier.uuidString) else { return }
+        UserDefaults.standard.set(true, forKey: key)
     }
 
     /// Resolve + log the 5/MG hardware variant once a DIS string lands (#520). Both characteristics
@@ -3712,6 +4678,96 @@ public final class BLEManager: NSObject, ObservableObject {
         // Publish it so an MG-only capability can gate on attested hardware. Still diagnostic for every
         // existing consumer — nothing about framing or decode reads this.
         state.whoop5Variant = variant.label
+        reconcileModelFromAttestation(variant)
+        adoptWhoopSerialIdentity()
+    }
+
+    /// #1303: the 5/MG DIS read hands us the strap's OWN serial, so re-point this pairing from its
+    /// transient CoreBluetooth-UUID id onto a stable `whoop-<serial>` id — through the SAME generic
+    /// migration the ring already uses (`adoptSerialIdentity`, #771), so a re-pair or factory reset stops
+    /// forking one physical strap into a second row and orphaning its history (#1193).
+    ///
+    /// A WHOOP 4.0 is deliberately untouched: it does not expose a DIS serial (the read above is gated
+    /// `!= .whoop4`) and the 4.0 serial's source on the wire is not yet identified, so there is nothing
+    /// honest to adopt onto here.
+    ///
+    /// Deferred to the next main-loop turn, mirroring `adoptOuraSerial`: adoption re-points the ACTIVE
+    /// device, and the observers that react tear down and rebuild the very connection this callback is
+    /// running inside, so the current BLE callback must return first. Idempotent — after the first
+    /// adoption the id already equals the serial id, so every later reconnect costs one string compare and
+    /// touches no database. A serial `WhoopSerialIdentity` refuses (blank, truncated, non-serial prose)
+    /// leaves the strap on its existing id: adopting onto a junk id would migrate every device-scoped row
+    /// onto a garbage key, which is worse than not adopting.
+    private func adoptWhoopSerialIdentity() {
+        guard let rs = registryStore,
+              let serialId = WhoopSerialIdentity.adoptedId(serial: disSerial),
+              let active = try? rs.all().first(where: { $0.status == .active }),
+              WhoopSerialIdentity.mayAdopt(currentId: active.id),
+              active.id != serialId
+        else { return }
+        let currentId = active.id
+        Task { @MainActor [weak self] in
+            guard let self, let rs = self.registryStore,
+                  (try? rs.all().first(where: { $0.status == .active }))?.id == currentId
+            else { return }
+            guard (try? rs.adoptSerialIdentity(from: currentId, to: serialId)) == true else { return }
+            try? rs.setActive(serialId)
+            // The rows have MOVED to the serial id and the old registry row is gone, so the live persist
+            // paths must follow in the same turn: `deviceId`, the Collector and the Backfiller all stamp
+            // rows at write time, and leaving them on the now-deleted id would write new samples into a
+            // second, orphaned history — the same split this phase exists to prevent, just on the
+            // provisional path instead of the legacy one. Kotlin reaches the identical call through
+            // `SourceCoordinator.pointWhoop`, which re-points any non-legacy id.
+            self.setActiveDeviceId(serialId)
+            // Prefix only. `serialId` embeds the full serial, which must never reach a shareable log.
+            self.log("Adopted stable serial identity (serialPrefix=\(WhoopSerialIdentity.logSafe(serial: self.disSerial))) - history re-pointed off the transient pairing id (#1303)")
+            self.onSerialIdentityAdopted?(serialId)
+        }
+    }
+
+    /// The strap's own DIS attestation is ground truth (a WHOOP 4.0 never attests a 5AM/5AG serial). When
+    /// it positively identifies a 5-generation strap but the active registry row still resolves to WHOOP
+    /// 4.0 — a wrong Add-Device pick, or a legacy "4.0" row — correct the model so the Devices display and
+    /// the `forRegistryModel`-driven skin-temp raw→°C scale (#938) stop treating a 5.0 as a 4.0. Extends the
+    /// #716 stamp (which only fixed the "WHOOP" placeholder). ONE-DIRECTIONAL: attestation can only upgrade
+    /// 4.0→5.0, never the reverse, and once corrected the guard below no longer matches, so it self-limits.
+    private func reconcileModelFromAttestation(_ variant: Whoop5Variant) {
+        guard variant != .unknown, let rs = registryStore else { return }
+        guard let attestingId = peripheral?.identifier.uuidString else {
+            // Should not happen — the attestation arrives on a connected link — but a silent return is one
+            // more path that goes quiet exactly when something is off.
+            log("DIS attestation (variant=\(variant.label)) not applied — the connected strap's id is unknown")
+            return
+        }
+        // Correct the row the attestation CAME FROM, never merely "whichever is active". Those are the
+        // same device on a single-strap install, and different ones the moment somebody pairs a 4.0
+        // alongside a 5/MG and leaves the 4.0 active — at which point relabelling by status rewrites the
+        // 4.0's row as "WHOOP 5.0 / MG" on the strength of the OTHER strap's DIS block.
+        //
+        // Unreachable today, because `Whoop5Variant.from` here is never given a model number and a real MG
+        // reports a serial prefix and hardware revision matching neither heuristic — so this returns on
+        // `.unknown` every time. Fixed anyway: the Android twin's identical bug went live the moment its
+        // resolver was widened, and twinning the DIS model-number read would do exactly that here (#520).
+        let devices = (try? rs.all())?.filter { $0.status != .archived } ?? []
+        let byId = devices.first { $0.peripheralId?.caseInsensitiveCompare(attestingId) == .orderedSame }
+        // The sole non-archived device is not a guess: there is nothing else the attestation could have
+        // come from, and `peripheralId` is nil on the seeded row until the strap is adopted — the very
+        // single-strap install this correction exists for.
+        // The fallback requires the sole row to be UNADOPTED. "One device, so it must be the one attesting"
+        // holds only while that row has never been bound to an id; a row that HAS one and does not match is
+        // a different strap, and relabelling it is the corruption this guard exists to prevent. That is not
+        // hypothetical — adding a 5/MG to an install whose only row is a 4.0 reaches here before the new
+        // strap is registered.
+        let soleUnadopted = (devices.count == 1 && devices[0].peripheralId == nil) ? devices[0] : nil
+        guard let attesting = byId ?? soleUnadopted else {
+            log("DIS attestation (variant=\(variant.label)) not applied — \(devices.count) paired devices"
+                + " and none carries this strap's id, so it cannot be attributed")
+            return
+        }
+        guard DeviceFamily.forRegistryDevice(model: attesting.model, brand: attesting.brand) == .whoop4
+        else { return }
+        try? rs.setModel(attesting.id, model: "WHOOP 5.0 / MG")
+        log("Corrected device model \"\(attesting.model ?? "nil")\" → \"WHOOP 5.0 / MG\" from DIS attestation (variant=\(variant.label))")
     }
 
     private func requestNotify(_ c: CBCharacteristic, on p: CBPeripheral, reason: String) {
@@ -3808,6 +4864,9 @@ public final class BLEManager: NSObject, ObservableObject {
     private func recordAlarmArm(sentEpoch: Int) {
         let d = UserDefaults.standard
         d.set(sentEpoch, forKey: "alarm.lastArmSentEpoch")
+        // #1706: WHICH strap this arm went to. Without it the export, and the reject streak, compare
+        // this epoch against a readback that on a multi-strap install may be a different device.
+        d.set(deviceId, forKey: "alarm.lastArmDeviceId")
         d.set(Date().timeIntervalSince1970, forKey: "alarm.lastArmAt")
         d.set(commandChannelReady, forKey: "alarm.lastArmConnected")   // #613: true only if the arm actually went out
         // #34: the strap-clock skew (its own RTC minus wall, seconds) AT THE MOMENT we armed. A wrong RTC
@@ -3995,7 +5054,8 @@ public final class BLEManager: NSObject, ObservableObject {
         // change so a steady resting HR doesn't re-render the whole Live console every second.
         if m.hr >= 30 && m.hr <= 220, state.heartRate != m.hr { state.heartRate = m.hr }
         // Record it continuously — independent of the realtime stream or the open screen.
-        collector?.ingestStandardHR(hr: m.hr, rr: m.rr, at: Int(Date().timeIntervalSince1970))
+        collector?.ingestStandardHR(hr: m.hr, rr: m.rr, contact: m.contact,
+                                    at: Int(Date().timeIntervalSince1970))
     }
 }
 
@@ -4196,6 +5256,16 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         cancelScanFallback()
         cancelPendingConnectProbe()   // #730: the connect resolved; no pending-connect log needed
         failedConnectAttempts = 0   // a successful connect clears the reconnect backoff (#414)
+        // #1809: this link's inbound tally starts empty; the epitaph on disconnect reports exactly what
+        // arrived between here and there.
+        inboundFrames = 0; inboundBytes = 0; cmdChannelFrames = 0
+        // #1635: same guarantee for the banked tally. Clearing only on teardown would be enough if every
+        // link ended in one, and a link that begins without a preceding clean teardown would otherwise
+        // open holding the previous link's rows — reporting them as banked on a link that never saw them.
+        bankedHr = 0; bankedRr = 0; bankedGravity = 0; bankedResp = 0
+        bankedSkinTemp = 0; bankedSpo2 = 0; bankedBattery = 0
+        linkUpSince = DispatchTime.now()
+        standingConnectAt = nil     // #1413: a live link means no standing connect is outstanding
         restoredPeripheral = nil
         preparePeripheral(peripheral)
         // Clear the per-connection bond BEFORE publishing the connected uuid below. SourceCoordinator's #52
@@ -4260,6 +5330,53 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         return "code?"
     }
 
+    /// Feed one 5/MG bond refusal into the #747 give-up and act on the trip (#1635).
+    ///
+    /// Both causes arrive here, and they want OPPOSITE treatment — see `giveUpSuppressesHello`. An auth
+    /// refusal means the strap actively declined, so pausing auto-reconnect is right. An unanswered
+    /// handshake means the write vanished while the link streamed live HR the whole time, so pausing
+    /// would throw away a working strap to punish a handshake nobody is waiting on.
+    ///
+    /// Shared by both call sites so the split cannot drift: the auth path (a write error) and the
+    /// unanswered path (a disconnect with a hello still outstanding) reach the same decision.
+    private func recordWhoop5BondRefusal(authRefusal: Bool, peripheralUUID: String) {
+        // #1635: the two causes want different patience, for the same reason they want different
+        // outcomes - see `giveUpThresholdFor`. Keyed on the same authRefusal as the branch below, so the
+        // threshold and the treatment can never disagree about which kind of refusal this is.
+        guard bondGiveUp.recordRefusal(
+            threshold: giveUpThresholdFor(authRefusal: authRefusal, pauseThreshold: bondGiveUp.giveUpThreshold)
+        ) else { return }
+        let opaque = BondRefusalGiveUp.opaqueId(fromLocalUUID: peripheralUUID)
+        let suppress = giveUpSuppressesHello(authRefusal: authRefusal)
+        if suppress {
+            HelloSuppressionStore.setSuppressed(peripheralUUID, true)
+            log(BondRefusalGiveUp.helloSuppressedEpitaph(refusals: bondGiveUp.refusals, opaqueId: opaque))
+        } else {
+            autoReconnectPausedForBondLoop = true
+            bondLoopPausedAt = Date()   // starts the #78 hole-4 salvage-probe floor
+            // #1539: park the connect in the same breath as the pause, so this can end while backgrounded.
+            standingConnectWhilePausedIfDue(justTripped: true)
+            log(BondRefusalGiveUp.epitaphLine(refusals: bondGiveUp.refusals, opaqueId: opaque))
+        }
+        // Each branch gets the hint that matches what it actually DID. The paused hints say "auto-reconnect
+        // is paused"; on the suppression branch nothing is paused, so saying so would be the same
+        // confidently-wrong diagnostic this issue has produced twice already (#1635). The third arm is
+        // unreachable while `giveUpSuppressesHello` is `!authRefusal`, and is kept because the Kotlin twin
+        // keeps it: if that rule ever changes, both platforms must change behaviour together.
+        if suppress {
+            state.pairingHint = BondRefusalGiveUp.helloSuppressedHint()
+        } else if authRefusal {
+            state.pairingHint = BondRefusalGiveUp.pausedHint()
+        } else {
+            state.pairingHint = BondRefusalGiveUp.pausedHintHandshakeUnanswered()
+        }
+        if TestCentre.active(.connection) {
+            state.append(log: "bond gaveUp refusals=\(bondGiveUp.refusals) id=\(opaque) " +
+                (suppress ? "(hello suppressed, staying connected)" : "(auto-reconnect paused)"),
+                domain: .connection)
+        }
+    }
+
     public func centralManager(_ central: CBCentralManager,
                                didDisconnectPeripheral peripheral: CBPeripheral,
                                error: Error?) {
@@ -4285,6 +5402,40 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         // arm timestamp. A drop that is unintentional, error-bearing, and lands shortly after we armed
         // the R10/R11 burst is the marginal-radio tell. Feed the detector; if it trips, the NEXT connect
         // skips the heavy arm (the flag is intentionally NOT reset on disconnect so it survives rescan).
+        // #1809: the epitaph goes out BEFORE the resets below, for the same reason the two detectors read
+        // their state here - `realtimeArmedAt` is about to be cleared. `ended` carries the CBError CASE, not
+        // just the OS sentence: the #617 branch already computes that code and the strap log never saw it.
+        let endedReason: String
+        if intentionalDisconnect {
+            endedReason = "intentional"
+        } else if let cb = error as? CBError {
+            endedReason = "CBError.\(cb.code)(\(cb.code.rawValue))"
+        } else if let error {
+            endedReason = "\(error)"
+        } else {
+            endedReason = "no error reported"
+        }
+        // Only for a link we actually held. Emitting without one would report "the strap sent NOTHING on
+        // this link" using the PREVIOUS link's counters, fabricating the very symptom #1809 is about.
+        if let since = linkUpSince {
+            let upMs = Int(Double(DispatchTime.now().uptimeNanoseconds &- since.uptimeNanoseconds) / 1_000_000)
+            log(ConnectionReadout.linkEpitaph(upMillis: upMs, inboundFrames: inboundFrames,
+                                              inboundBytes: inboundBytes, cmdChannelFrames: cmdChannelFrames,
+                                              realtimeArmed: realtimeArmedAt != nil, ended: endedReason))
+            // #1635: LIVE streams only — the offload persists through `Backfiller` and has its own
+            // accounting, so folding it in would make a healthy bonded sync read as "nothing banked live
+            // for: gravity". Inside the same `linkUpSince` guard for the same reason the epitaph is.
+            log(ConnectionReadout.linkBankedSummary(
+                hr: bankedHr, rr: bankedRr, gravity: bankedGravity, resp: bankedResp,
+                // nil, not 0: this store does not return a step count, and a zero would read as a fault.
+                skinTemp: bankedSkinTemp, spo2: bankedSpo2, steps: nil, battery: bankedBattery))
+        }
+        // Clear the tally with the link, so a second teardown for the same drop cannot re-report it.
+        inboundFrames = 0; inboundBytes = 0; cmdChannelFrames = 0
+        bankedHr = 0; bankedRr = 0; bankedGravity = 0; bankedResp = 0
+        bankedSkinTemp = 0; bankedSpo2 = 0; bankedBattery = 0
+        linkUpSince = nil
+
         let timedOut = !intentionalDisconnect && error != nil
         let sinceArm = realtimeArmedAt.map { Date().timeIntervalSince($0) }
         if marginalRadio.connectionEnded(wasArmed: realtimeArmedAt != nil,
@@ -4312,6 +5463,10 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             // is real; the stale OS pairing is the problem, which the guide tells the user how to clear.
             autoReconnectPausedForBondLoop = true
             bondLoopPausedAt = Date()   // the #78 hole-4 salvage probe covers this pause too (one bounded cycle)
+            // #1539: arm the parked connect in the same breath as the pause. The salvage probe only fires on
+            // app-foreground, so without this a pause tripped with the phone in a pocket strands the strap
+            // until someone opens the app.
+            standingConnectWhilePausedIfDue(justTripped: true)
             if TestCentre.active(.connection) {
                 state.append(log: "reconnect paused=bondLoop (#617: \(postBondLoop.consecutiveBondTimeouts) bond-then-timeout cycles)", domain: .connection)
             }
@@ -4358,10 +5513,39 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         // probes above it has already written to the strap, so the user must be told exactly how far it got
         // and which keys are still set. This publishes the partial report and re-closes the 128 allowlist.
         abandonR22DisableRun("the strap disconnected mid-run")
+        // #891: an ECG-gate write interrupted mid-verification is RENDERED, not dropped — it has already
+        // written to the strap, so the user is told the read-back never landed (verdict silent). Clearing
+        // the in-flight tracker re-closes the 121 read-back allowlist and makes any pending timer no-op.
+        if ecgGateReport != nil {
+            ecgGateReport?.noteReadBackTimeout(seconds: Int(BLEManager.ecgGateReadBackTimeout))
+            finishEcgGateWrite()
+        }
+        // #1061: a Broadcast-HR write interrupted mid-verification is likewise RENDERED, not dropped —
+        // it has already written, so the user is told the read-back never landed (verdict silent).
+        if broadcastHrGateReport != nil {
+            broadcastHrGateReport?.noteReadBackTimeout(seconds: Int(BLEManager.ecgGateReadBackTimeout))
+            finishBroadcastHrWrite()
+        }
         state.clearBiometrics()       // and a stale HR / R-R must not outlive the link either
         state.liveFeedActive = false  // a drop while Live is open must not leave a stale "Stop live feed"
+        // #1635: an unanswered CLIENT_HELLO produces no write error at all - the link simply drops a few
+        // seconds later - so it never reached the give-up on this platform and nothing could end the loop.
+        // Read it HERE, while `clientHelloWriteAt` and `didBond` are both still valid, and feed it in
+        // through the same split the auth path uses. `countsAsBondRefusal` gates on family, so a 4.0 (which
+        // bonds cleanly) can never latch the suppression.
+        if countsAsBondRefusal(isAuthRefusalStatus: false,
+                               helloUnacked: clientHelloWriteAt != nil,
+                               alreadyBonded: didBond,
+                               family: selectedModel.deviceFamily) {
+            recordWhoop5BondRefusal(authRefusal: false,
+                                    peripheralUUID: peripheral.identifier.uuidString)
+        }
         didBond = false
+        clientHelloWriteAt = nil   // #1635: no hello survives the link that carried it
         whoop5RealtimeArmed = false
+        // A user capture remains represented by RawDataSessionStore, but its transport must be re-armed
+        // on the next connection. Keeping this true would make that reconnect attempt a silent no-op.
+        rawCaptureInFlight = false
         // The strap forgets the realtime-HR toggle across a disconnect; the post-bond branch re-arms it
         // from `wantsRealtime`. Clear only the "what we last sent" flag — `screenWantsRealtime` /
         // `keepRealtimeForData` (and thus `wantsRealtime`) are intent and must survive a reconnect so the
@@ -4371,6 +5555,9 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         clockRequested = false
         clockRetries = 0
         connectHandshakeDone = false
+        // Mirrors the flag above: a new link has not done the handshake, so it cannot hand over history
+        // until it does. Cleared HERE and nowhere else, so the two can never disagree.
+        state.historyReady = false
         cmdNotifyConfirmedActive = false   // #34: a fresh connection needs its own notify-confirm + settle
         connectSettledSignaled = false
         restoreNeedsResubscribe = false    // #613: a real reconnect isn't a restore — never force-toggle here
@@ -4399,6 +5586,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         // re-derives it. (The honest flag is per-link, like the syncing pill / reject counters above.)
         whoop5EmptyOffload.reset()
         state.historySyncExperimental = false
+        lastBatteryReadAt = nil   // #battery: next connect's first enableLiveNotifications re-seeds the 5/MG battery reading
         // #612: the display flag only, not the underlying emptySyncTracker streak (that counter
         // deliberately survives a reconnect — unchanged, existing behaviour). A fresh link re-derives
         // this from its own next HISTORY_COMPLETE.
@@ -4414,21 +5602,26 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         keepAliveTimer?.cancel()
         keepAliveTimer = nil
         resetCharacteristics()
-        puffinRecorder.flush()   // persist any buffered puffin capture frames before reconnect
+        // Best-effort, fire-and-forget: nothing below depends on this write completing, and the
+        // recorder keeps writing the same session file after reconnect (#652: encode+write off-main).
+        Task { @MainActor in await puffinRecorder.flush() }   // persist any buffered puffin capture frames
         puffinEventLog.close()   // release the event-log handle so the file is safe to export
         puffinDeepBufferLog.close()   // same for the high-rate deep-buffer log (#423)
-        Task { @MainActor in await collector?.flushStandardHR() }   // persist any buffered 0x2A37 HR
+        Task { @MainActor in await collector?.flushStandardHR(reason: .disconnect) }   // persist any buffered 0x2A37 HR
         if autoReconnectPausedForBondLoop {
             // #747: the bond keeps being refused, so auto-reconnect is paused: we stop hammering a strap that
             // can't bond (the epitaph + paused hint were already surfaced when the give-up tripped). The user
             // re-arms it by tapping Connect. We do NOT schedule a rescan here.
             log("Disconnected\(error.map { ": \($0.localizedDescription)" } ?? ""); auto-reconnect paused (strap keeps refusing to pair; tap Connect once it's free)")
+            // #1539: a connect attempt CONSUMES the parked request, so re-park it — floored, so a reachable
+            // strap that keeps refusing gets one attempt per window instead of a connect/refuse spin.
+            standingConnectWhilePausedIfDue()
             if TestCentre.active(.connection) {
                 state.append(log: "connect down (uptime ends)", domain: .connection)
                 state.append(log: "reconnect paused=bondLoop (strap refusing bond)", domain: .connection)
             }
         } else if !intentionalDisconnect {
-            log("Disconnected\(error.map { " — \($0.localizedDescription)" } ?? ""); rescanning in 3s")
+            log("Disconnected\(error.map { " — \($0.localizedDescription)" } ?? "")")
             // Connection test mode: count + describe the involuntary reconnect churn, and mark the link
             // down for the uptime readout. Gated zero-cost (the .connection bool is read before any string
             // is built). Diagnostic only - the rescan above is unchanged. The count increments only on an
@@ -4444,12 +5637,10 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
                 state.append(log: "connect down (uptime ends\(held))", domain: .connection)
                 state.append(log: "reconnect n=\(connReconnectCount) reason=\(reason)", domain: .connection)
             }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
-                // #78 hole-3: a timer in flight when the give-up trips must not fire an extra attempt
-                // (and, via connectFromSystem, can never reset the pause the way the old connect() did).
-                guard let self, !self.intentionalDisconnect, !self.autoReconnectPausedForBondLoop else { return }
-                self.connectFromSystem()
-            }
+            // #1413: route through the standing-connect regime, not a bare timer, so a suspension in the
+            // reconnect window can't leave the link dead until the phone is next picked up. The regime keeps
+            // the same guards (#78 hole-3): the give-up pause and an intentional teardown both stop it.
+            scheduleReconnect()
         } else {
             log("Disconnected (intentional)")
             // A user-initiated teardown ends the churn count for the run and marks the link down so the
@@ -4481,6 +5672,22 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
             }
             state.append(log: "reconnect n=\(connReconnectCount) failedConnect reason=\(reason)", domain: .connection)
         }
+        // PARITY (#1790): Android can now CLEAR this pairing itself, behind a default-off Test Centre
+        // switch, once, after five of these failures — the step guide-line 2 asks the user to take. This
+        // side deliberately cannot, and the blocker is identity rather than a missing call:
+        //
+        //  - iOS: the same identity problem, with nothing else to reach for. The guide below already
+        //    tells the user to do it themselves, which is the honest answer rather than a claim about
+        //    Apple's intent.
+        //  - macOS ships IOBluetooth, a separate classic-Bluetooth framework, and whether its device
+        //    removal works on a BLE pairing is a question that never arises for us: it addresses devices
+        //    by MAC, and we never have one. `epitaphLine`'s doc already says why — the peripheral UUID is
+        //    "per-install, not the hardware address". The only bridge left is matching
+        //    `IOBluetoothDevice.pairedDevices()` by NAME, and deleting a pairing on a name match removes
+        //    the wrong device the moment there are two straps or one has been renamed.
+        //
+        // So both platforms detect this and both give the same advice; only Android can act on it. Do not
+        // close the gap with a name match. Kotlin twin: `StaleBondRemoval.kt`.
         if let cbErr = error as? CBError, cbErr.code == .peerRemovedPairingInformation {
             state.reconnectGuide = """
             Your strap's Bluetooth pairing was reset - usually by a WHOOP firmware update, or the official WHOOP app reconnecting. NOOP works fine on the new firmware; you just need to re-pair:
@@ -4494,19 +5701,20 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         }
         // Any other connect failure (e.g. a weak-signal encrypted-handshake timeout on a 5/MG at the
         // edge of range — #414). The disconnect path reschedules a rescan, but didFailToConnect never
-        // did, so the loop died here until a manual reconnect. Reschedule with a capped exponential
-        // backoff (3, 6, 12, 24, 48, 60s…) so a strap that's genuinely out of range doesn't hammer BLE.
+        // did, so the loop died here until a manual reconnect.
         // #747: don't reschedule while the bond-loop pause is active; the user must free the strap first.
-        guard !intentionalDisconnect, !autoReconnectPausedForBondLoop else { return }
-        failedConnectAttempts += 1
-        let delay = min(60.0, 3.0 * pow(2.0, Double(failedConnectAttempts - 1)))
-        log("Reconnecting in \(Int(delay))s (attempt \(failedConnectAttempts))")
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            // #78 hole-3: a backoff timer in flight when the give-up trips must not fire an extra
-            // attempt (and connectFromSystem never resets the pause the way the old connect() did).
-            guard let self, !self.intentionalDisconnect, !self.autoReconnectPausedForBondLoop else { return }
-            self.connectFromSystem()
-        }
+        // #1413: hand off to the shared standing-connect regime — from the FIRST failure, not after a few
+        // timed retries. A standing central.connect stays outstanding, so a suspended app is still woken
+        // when the strap returns; this callback is where the overnight reconnect died. Out-of-range
+        // hammering is held off by the bond-loop pause and the refusal streak rather than by a timer,
+        // because a passive `central.connect` is not what hammers a strap.
+        // #1539: while the pause is latched `scheduleReconnect` below is a no-op, so a parked connect that
+        // FAILED — rather than staying parked, which is what happens when the strap is reachable but the
+        // handshake dies — would consume the request and strand us again with no disconnect callback ever
+        // coming to re-arm it. Re-park it here, floored, so the instantly-failing shape this callback warns
+        // about above cannot hot-loop. Inert when the pause is not latched (the gate checks it).
+        standingConnectWhilePausedIfDue()
+        scheduleReconnect()
     }
 
     /// State restoration entry point (M3 background collection).
@@ -4532,6 +5740,7 @@ extension BLEManager: @preconcurrency CBCentralManagerDelegate {
         selectedModel = .persisted
         reassembler = Reassembler(family: selectedModel.deviceFamily)
         router.family = selectedModel.deviceFamily
+        router.deviceId = deviceId   // #1706: attribute this connection's alarm readback
         configureCollectorFamily()
         // Collection only runs post-bond, so a restored link was already bonded;
         // seed those flags now. `didWriteValueFor` won't re-fire on its own.
@@ -4621,9 +5830,11 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             case BLEManager.batteryService:
                 peripheral.discoverCharacteristics([BLEManager.batteryChar], for: s)
             case BLEManager.disService:
-                // #520: read-only identity strings. Discovered here, but READ post-bond (below).
+                // #520: read-only identity strings. Discovered here; READ post-bond, or on a suppressed
+                // link via `readDisIdentityUnbonded` (#1635) — a strap that never bonds has no other
+                // source for its firmware at all.
                 peripheral.discoverCharacteristics(
-                    [BLEManager.disSerialChar, BLEManager.disHwRevChar], for: s)
+                    BLEManager.disChars.map { $0 }, for: s)
             case BLEManager.whoop5Service:
                 // EXPERIMENTAL WHOOP 5.0/MG path: discover the puffin command + notify characteristics
                 // so we can send CLIENT_HELLO and receive frames. Live HR/battery still arrive over the
@@ -4645,6 +5856,28 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             return
         }
         guard let chars = service.characteristics else { return }
+        // #1635: dump what the strap actually OFFERS, once per peripheral. Every characteristic below is
+        // matched against a UUID someone hardcoded, so anything a 5/MG exposes that nobody guessed has
+        // never been visible. Sends nothing — the tree has already been discovered, so this reads a local
+        // cache and cannot provoke the teardown that writing to an encrypted characteristic can.
+        //
+        // Emitted only once EVERY service has reported its characteristics, because this callback fires
+        // per service: dumping on each would print a partial tree N times. Once per peripheral rather than
+        // per connect — the tree is static and the dump is ~30 lines, which would otherwise evict the
+        // connect/drop/bond evidence from a rolling buffer on a strap that reconnects every few seconds.
+        if TestCentre.active(.connection),
+           gattTreeDumpedFor != peripheral.identifier,
+           let all = peripheral.services,
+           all.allSatisfy({ $0.characteristics != nil }) {
+            gattTreeDumpedFor = peripheral.identifier
+            let tree: [(String, [(String, UInt)])] = all.map { svc in
+                (svc.uuid.uuidString,
+                 (svc.characteristics ?? []).map { ($0.uuid.uuidString, $0.properties.rawValue) })
+            }
+            for line in GattCapability.treeLines(tree) {
+                state.append(log: line, domain: .connection)
+            }
+        }
         for c in chars {
             switch c.uuid {
             case BLEManager.cmdWriteChar:
@@ -4662,7 +5895,21 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                 // fires for a 5/MG strap. Live HR/battery come from the standard profiles; this just
                 // opens the puffin session. Unverified on real MG hardware.
                 cmdCharacteristic = c
-                if let hello = selectedModel.deviceFamily.clientHello {
+                // #1635: once the give-up has latched, the hello is what ends the link — skip it and let
+                // the standard-profile HR stream keep running. Consumed unconditionally so an explicit
+                // Connect's single retry belongs to this session and cannot leak into a later automatic one.
+                let helloUserAsked = helloRetryRequested
+                helloRetryRequested = false
+                let helloSuppressed = HelloSuppressionStore.suppressed(peripheral.identifier.uuidString)
+                if !shouldSendClientHello(suppressedForDevice: helloSuppressed, userInitiated: helloUserAsked) {
+                    log("WHOOP 5/MG: CLIENT_HELLO suppressed for this strap - it was never acknowledged and the write is what drops the link. Staying on live HR (not fully paired); press Connect to try the handshake again (#1635).")
+                    state.pairingHint = BondRefusalGiveUp.helloSuppressedHint()
+                    // The unbonded DIS attempt rides HERE and nowhere else: this is the only 5/MG state
+                    // known to be stable - the handshake is off and the link is holding - and it is now
+                    // PERMANENT rather than transient, so without it a suppressed strap never learns its
+                    // firmware or whether it is an MG at all (#490).
+                    scheduleUnbondedDisRead()
+                } else if let hello = selectedModel.deviceFamily.clientHello {
                     // CONTRIBUTOR FIX (issue #17 — diagnosed from the logs, unverified on hardware here):
                     // write CLIENT_HELLO with .withResponse so CoreBluetooth runs just-works bonding when
                     // the link needs authenticating, AND so didWriteValueFor fires. That callback is where
@@ -4672,6 +5919,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                     // "Finishing the secure pairing handshake…".
                     log("WHOOP 5/MG: writing CLIENT_HELLO to fd4b0002 with response (to trigger bonding, experimental).")
                     state.pairingHint = nil   // fresh attempt; clear any stale pairing-mode guidance
+                    clientHelloWriteAt = Date()   // #1635: a hello is now outstanding
                     peripheral.writeValue(Data(hello), for: c, type: .withResponse)
                 }
                 // The realtime-HR stream is armed POST-bond (in didWriteValueFor / startRealtime) with
@@ -4694,13 +5942,22 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                 default: break
                 }
                 requestNotify(c, on: peripheral, reason: "discovery")
-            case BLEManager.disSerialChar, BLEManager.disHwRevChar:
-                // #520: CAPTURE ONLY — the read is issued post-bond (a 5/MG refuses standard reads on an
-                // unencrypted link, see #490). These are read-only identity strings: never subscribed
-                // (no notify property) and never written. Must be handled BEFORE `default`, or they'd be
-                // retained as puffin notify characteristics.
+            case BLEManager.disSerialChar, BLEManager.disHwRevChar, BLEManager.disFwRevChar,
+                 BLEManager.disManufacturerChar, BLEManager.disModelNumberChar, BLEManager.disSwRevChar:
+                // #520: CAPTURE ONLY — the read is issued post-bond, and since #1635 ALSO on a suppressed
+                // link that will never bond (see `readDisIdentityUnbonded`; whether a 5/MG answers a
+                // standard read unencrypted is the open question #490 asks). These are read-only identity
+                // strings: never subscribed (no notify property) and never written. Must be handled BEFORE
+                // `default`, or they'd be retained as puffin notify characteristics.
                 if c.uuid == BLEManager.disSerialChar {
                     disSerialCharacteristic = c
+                } else if c.uuid != BLEManager.disHwRevChar {
+                    // The identity extras are read straight off the discovered service, so they need no
+                    // dedicated property — but they must still be claimed here or `default` would retain
+                    // them as puffin notify characteristics.
+                    if !disExtraCharacteristics.contains(where: { $0.uuid == c.uuid }) {
+                        disExtraCharacteristics.append(c)
+                    }
                 } else {
                     disHwRevCharacteristic = c
                 }
@@ -4722,6 +5979,10 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                            error: Error?) {
         if let error = error {
             log("Confirmed write failed: \(error.localizedDescription)")
+            // #1635: a failed write owes no ack. Leaving the window open would let the NEXT completion on
+            // fd4b0002 — DISABLE_ALARM and every other puffin command share it — satisfy both halves of
+            // the bond gate below and declare a bond the strap never granted, which is the whole bug.
+            if characteristic.uuid == BLEManager.whoop5CmdWriteChar { clientHelloWriteAt = nil }
             // #78 hole-1: classify by ATT code first (locale-proof), English string fallback second.
             // This one change repairs the pairing hint (streak>=2), the #747 give-up (5) AND the #52
             // stale-pin handoff below for non-English devices, which all key off this same flag.
@@ -4762,16 +6023,11 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                 // threshold (the pairing hint has had several cycles to be acted on), pause auto-reconnect so
                 // we stop hammering a strap that can't bond, write the one-line epitaph (opaque id only, no
                 // PII), and surface the honest paused hint. A genuine bond or a manual reconnect re-arms it.
-                if bondGiveUp.recordRefusal() {
-                    autoReconnectPausedForBondLoop = true
-                    bondLoopPausedAt = Date()   // starts the #78 hole-4 salvage-probe floor
-                    let opaque = BondRefusalGiveUp.opaqueId(fromLocalUUID: peripheral.identifier.uuidString)
-                    log(BondRefusalGiveUp.epitaphLine(refusals: bondGiveUp.refusals, opaqueId: opaque))
-                    state.pairingHint = BondRefusalGiveUp.pausedHint()
-                    if TestCentre.active(.connection) {
-                        state.append(log: "bond gaveUp refusals=\(bondGiveUp.refusals) id=\(opaque) (auto-reconnect paused)", domain: .connection)
-                    }
-                }
+                // #1635: the trip itself now lives in recordWhoop5BondRefusal, shared with the
+                // unanswered-handshake path at disconnect, so the two causes cannot drift apart. This
+                // one is an AUTH refusal — the strap actively declined — so it still pauses.
+                recordWhoop5BondRefusal(authRefusal: true,
+                                        peripheralUUID: peripheral.identifier.uuidString)
             }
             // Multi-WHOOP stale-pin recovery (#52). When a stale registry pin points at a strap that keeps
             // refusing the encrypted bond ("Encryption/Authentication is insufficient") but a DIFFERENT
@@ -4798,8 +6054,34 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
         // which the strap refused before the link was encrypted. Do NOT run the WHOOP4 command handshake
         // below — a 5/MG strap rejects WHOOP4-framed commands (the send() guard drops them anyway).
         if selectedModel.deviceFamily == .whoop5 {
-            if !didBond {
+            // #1635: only the CLIENT_HELLO's OWN completion is evidence of a bond. Declining withholds
+            // the bond declaration ONLY — the puffin re-subscribe below is unchanged, so a link that is
+            // genuinely up keeps its notifications either way.
+            let isHelloChar = characteristic.uuid == BLEManager.whoop5CmdWriteChar
+            let helloOutstanding = clientHelloWriteAt != nil
+            // Consume the window ONLY for the hello's own completion. A foreign completion that cleared it
+            // would make a genuine ack arriving afterwards look unsolicited, costing a real bond.
+            //
+            // An UNACKED hello leaves the window open, and the pair of conditions cannot be satisfied by a
+            // later command on the same characteristic: `send` writes `.withoutResponse` by default, which
+            // produces no completion at all, and the `.withResponse` senders (the offload acks) only run
+            // after a bond, where `alreadyBonded` short-circuits this. The link dropping clears it anyway.
+            if isHelloChar { clientHelloWriteAt = nil }
+            if !helloOutstanding, !didBond {
+                // Declining must not be silent — see `ClientHelloOutcome.declinedLine`.
+                log(ClientHelloOutcome.declinedLine(charUuid: characteristic.uuid.uuidString, status: nil))
+            }
+            if ClientHelloOutcome.isAck(
+                isHelloChar: isHelloChar,
+                helloOutstanding: helloOutstanding,
+                alreadyBonded: didBond,
+                isWhoop5: true
+            ) {
                 didBond = true
+                // #1635: the handshake demonstrably works on this strap - drop the latch so a later
+                // transient failure starts from a clean slate rather than inheriting an old verdict.
+                HelloSuppressionStore.setSuppressed(peripheral.identifier.uuidString, false)
+                bondGiveUp.reset()
                 state.bonded = true
                 state.encryptedBond = true   // genuine encrypted bond (not the live-HR shortcut) — #69
                 bondedAt = Date()            // #617: start the bond→drop stopwatch for the bond-loop detector
@@ -4840,6 +6122,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             if !whoop5SessionStarted {
                 whoop5SessionStarted = true
                 connectHandshakeDone = true     // unblocks beginBackfill()'s guard
+                state.historyReady = true       // and the sync controls, which must not offer what it declines
                 log("WHOOP 5/MG: connect handshake done — backfill unblocked")
                 noteRebootReconnectIfNeeded()
                 // Re-apply the Broadcast-HR device-config flag if the user opted in (#181).
@@ -4852,7 +6135,11 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                 // Hardware-validated ordering (#78 fork).
                 send(.setClock, payload: BLEManager.setClockPayload())
                 send(.getClock, payload: [])
-                log("WHOOP 5/MG: clock synced (set/get) — strap can persist history now")
+                // #1823: say what was SENT, not what resulted. This previously read "clock synced —
+                // strap can persist history now", logged before any reply had arrived, so a log could
+                // assert the clock was set while the Devices readout said 1970/71. The strap's actual
+                // answer now arrives as the "clock: …" ack line from FrameRouter.
+                log("WHOOP 5/MG: SET_CLOCK + GET_CLOCK sent — awaiting the strap's answer")
                 log("WHOOP 5/MG: scheduling first historical offload (connect)")
                 // Deferred ~1.5s so the puffin notify subscriptions settle before SEND_HISTORICAL_DATA,
                 // mirroring the WHOOP4 kick. requestSync → beginBackfill is itself gated on
@@ -4889,6 +6176,7 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
         // type-47 fine because it runs the sequence once on a stable connection; the app stormed it.
         guard !connectHandshakeDone else { return }
         connectHandshakeDone = true
+        state.historyReady = true
         noteRebootReconnectIfNeeded()
         backfillStarted = true
 
@@ -5058,11 +6346,19 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
         // log was indistinguishable from one where the strap never answered, which is why a broken decode
         // survived unnoticed. The raw-frame dump above is unconditional for the same reason. If a firmware
         // revision ever shifts these fields again, the rejection must be visible rather than silent.
-        if let pages = DataRange.pagesBehind(from: frame, cmdOff: cmdOff) {
-            log("Strap backlog pages behind: \(pages) (#689 — GET_DATA_RANGE ring backlog, diagnostic only)")
-        } else {
-            log("Strap backlog pages behind: not decodable from this frame (#689 — offsets may have moved; "
-                + "the raw frame above is the input). Diagnostic only, sync is unaffected.")
+        // ...but NOT on the PENDING(2) ack. GET_DATA_RANGE answers twice — a short ack, then the payload —
+        // which Framing's result-code table already records ("2=PENDING precedes SUCCESS on
+        // GET_DATA_RANGE"). The ack carries no ring pointers at all, so decoding it failed every time and
+        // reported a decode problem that did not exist: one "offsets may have moved" per sync, on healthy
+        // hardware, pointing the reader at an alignment bug rather than at the ack. Skip it here; the
+        // SUCCESS frame still logs its failure loudly, which is the case the paragraph above protects.
+        if !DataRange.isPendingResponse(frame, cmdOff: cmdOff) {
+            if let pages = DataRange.pagesBehind(from: frame, cmdOff: cmdOff) {
+                log("Strap backlog pages behind: \(pages) (#689 — GET_DATA_RANGE ring backlog, diagnostic only)")
+            } else {
+                log("Strap backlog pages behind: not decodable from this frame (#689 — offsets may have moved; "
+                    + "the raw frame above is the input). Diagnostic only, sync is unaffected.")
+            }
         }
         if let newest = BLEManager.dataRangeNewestUnix(from: frame) {
             // #695: the sync-affecting side-effects (strapNewestTs, backfill window, LiveState range) only
@@ -5109,12 +6405,20 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                            didUpdateValueFor characteristic: CBCharacteristic,
                            error: Error?) {
         if let error {
+            // A DIS refusal is a FINDING, not noise — report it specifically and latch it, or a capture
+            // cannot tell a refusal from a read that was never issued (#490, #1635).
+            noteDisReadFailure(characteristic.uuid, error)
             log("Notify update failed for \(characteristic.uuid): \(error.localizedDescription)")
             return
         }
         guard let data = characteristic.value else { return }
         let bytes = [UInt8](data)
         lastDataAt = Date()   // feed the liveness watchdog on every notification
+        // #1809: count BEFORE the per-characteristic switch below, so the tally covers every inbound
+        // frame including ones no branch consumes - the epitaph must answer "did anything arrive at all".
+        inboundFrames += 1
+        inboundBytes += bytes.count
+        if characteristic.uuid == BLEManager.cmdNotifyChar { cmdChannelFrames += 1 }
 
         switch characteristic.uuid {
         case BLEManager.heartRateChar:
@@ -5125,6 +6429,11 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             if selectedModel.deviceFamily == .whoop5, !state.bonded {
                 state.bonded = true
                 log("WHOOP 5/MG: live HR streaming — marking the link established (experimental).")
+                // #1635: a 5/MG has no confirmed-write handshake, so the keep-alive (and with it the
+                // liveness watchdog) is started HERE, on the bonded transition, exactly as the Kotlin twin
+                // does. The other two start sites are post-bond, which a suppressed strap never reaches —
+                // and this also covers an unbonded 5/MG that has not latched yet.
+                startKeepAlive()
             }
         case BLEManager.batteryChar:
             // 0x2A19 = percent — 5/MG ONLY. The WHOOP 4.0's 0x2A19 is a stub constant 100 (real value =
@@ -5142,6 +6451,37 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
             disHwRev = String(decoding: bytes, as: UTF8.self)
                 .trimmingCharacters(in: CharacterSet(charactersIn: "\0").union(.whitespacesAndNewlines))
             noteWhoop5VariantFromDIS()
+        case BLEManager.disFwRevChar:
+            disFirmware = String(decoding: bytes, as: UTF8.self)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\0").union(.whitespacesAndNewlines))
+            // FALLBACK only. The puffin report is the strap's own account of what it is running and lands
+            // later in the connect; a value that appeared and then changed would be worse than one that
+            // arrived once, so this yields rather than racing it.
+            if shouldPublishDisFirmware(disFirmware: disFirmware, alreadyDecoded: state.strapFirmware) {
+                state.strapFirmware = disFirmware
+                // #1634: persist it against THIS strap. The per-device key has readers (DevicesView, the
+                // debug export) but had no writer at all - the decoded path cannot key on identity, which
+                // its own comment concedes - so `perDevice` always resolved nil and iOS fell back to a
+                // global value that is wrong the moment a second strap exists. This site DOES have the
+                // peripheral, so it is the one place that can attribute a firmware honestly. Kotlin twin:
+                // NoopPrefs.setFirmwareFor beside the same publish.
+                if let key = FirmwareAttribution.prefKey(peripheralId: peripheral.identifier.uuidString),
+                   let fw = disFirmware {
+                    UserDefaults.standard.set(fw, forKey: key)
+                }
+                // Named as the DIS source, because it is not the same reading as the decoded one a 4.0
+                // shows and a capture must not have to guess which it is looking at.
+                log("DIS: firmware=\(disFirmware ?? "?") (standard profile, no bond required)")
+            } else {
+                let shown = (disFirmware?.isEmpty ?? true) ? "?" : (disFirmware ?? "?")
+                log("DIS: firmware=\(shown) not published — a decoded value already stands")
+            }
+        case BLEManager.disManufacturerChar, BLEManager.disModelNumberChar, BLEManager.disSwRevChar:
+            // Diagnostic only: nothing gates on these, but they cost one read each and are exactly what
+            // is missing when someone reports an unidentified strap.
+            let v = String(decoding: bytes, as: UTF8.self)
+                .trimmingCharacters(in: CharacterSet(charactersIn: "\0").union(.whitespacesAndNewlines))
+            if !v.isEmpty { log("DIS: \(characteristic.uuid.uuidString) = \(v)") }
         case BLEManager.dataNotifyChar,
              BLEManager.cmdNotifyChar,
              BLEManager.eventNotifyChar:
@@ -5156,6 +6496,8 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                     // …but a REAL-TIME physical gesture (double-tap / wrist) must still fire even mid-
                     // offload (#69). Gated on ts≈now so replayed historical EVENTs (old ts) are ignored.
                     router.dispatchLiveGestureIfFresh(frame: frame, now: strapClockNow)
+                    // …and the strap's own console narration, which it emits precisely DURING a sync.
+                    router.mirrorStrapConsoleIfPresent(frame: frame)
                     continue
                 }
                 // #47: decode this live WHOOP4 frame ONCE here and thread the result to every consumer
@@ -5241,9 +6583,8 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                     // reverse-engineering — its own file the bulk-capture eviction never churns.
                     // BEFORE the offload branch so it catches the burst; no-op unless capture is on.
                     puffinDeepBufferLog.appendIfDeepBuffer(frame: frame, char: characteristic.uuid, isOffload: isOffload)
+                    stopUnexpectedRealtimeImu(frame, isOffload: isOffload)
                     // #423: the queryable twin of that diagnostics line — persist the decoded 100 Hz 6-axis
-                    // IMU samples into the rawImuSample table when raw capture is on (same gate, gated inside).
-                    collector?.storeRawImu(frame: frame)
                     if isOffload {
                         // Same policy as WHOOP4: historical offload frames are bulk sync traffic.
                         // Keep them out of the live UI parser during backfill and let Backfiller
@@ -5253,6 +6594,8 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                         // A real-time double-tap / wrist gesture still fires during a 5/MG offload (which
                         // runs for minutes, #69); the ts≈now gate rejects replayed historical EVENTs.
                         router.dispatchLiveGestureIfFresh(frame: frame, now: strapClockNow)
+                        // …and the strap's own console narration, which it emits precisely DURING a sync.
+                        router.mirrorStrapConsoleIfPresent(frame: frame)
                         continue
                     }
                     router.handle(frame: frame)
@@ -5286,6 +6629,21 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
                        frame[10] == WhoopCommand.setConfig.rawValue
                         || frame[10] == WhoopCommand.getFeatureFlagValue.rawValue {
                         handleR22DisableResponse(frame, isWhoop5: true)
+                    }
+                    // #891: a reply belonging to an ECG raw-data gate write — either the SET_DEVICE_CONFIG(119)
+                    // write ack (recorded, never the proof) or the GET_DEVICE_CONFIG_VALUE(121) read-back that
+                    // decides the verdict. Both handlers guard on ecgGateReport being live, so they no-op
+                    // outside a verification (and the 121 read-probe clause above no-ops too, its run not live).
+                    // #1061 shares the SAME opcodes for its Broadcast-HR write read-back; only one gate is ever
+                    // in flight (both are single-flight), and each handler no-ops unless its own report is live.
+                    if frame.count > 10, frame[8] == 0x24 {
+                        if frame[10] == WhoopCommand.setDeviceConfig.rawValue {
+                            handleEcgGateWriteAck(frame, cmdOff: 10)
+                            handleBroadcastHrGateWriteAck(frame, cmdOff: 10)
+                        } else if frame[10] == WhoopCommand.getDeviceConfigValue.rawValue {
+                            handleEcgGateReadBack(frame, isWhoop5: true)
+                            handleBroadcastHrGateReadBack(frame, isWhoop5: true)
+                        }
                     }
                     // #695: a 5/MG GET_DATA_RANGE COMMAND_RESPONSE (puffin envelope: type @8, cmd @10). Feeds
                     // the SAME newest/oldest window + backfill gate + diagnostics as the 4.0 path above — this

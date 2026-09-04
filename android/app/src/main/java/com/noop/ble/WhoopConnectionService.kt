@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
@@ -205,12 +206,39 @@ class WhoopConnectionService : Service() {
      *  The detector is reset each time we (re)enter a window. */
     private val sleepWatcher = SleepWindowWatcher()
     private var inAlarmWindow = false
+    /** Whether this window has already logged a live-HR reading (#1858). The window-open line is worth
+     *  one line a night, and it must report a REAL reading: `heartRate ?: 0` means the collector also
+     *  runs when nothing is streaming, which is the very case the line exists to rule out. */
+    private var loggedAlarmWindowHr = false
 
     /** The smart-alarm HR collector, alive for the life of the service. */
     private var alarmJob: Job? = null
 
     private val ble get() = (application as NoopApplication).ble
     private val repo get() = (application as NoopApplication).repository
+
+    /**
+     * Watches the OS PAIRING flow (#1635). NOOP has never observed ACTION_BOND_STATE_CHANGED, so whether a
+     * CLIENT_HELLO triggers pairing at all - and whether that pairing fails - has been invisible. A WHOOP
+     * 5/MG shows every CLIENT_HELLO unacknowledged and the link torn down locally on a clockwork timer;
+     * seeing BOND_NONE -> BOND_BONDING -> BOND_NONE across that window decides it, and seeing no transition
+     * at all decides it the other way. Registered and unregistered alongside [bluetoothStateReceiver].
+     */
+    private val bondStateReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action != BluetoothDevice.ACTION_BOND_STATE_CHANGED) return
+            val dev: BluetoothDevice? =
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE, BluetoothDevice::class.java)
+                } else {
+                    @Suppress("DEPRECATION")
+                    intent.getParcelableExtra(BluetoothDevice.EXTRA_DEVICE)
+                }
+            val cur = intent.getIntExtra(BluetoothDevice.EXTRA_BOND_STATE, BluetoothDevice.ERROR)
+            val prev = intent.getIntExtra(BluetoothDevice.EXTRA_PREVIOUS_BOND_STATE, BluetoothDevice.ERROR)
+            runCatching { ble.onBondStateChanged(prev, cur, dev?.address) }
+        }
+    }
 
     /**
      * Watches the OS Bluetooth radio so turning it off immediately tears down NOOP's orphaned GATT
@@ -233,8 +261,9 @@ class WhoopConnectionService : Service() {
         }
     }
 
-    /** True once [bluetoothStateReceiver] is registered, so repeat onStartCommands don't double-register
-     *  (which would later throw on a single unregister). */
+    /** True once [bluetoothStateReceiver] and [bondStateReceiver] are registered, so repeat
+     *  onStartCommands don't double-register (which would later throw on a single unregister). Both
+     *  register together and unregister together, so one flag covers the pair. */
     private var bluetoothReceiverRegistered = false
 
     override fun onBind(intent: Intent?): IBinder? = null
@@ -267,6 +296,16 @@ class WhoopConnectionService : Service() {
                     IntentFilter(BluetoothAdapter.ACTION_STATE_CHANGED),
                     ContextCompat.RECEIVER_NOT_EXPORTED,
                 )
+
+                // #1635: same lifecycle and the same registration form as the radio receiver above - the FGS
+                // owns the connection, so the pairing flow is only interesting while it is alive, and both are
+                // torn down together in onDestroy.
+                ContextCompat.registerReceiver(
+                    this,
+                    bondStateReceiver,
+                    IntentFilter(BluetoothDevice.ACTION_BOND_STATE_CHANGED),
+                    ContextCompat.RECEIVER_NOT_EXPORTED,
+                )
             }.onSuccess { bluetoothReceiverRegistered = true }
         }
 
@@ -284,7 +323,9 @@ class WhoopConnectionService : Service() {
                 // flow completes; combine keeps running on ble.state with days frozen.
                 // #797: the bounded merge (recentDaysMergedFlow) is enough here, the notification only reads
                 // today's row; this stops a years-deep import re-merging the whole history on every change.
-                repo.recentDaysMergedFlow("my-whoop").catch { emit(emptyList()) },
+                // #1304/#512: the active strap's live day is under its own id ("whoop-<uuid>"); a raw
+                // "my-whoop" read (which the union method collapses to) misses it. Same accessor as :606.
+                repo.recentDaysMergedFlow((application as NoopApplication).activeDeviceId).catch { emit(emptyList()) },
             ) { state, days ->
                 // #911: resolve the day the way the dashboard does, via the LOGICAL local day (rolls at
                 // 04:00, with the #304 pre-04:00 carve-out), NOT a naive LocalDate.now() that rolls at
@@ -365,7 +406,9 @@ class WhoopConnectionService : Service() {
                     lastRuntimeEvalPct = runtimePct
                     runCatching {
                         val nowS = System.currentTimeMillis() / 1000
-                        val samples = repo.batterySamples("my-whoop", nowS - 14L * 86_400, nowS, limit = 2_000)
+                        // #1304/#512: read the active strap's own SoC (banked under "whoop-<uuid>" for a
+                        // 2nd strap), not the hardcoded canonical id. Same accessor as :606.
+                        val samples = repo.batterySamples((application as NoopApplication).activeDeviceId, nowS - 14L * 86_400, nowS, limit = 2_000)
                             .mapNotNull { s -> s.soc?.let { s.ts to it } }
                         val rated = if (state.whoop5Detected) BatteryEstimator.ratedLifeHoursWhoop5
                                     else BatteryEstimator.ratedLifeHoursWhoop4
@@ -479,15 +522,71 @@ class WhoopConnectionService : Service() {
                 .conflate()
                 .collect { hr ->
                     if (!store.enabled || store.scheduledDeadlineMs <= 0L) {
+                        // Disarmed while we were inside the window. SmartAlarmReceiver zeroes the
+                        // edges before re-arming, and an explicit disable zeroes them for good, so
+                        // without this the end-of-window line is simply lost — and a window line with
+                        // no end line is documented to mean the HR stream stopped, which would be the
+                        // wrong reading. Log it here so every opened window closes with a line.
+                        if (inAlarmWindow) {
+                            ble.externalLog(
+                                "Smart alarm: wake window ended (alarm no longer armed), detector " +
+                                    "${if (sleepWatcher.hasFired) "fired" else "never fired"} - " +
+                                    "${sleepWatcher.trough?.let { "trough $it bpm" } ?: "trough never established"} " +
+                                    "from ${sleepWatcher.samples} readings",
+                            )
+                        }
                         inAlarmWindow = false
                         return@collect
                     }
                     val now = System.currentTimeMillis()
                     val inWindow = now in store.scheduledWindowStartMs until store.scheduledDeadlineMs
-                    if (inWindow && !inAlarmWindow) sleepWatcher.reset()   // fresh night
+                    if (inWindow && !inAlarmWindow) {
+                        sleepWatcher.reset()   // fresh night
+                        loggedAlarmWindowHr = false
+                    }
+                    // #1858: the alarm package had no logging at all, so "the smart alarm never works"
+                    // could not be told apart from "nothing was streaming all night" — the two need
+                    // opposite fixes. These lines are diagnostics ONLY; every decision below is
+                    // unchanged.
+                    //
+                    // Reading an exported log. It takes BOTH the window line and the end line, because
+                    // the end line carries the sample count and only that separates a detector that
+                    // declined to fire from a stream that stopped underneath it:
+                    //
+                    //   window + advance                  -> worked
+                    //   window + end (no fire, samples n) -> HR flowed all window and it still never
+                    //                                        fired: the detector's own defect
+                    //   window, NO end line               -> the stream stopped before the window ended
+                    //                                        (no post-deadline sample to log on)
+                    //   no window + end (samples 0)       -> nothing streamed inside the window at all
+                    //   neither line                      -> the collector never ran in-window: the
+                    //                                        service was down, or the alarm was off
+                    if (!inWindow && inAlarmWindow) {
+                        ble.externalLog(
+                            "Smart alarm: wake window ended, detector ${if (sleepWatcher.hasFired) "fired" else "never fired"} " +
+                                "- ${sleepWatcher.trough?.let { "trough $it bpm" } ?: "trough never established"} " +
+                                "from ${sleepWatcher.samples} readings",
+                        )
+                    }
                     inAlarmWindow = inWindow
                     if (!inWindow) return@collect
+                    if (hr > 0 && !loggedAlarmWindowHr) {
+                        loggedAlarmWindowHr = true
+                        val mins = (store.scheduledDeadlineMs - now) / 60_000L
+                        ble.externalLog("Smart alarm: in wake window with live HR $hr bpm, deadline in $mins min")
+                    }
                     if (sleepWatcher.shouldWake(hr)) {
+                        // advanceTo() returns silently when the OS will not honour an exact alarm (the
+                        // API 31+ permission can be revoked AFTER the alarm was armed, leaving a
+                        // deadline that can never be moved). Claiming "advancing" would then assert
+                        // something this line cannot attribute - and that is precisely the case someone
+                        // reading the log would be hunting. State the request and the permission apart.
+                        val permitted = SmartAlarmScheduler.canScheduleExact(this@WhoopConnectionService)
+                        ble.externalLog(
+                            "Smart alarm: detector fired, asking to advance the wake - HR $hr bpm vs " +
+                                "trough ${sleepWatcher.trough} after ${sleepWatcher.samples} readings" +
+                                if (permitted) "" else " - IGNORED, exact alarms are not permitted",
+                        )
                         SmartAlarmScheduler.advanceTo(this@WhoopConnectionService, store, now)
                     }
                 }
@@ -646,6 +745,7 @@ class WhoopConnectionService : Service() {
             // unregisterReceiver throws if it was never registered; the flag guards that, and runCatching
             // covers the rare case the OS already reclaimed it.
             runCatching { unregisterReceiver(bluetoothStateReceiver) }
+            runCatching { unregisterReceiver(bondStateReceiver) }
             bluetoothReceiverRegistered = false
         }
         scope.cancel()

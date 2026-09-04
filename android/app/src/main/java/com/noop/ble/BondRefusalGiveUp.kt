@@ -20,11 +20,15 @@ package com.noop.ble
  */
 class BondRefusalGiveUp(
     /**
-     * Consecutive bond refusals before we pause auto-reconnect + write the epitaph. 5 (not 2, where the
+     * Consecutive bond refusals before we PAUSE auto-reconnect + write the epitaph. 5 (not 2, where the
      * pairing HINT already shows): the hint asks the user to act; we give them several reconnect cycles to
      * do it before we stop hammering. A genuinely held/stale strap reaches 5 within a couple of minutes.
+     *
+     * This is the AUTH-REFUSAL number specifically, and [recordRefusal] takes a per-refusal override for
+     * that reason: an unanswered handshake asks the user for nothing, so waiting five cycles for a decision
+     * they cannot make just buys ~4.8s link drops. See [giveUpThresholdFor].
      */
-    private val giveUpThreshold: Int = 5,
+    val giveUpThreshold: Int = 5,
 ) {
     var refusals = 0
         private set
@@ -39,10 +43,14 @@ class BondRefusalGiveUp(
     /**
      * Record one bond refusal. Returns true if THIS refusal freshly crossed the give-up threshold (so the
      * caller pauses the reconnect + writes the epitaph exactly once).
+     *
+     * [threshold] defaults to the constructed [giveUpThreshold]; callers that can tell the two give-up
+     * CAUSES apart pass the one for the refusal in hand ([giveUpThresholdFor]). The latch is still reported
+     * exactly once whatever the threshold, so a lower one moves the crossing without duplicating it.
      */
-    fun recordRefusal(): Boolean {
+    fun recordRefusal(threshold: Int = giveUpThreshold): Boolean {
         refusals += 1
-        if (!gaveUp && refusals >= giveUpThreshold) {
+        if (!gaveUp && refusals >= threshold) {
             gaveUp = true
             return true
         }
@@ -77,6 +85,56 @@ class BondRefusalGiveUp(
                 "official WHOOP app, or your phone is holding an old pairing. Close the WHOOP app, put the " +
                 "strap in pairing mode (tap until the LEDs flash blue), and if it is listed in your Bluetooth " +
                 "settings choose Forget This Device. Then tap Connect to try again."
+
+        /**
+         * #1635: the hint for a strap whose CLIENT_HELLO is never acknowledged, where NOOP now stays
+         * connected with the handshake switched off rather than pausing.
+         *
+         * Deliberately does NOT say "paused" (nothing is paused) and does NOT name a cause. An unanswered
+         * write is not evidence the strap is held by the official app, and the epitaph that asserts that is
+         * reserved for an actual auth refusal. Says what was observed and what the user still gets.
+         *
+         * Pure; no em-dash. Byte-identical to the Swift `BondRefusalGiveUp.helloSuppressedHint`.
+         */
+        fun helloSuppressedHint(): String =
+            "The secure handshake with your strap never completes, and the attempt itself is what drops " +
+                "the link. NOOP has switched it off for this strap so live heart rate keeps streaming. " +
+                "History sync stays unavailable until it pairs, and so do motion, skin temperature, " +
+                "SpO₂ and respiratory rate — so sleep is staged from heart rate alone, and HRV and " +
+                "resting heart rate are unavailable. Tap Connect to try the handshake again."
+
+        /**
+         * #1635: the log epitaph for the suppression path.
+         *
+         * Separate from [epitaphLine] because that one asserts a cause ("almost certainly held by the
+         * official WHOOP app") that only an auth refusal supports. Reusing it here would print a confident
+         * explanation for a write that simply vanished.
+         *
+         * Pure. Byte-identical to the Swift `BondRefusalGiveUp.helloSuppressedEpitaph`.
+         */
+        fun helloSuppressedEpitaph(refusals: Int, opaqueId: String): String =
+            "Bond epitaph: the strap [$opaqueId] never acknowledged the secure handshake ${refusals}x in a " +
+                "row, and the attempt is what drops the link - leaving the handshake off so live heart " +
+                "rate keeps streaming. Tap Connect to try it again."
+
+        /**
+         * The paused hint for a bond that failed WITHOUT the strap ever answering (#1635).
+         *
+         * [pausedHint] names a cause — the strap still held by the official WHOOP app, or a stale OS
+         * pairing — which is well founded when the refusal arrived as INSUFFICIENT_AUTHENTICATION or
+         * INSUFFICIENT_ENCRYPTION: the strap actively said no. It is NOT founded when the CLIENT_HELLO
+         * simply goes unanswered and the link drops on a timer, which is a different observation with
+         * several possible causes. Telling that user to close the WHOOP app would be a guess dressed as
+         * instruction, and if it is wrong they have no way to know.
+         *
+         * So this describes what was observed and offers the one action that is definitely theirs to
+         * take, without asserting why. Pure; no em-dash.
+         */
+        fun pausedHintHandshakeUnanswered(): String =
+            "NOOP stopped retrying because the secure handshake with your strap never completes: the " +
+                "strap does not answer, and the link drops a few seconds later. Auto-reconnect is paused " +
+                "so it stops draining both batteries. Tap Connect to try again, and if it keeps happening " +
+                "please share your strap log."
 
         /**
          * #750: a short OPAQUE token for the epitaph, derived from the strap's device id.

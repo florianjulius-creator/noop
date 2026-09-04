@@ -58,14 +58,9 @@ extension WhoopStore {
         return out
     }
 
-    /// #423 rolling retention for the raw-IMU capture table (twin of Kotlin `RAW_IMU_RETENTION_ROWS`):
-    /// ~1 h at 1 row/strap-second (~4 MB) hard-caps the table during a multi-day offload replay.
-    public static let rawImuRetentionRows = 3600
-
     /// v31 rolling retention for the v18 aux-slot table (twin of Kotlin `V18_AUX_RETENTION_ROWS`).
     ///
-    /// `rawImuSample` is the closest precedent — raw instrumentation banked as a blob, capped rather than
-    /// unbounded — and the same reasoning applies here: nothing reads these rows yet, so a cap is far
+    /// Raw instrumentation must be capped rather than unbounded. Nothing reads these rows yet, so a cap is far
     /// cheaper to RELAX later than to impose once users have a year of history. Unbounded, this table is
     /// the one genuinely new source of row growth in v31 (the four named channels only WIDEN rows that
     /// were already being written: ~14 bytes on a `gravitySample`/`skinTempSample`/`sleepStateSample` row
@@ -99,27 +94,6 @@ extension WhoopStore {
                     name = excluded.name,
                     lastSeen = excluded.lastSeen
                 """, arguments: [id, mac, name, now, now])
-        }
-    }
-
-    /// #423: persist decoded 5/MG raw-IMU offload buffers (one row per strap-second, packed i16 BLOB),
-    /// then bound the table to the newest `retentionRows` for the device (rolling retention). Written from
-    /// the deep-buffer capture seam, not the normal stream path, so it inserts directly (idempotent by ts).
-    /// Twin of Kotlin `WhoopRepository.insertRawImu`.
-    public func insertRawImu(deviceId: String, rows: [(ts: Int, cols: [Int16])], retentionRows: Int) async throws {
-        guard !rows.isEmpty else { return }
-        try syncWrite { db in
-            let ins = try db.cachedStatement(sql: """
-                INSERT INTO rawImuSample (deviceId, ts, samples) VALUES (?, ?, ?)
-                ON CONFLICT(deviceId, ts) DO NOTHING
-                """)
-            // Pack the raw i16 columns to the LE BLOB HERE (packImuColumns is module-internal), so the
-            // caller passes plain [Int16] and never needs the packer. Mirrors how `insert` packs ppgWaveform.
-            for r in rows { try ins.execute(arguments: [deviceId, r.ts, WhoopStore.packImuColumns(r.cols)]) }
-            try db.execute(sql: """
-                DELETE FROM rawImuSample WHERE deviceId = ? AND ts < (
-                    SELECT MIN(ts) FROM (SELECT ts FROM rawImuSample WHERE deviceId = ? ORDER BY ts DESC LIMIT ?))
-                """, arguments: [deviceId, deviceId, retentionRows])
         }
     }
 
@@ -323,11 +297,12 @@ extension WhoopStore {
             // `packPpgSamples`) rather than 24 scalar rows, so this insert is O(records), not O(samples).
             if !streams.ppgWaveform.isEmpty {
                 let stmt = try db.cachedStatement(sql: """
-                    INSERT INTO ppgWaveformSample (deviceId, ts, samples) VALUES (?, ?, ?)
+                    INSERT INTO ppgWaveformSample (deviceId, ts, samples, burstIndex) VALUES (?, ?, ?, ?)
                     ON CONFLICT(deviceId, ts) DO NOTHING
                     """)
                 for s in streams.ppgWaveform {
-                    try stmt.execute(arguments: [deviceId, s.ts, WhoopStore.packPpgSamples(s.samples)])
+                    try stmt.execute(arguments: [deviceId, s.ts, WhoopStore.packPpgSamples(s.samples),
+                                                 s.burstIndex])
                 }
             }
             // Every remaining v18 slot (v31), one compact blob per strap-second. Persist-only, same as
@@ -349,9 +324,8 @@ extension WhoopStore {
             return (hr, rr, ev, bat, spo2, skin, resp, grav)
         }
 
-        // Rolling retention (the `insertRawImu` shape, #423) but AMORTISED. The delete finds the
-        // Nth-newest row by rank, so it walks up to `v18AuxRetentionRows` index entries; `insertRawImu`
-        // keeps 3,600 so that is free, this keeps 604,800 and an offload inserts once per chunk. Swept
+        // Rolling retention is amortised. The delete finds the Nth-newest row by rank, so it walks up to
+        // `v18AuxRetentionRows` index entries. The 604,800-row cap is swept
         // once per `v18AuxPruneEveryRows` rows instead, which keeps newest-N-rows exactly (a time window
         // would not — a sporadically-worn strap's rows span far more than a week, and the census wants
         // that). Counter is per device because the delete is.
@@ -633,11 +607,13 @@ extension WhoopStore {
         -> [PpgWaveformSample] {
         try syncRead { db in
             try Row.fetchAll(db, sql: """
-                SELECT ts, samples FROM ppgWaveformSample
+                SELECT ts, samples, burstIndex FROM ppgWaveformSample
                 WHERE deviceId = ? AND ts >= ? AND ts <= ?
                 ORDER BY ts LIMIT ?
                 """, arguments: [deviceId, from, to, limit])
-                .map { PpgWaveformSample(ts: $0["ts"], samples: WhoopStore.unpackPpgSamples($0["samples"])) }
+                .map { PpgWaveformSample(ts: $0["ts"],
+                                         samples: WhoopStore.unpackPpgSamples($0["samples"]),
+                                         burstIndex: $0["burstIndex"]) }
         }
     }
 
@@ -687,6 +663,25 @@ extension WhoopStore {
                 SELECT rrMs, srcChannel FROM rrInterval WHERE deviceId = ?
                 ORDER BY ts ASC, ord ASC, rrMs ASC, seq ASC
                 """, arguments: [deviceId]).map { (rrMs: $0["rrMs"], srcChannel: $0["srcChannel"]) }
+        }
+    }
+
+    /// Run the `v35-rr-future-quarantine` backfill predicate with an EXPLICIT `now` (the migration itself
+    /// uses `strftime('%s','now')`; a test needs a fixed instant). Marks every stored R-R beat whose ts is
+    /// after `nowSeconds`. Test-only (#1073).
+    public func markFutureRrSuspectForTest(nowSeconds: Int) async throws {
+        try syncWrite { db in
+            try db.execute(sql: "UPDATE rrInterval SET tsSuspect = 1 WHERE ts > ?", arguments: [nowSeconds])
+        }
+    }
+
+    /// Every STORED R-R row for a device as `(ts, tsSuspect)`, bypassing the scoring read's filter — so a
+    /// test can assert which rows were quarantined AND that none were deleted. Test-only (#1073).
+    public func rrSuspectRowsForTest(deviceId: String) async throws -> [(ts: Int, tsSuspect: Int?)] {
+        try syncRead { db in
+            try Row.fetchAll(db, sql: """
+                SELECT ts, tsSuspect FROM rrInterval WHERE deviceId = ? ORDER BY ts ASC
+                """, arguments: [deviceId]).map { (ts: $0["ts"], tsSuspect: $0["tsSuspect"]) }
         }
     }
 }

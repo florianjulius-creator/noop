@@ -46,6 +46,8 @@ ANDROID_LOCALE_DIRS = {
 UNIVERSAL = {
     "", "-", "–", "—", "·", "•", "✓", "→", "↔",
     "NOOP", "bpm", "BPM", "HRV", "SpO2", "SpO₂", "OK", "ID",
+    # Training-load acronyms — universal training-science terms, identical in every language (like HRV).
+    "CTL", "ATL", "TSB",
 }
 
 # A bare printf/String.format conversion specifier, e.g. "%.1f" or "%02d" — a
@@ -433,7 +435,7 @@ def scan_android() -> list[tuple[str, int, str]]:
                         continue
                     seen.add(offset)
                     line_no = text.count("\n", 0, offset) + 1
-                    findings.append((str(path.relative_to(ROOT)), line_no, literal))
+                    findings.append((path.relative_to(ROOT).as_posix(), line_no, literal))
 
             # The call's own first (content) argument only — catches
             # `Text(if (x) "a" else "b")` — never the whole call span, which
@@ -854,7 +856,7 @@ def scan_ios() -> tuple[list[tuple[str, int, str]], dict[str, list[str]]]:
                         continue
                     entry = swift_catalog_lookup(cat, literal)
                     line_no = text.count("\n", 0, offset) + 1
-                    rel = str(path.relative_to(ROOT))
+                    rel = path.relative_to(ROOT).as_posix()
                     if entry is None:
                         hardcoded.append((rel, line_no, literal))
                         continue
@@ -862,7 +864,7 @@ def scan_ios() -> tuple[list[tuple[str, int, str]], dict[str, list[str]]]:
                         continue
                     for lang in LANGS:
                         if not _is_translated(entry, lang):
-                            lang_gaps[lang].append(f"{catalog_path.relative_to(ROOT)} :: {literal!r}")
+                            lang_gaps[lang].append(f"{catalog_path.relative_to(ROOT).as_posix()} :: {literal!r}")
     for lang in lang_gaps:
         lang_gaps[lang] = sorted(set(lang_gaps[lang]))
     return hardcoded, lang_gaps
@@ -909,6 +911,133 @@ def extra_locale_allowance() -> dict[str, int]:
         return {}
     out: dict[str, int] = {}
     for raw in EXTRA_LOCALE_BASELINE_PATH.read_text(encoding="utf-8").splitlines():
+        line = raw.split("#", 1)[0].strip()
+        if not line:
+            continue
+        target, _, count = line.rpartition(" ")
+        out[target.strip()] = int(count)
+    return out
+
+
+ECHO_BASELINE_PATH = ROOT / "Tools/i18n_echo_baseline.txt"
+
+#: Format specifiers stripped before deciding whether a string has translatable words in it. Covers
+#: both the Apple (`%@`, `%lld`) and Android (`%1$s`, `%d`) conversion shapes.
+FORMAT_SPECIFIER_PATTERN = re.compile(r"%(?:\d+\$)?[@#0\-+ ]*[\d.]*(?:ll|l|h)?[@dfsu]|%%")
+
+
+# Multi-word product names that travel verbatim into Latin-script locales. The two-word floor below
+# already lets a ONE-word brand through ("HRV", "Strava"); it cannot see a two-word one, so "iCloud
+# Drive" repeated verbatim in German reads as an untranslated echo when it is the correct rendering.
+# Only strings that are ENTIRELY brand are exempted (see `_is_pure_brand_phrase`), so "Apple Health
+# sync" stays gated on its translatable word. CJK locales that DO translate these are unaffected —
+# they differ from the source, so they were never counted as echoes in the first place.
+BRAND_PHRASES = ("iCloud Drive",)
+
+
+def _is_pure_brand_phrase(text: str) -> bool:
+    """Whether a string is nothing but brand names, placeholders and punctuation."""
+    stripped = FORMAT_SPECIFIER_PATTERN.sub(" ", text)
+    for brand in BRAND_PHRASES:
+        stripped = stripped.replace(brand, " ")
+    return not re.search(r"[^\W\d_]{2,}", stripped, flags=re.UNICODE)
+
+
+def _has_translatable_words(text: str) -> bool:
+    """Whether a string carries enough real words that an identical translation is suspicious.
+
+    Strips format specifiers first: "%@ · n = %lld" / "%1$s: %2$s" are placeholders and punctuation
+    with nothing to translate, so a locale repeating them verbatim is CORRECT, not a gap. Two words is
+    the floor — one word is very often a term that legitimately travels ("HRV", "Yoga", a brand name).
+    A string that is entirely a multi-word brand is the same case one size up (see [BRAND_PHRASES]).
+    """
+    if _is_pure_brand_phrase(text):
+        return False
+    stripped = FORMAT_SPECIFIER_PATTERN.sub(" ", text)
+    return len(re.findall(r"[^\W\d_]{2,}", stripped, flags=re.UNICODE)) >= 2
+
+
+def _ios_echoed_counts() -> dict[str, int]:
+    """`<catalog> <lang> -> count` of xcstrings localizations marked `translated` whose value IS the
+    English key (in a String Catalog the key is the source string)."""
+    counts: dict[str, int] = {}
+    for _dirs, catalog_path in CATALOGS:
+        if not catalog_path.is_file():
+            continue
+        try:
+            cat = json.loads(catalog_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        rel = catalog_path.relative_to(ROOT).as_posix()
+        for key, entry in (cat.get("strings") or {}).items():
+            if not _has_translatable_words(key):
+                continue
+            for lang, unit in (entry.get("localizations") or {}).items():
+                if lang == "en":
+                    continue
+                su = unit.get("stringUnit") or {}
+                if su.get("state") == "translated" and su.get("value") == key:
+                    counts[f"{rel} {lang}"] = counts.get(f"{rel} {lang}", 0) + 1
+    return counts
+
+
+def _android_echoed_counts() -> dict[str, int]:
+    """Android twin of `_ios_echoed_counts`: `values-<locale>/strings.xml` entries whose value is the
+    base `values/strings.xml` value VERBATIM. Android keys are identifiers, not the source text, so the
+    echo is `locale_value == base_value` (not value == key), and the translatable-words floor is applied
+    to the BASE value (the English copy)."""
+    base_path = ROOT / "android/app/src/main/res/values/strings.xml"
+    if not base_path.is_file():
+        return {}
+    try:
+        base = {n.attrib["name"]: (n.text or "") for n in ET.parse(base_path).getroot().findall("string")}
+    except ET.ParseError:
+        return {}
+    # Only base keys with real words to translate can be a meaningful echo — precompute once.
+    translatable = {k: v for k, v in base.items() if _has_translatable_words(v)}
+    counts: dict[str, int] = {}
+    res = ROOT / "android/app/src/main/res"
+    for locale_dir in shipped_android_locale_dirs():
+        lang = locale_dir[len("values-"):]
+        path = res / locale_dir / "strings.xml"
+        try:
+            loc = {n.attrib["name"]: (n.text or "") for n in ET.parse(path).getroot().findall("string")}
+        except ET.ParseError:
+            continue
+        rel = path.relative_to(ROOT).as_posix()
+        n = sum(1 for k, base_val in translatable.items() if loc.get(k) == base_val)
+        if n:
+            counts[f"{rel} {lang}"] = n
+    return counts
+
+
+def echoed_translation_counts() -> dict[str, int]:
+    """`<catalog-or-strings.xml> <lang> -> count` of localizations that are still the English source, on
+    BOTH platforms.
+
+    The hole this closes: the coverage gate asks whether a key EXISTS in a language, never whether the
+    value differs from the source. A catalog can therefore be 100% "complete" while a German reader sees
+    English sentences — which is exactly what shipped once (a German goal card whose body read "Add a
+    daily action …").
+
+    Counts rather than a key list, for the reason `extra_locale_allowance` gives: a list goes stale on
+    every edit and trains people to regenerate it unread. NOT every hit is a missing translation — a
+    brand ("Apple Health"), a design-system label ("Headline / Semibold 17") or a term of art
+    legitimately reads the same in every language — which is why this RATCHETS against a baseline instead
+    of demanding zero: the gate's job is to stop the number GROWING, and the residue is a work list to
+    draw down by hand. iOS/xcstrings keys are disjoint from Android strings.xml paths, so the two merge
+    without collision.
+    """
+    return {**_ios_echoed_counts(), **_android_echoed_counts()}
+
+
+def echo_allowance() -> dict[str, int]:
+    """`<catalog-or-strings.xml> <lang> -> allowed echo count`, same shape and ratchet as
+    `extra_locale_allowance`."""
+    if not ECHO_BASELINE_PATH.exists():
+        return {}
+    out: dict[str, int] = {}
+    for raw in ECHO_BASELINE_PATH.read_text(encoding="utf-8").splitlines():
         line = raw.split("#", 1)[0].strip()
         if not line:
             continue
@@ -1017,7 +1146,7 @@ def ci_check(base_ref: str) -> int:
         # and gate them below. Reloading each catalog for a second pass wasted a full re-parse of a
         # 3255-string file.
         for extra in sorted(shipped_apple_langs(cat) - set(LANGS)):
-            extra_apple_gaps[f"{catalog_path.relative_to(ROOT)}:{extra}"] = sum(
+            extra_apple_gaps[f"{catalog_path.relative_to(ROOT).as_posix()}:{extra}"] = sum(
                 1 for v in cat.get("strings", {}).values()
                 if v.get("shouldTranslate") is not False and not _is_translated(v, extra)
             )
@@ -1035,6 +1164,30 @@ def ci_check(base_ref: str) -> int:
             if format_gaps:
                 failed = True
                 print(f"FAIL {catalog_path.relative_to(ROOT)} {lang}: {len(format_gaps)} format mismatch(es): {format_gaps[:10]}")
+
+    # A key that EXISTS in a language still says nothing about whether it was TRANSLATED. This section is
+    # the difference between "complete" and "translated": it counts localizations whose value is the
+    # English source verbatim, on BOTH platforms. See `echoed_translation_counts`.
+    print("\n--- Translations that are still the English source (ratcheting allowance) ---")
+    echo_failed = False
+    echoes = echoed_translation_counts()
+    echo_allowed = echo_allowance()
+    echo_improved: list[str] = []
+    for target in sorted(set(echoes) | set(echo_allowed)):
+        found = echoes.get(target, 0)
+        allowed = echo_allowed.get(target, 0)
+        if found > allowed:
+            failed = True
+            echo_failed = True
+            print(f"FAIL {target}: {found} untranslated echo(es) exceeds the allowance of {allowed}")
+        elif found < allowed:
+            echo_improved.append(f"{target}: {allowed} -> {found}")
+    for line in echo_improved:
+        print(f"  IMPROVED {line}")
+    if echo_improved:
+        print(f"  Lower these in {ECHO_BASELINE_PATH.relative_to(ROOT)} to lock the gain in.")
+    if not echo_failed and not echo_improved:
+        print(f"  OK no new English-only translations ({sum(echoes.values())} tracked, ratcheting down)")
 
     # #844: every OTHER shipped locale, gated against a ratcheting allowance. LANGS above stays at zero
     # tolerance; these carry real pre-existing debt (StrandDesign ships 14 of 95 Italian), so the gate
@@ -1101,8 +1254,16 @@ def catalog_summary() -> None:
             for v in strings.values():
                 if v.get("shouldTranslate") is False:
                     continue
-                state = (v.get("localizations", {}).get(lang) or {}).get("stringUnit", {}).get("state")
-                if state != "translated":
+                # Via `_is_translated`, NOT a bare `localizations[lang].stringUnit.state` read: a
+                # pluralised entry keeps its units under `variations.plural.<category>.stringUnit`, so the
+                # flat lookup returns None and scores a fully-translated plural as a gap. That is the exact
+                # trap `_string_units` was written for, and this summary was the one caller still falling
+                # into it — reporting de/es/fr/pt-PT missing=4 and pl missing=5 on the Strand catalog when
+                # every one of those entries was translated in every form. Worse than a wrong number: it
+                # sent a reader to re-translate strings that were already done, and it made Polish look
+                # like the worst-covered language precisely BECAUSE it correctly carries one/few/many/other
+                # where the others need only a flat unit.
+                if not _is_translated(v, lang):
                     missing += 1
             line += f"  {lang} missing={missing}"
         print(" ", line)

@@ -571,6 +571,9 @@ extension WhoopStore {
         // #423: WHOOP 5/MG raw-IMU offload capture (100 Hz 6-axis). `samples` is a packed i16 LE BLOB of
         // the six wire columns (ax…az,gx…gz). Twin of the Android `rawImuSample` table (MIGRATION_20_21);
         // same column order + PK so a `.noopbak` round-trips byte-for-byte.
+        //
+        // Historical rolling cache. Its opt-in writer retained at most 3,600 one-second rows, but no analytics,
+        // UI or export consumed them. v41 retires those legacy rows after file-backed capture replaces the cache.
         migrator.registerMigration("v28-raw-imu") { db in
             try db.create(table: "rawImuSample") { t in
                 t.column("deviceId", .text).notNull()
@@ -760,6 +763,134 @@ extension WhoopStore {
         migrator.registerMigration("v33-workout-steps") { db in
             try db.alter(table: "workout") { t in
                 t.add(column: "steps", .integer)
+            }
+        }
+        // #345 follow-up: per-session flag recording that a night was staged on SPARSE motion coverage
+        // (`SleepStager.isGravitySparse`), so the Sleep tab can honestly caption "sleep may be incomplete"
+        // when a sparse night likely under-detected (the "slept 8h, shows 1h" reports). Additive, nullable
+        // (existing rows / imported nights read null = unknown, never flagged); not part of the primary
+        // key. The v13 (`userEdited`) / v14 (`startTsAdjusted`) form. Byte-parity with Room MIGRATION_27_28.
+        migrator.registerMigration("v34-sleep-staging-sparse") { db in
+            // `.integer` (not `.boolean`) so the affinity is INTEGER on BOTH platforms — Room maps Kotlin
+            // Boolean? to INTEGER too — and this column carries no `grdb-boolean-affinity` divergence.
+            // The value is a 0/1 flag; GRDB binds/reads the Swift `Bool?` as 0/1 over an INTEGER column.
+            try db.alter(table: "sleepSession") { t in
+                t.add(column: "stagingSparse", .integer)
+            }
+        }
+        // v35 (#1073): quarantine R-R beats whose timestamp is in the FUTURE. An Oura ring's history
+        // timestamp is occasionally corrupt/misaligned and, before the OuraDriver gate was tightened to
+        // "now", converted to a date years ahead (measured on a live ring: ~1,600 beats stamped 2026→2034)
+        // and was banked — removed from the night it was measured in and queued to poison whichever future
+        // day it lands on. The ingest gate now rejects such samples, but rows already stored have to be
+        // taken out of scoring.
+        //
+        // NOT a delete: these are real heartbeats with a wrong timestamp, so — like the v32 srcChannel
+        // form — the column MARKS them and `Reads.rrIntervals` filters at READ, keeping them inspectable
+        // and recoverable if the ring-time offset is ever characterised (the migration rule warns against
+        // window-wide deletes). `strftime('%s','now')` runs once, at migration time; new rows are gated at
+        // ingest so never land future, and stay NULL. Additive nullable INTEGER, the v32 form: no table
+        // rebuild, no existing key touched, NOT in the primary key.
+        //
+        // Twin of Room MIGRATION_28_29.
+        migrator.registerMigration("v35-rr-future-quarantine") { db in
+            try db.alter(table: "rrInterval") { t in
+                t.add(column: "tsSuspect", .integer)
+            }
+            // CAST so the compare is numeric: `strftime` returns TEXT, and `ts` (INTEGER) > TEXT would
+            // otherwise lean on SQLite's affinity coercion rather than being explicit.
+            try db.execute(sql: "UPDATE rrInterval SET tsSuspect = 1 WHERE ts > CAST(strftime('%s','now') AS INTEGER)")
+        }
+        // v36 (#548): drop calibrated SpO₂ from WHOOP registry capabilities. Live NOOP never fills
+        // spo2Pct from the strap (import-only / experimental @82 candidate); advertising `spo2` made
+        // an empty Blood Oxygen tile look broken. Data-only UPDATE — no schema change. Twin of Room
+        // MIGRATION_29_30. Decode-time strip in DeviceRegistryStore is the belt; this is the suspenders.
+        migrator.registerMigration("v36-whoop-caps-no-spo2") { db in
+            let rows = try Row.fetchAll(
+                db,
+                sql: """
+                    SELECT id, capabilities FROM pairedDevice
+                    WHERE brand = 'WHOOP' OR id = 'my-whoop' OR id LIKE 'whoop-%'
+                    """
+            )
+            for row in rows {
+                let id: String = row["id"]
+                let encoded: String = row["capabilities"]
+                let stripped = WhoopLiveCapabilities.stripSpo2Token(fromEncoded: encoded)
+                if stripped != encoded && !stripped.isEmpty {
+                    try db.execute(
+                        sql: "UPDATE pairedDevice SET capabilities = ? WHERE id = ?",
+                        arguments: [stripped, id]
+                    )
+                }
+            }
+        }
+
+        // v37: persist nightly SDNN — the 5-min SDNN index (broad-variability twin of avgHrv=RMSSD),
+        // window-matched to a watch's short SDNN rather than the drift-inflated whole-night SD. Additive,
+        // nullable; computed by HRVAnalyzer.sdnnIndex during the nightly analysis.
+        //
+        // Numbered v37: upstream migrations advanced to v36 (`v36-whoop-caps-no-spo2`) while this branch
+        // was open, so this branch-local, never-shipped identifier is renumbered to the next free slot.
+        // Renumbering an unshipped identifier is free (GRDB tracks applied migrations by id, not number);
+        // renaming a SHIPPED one is not, so only this id moves.
+        migrator.registerMigration("v37-daily-avg-sdnn") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "avgSdnn", .double)
+            }
+        }
+        // v38-apple-step-hour: hourly Apple Health step counts. The daily `collect(.stepCount, …)` path
+        // in HealthKitBridge flattens a whole day to one `appleDaily.steps` total, so a dead/absent phone
+        // for part of a day (e.g. the phone died mid-hike) is invisible — steps just read low for the
+        // WHOLE day instead of showing exactly which hours had no recording. HealthKit retains hourly
+        // statistics historically, so this table lets a one-time backfill answer PAST days
+        // retroactively, not just from the day this migration ships. `ts` is the hour-BUCKET START
+        // (unix seconds), aligned to local-clock hour boundaries by the `HKStatisticsCollectionQuery`
+        // anchored at local midnight (see HealthKitBridge); `steps` is the cumulative sum within that
+        // hour. PK (deviceId, ts) mirrors every other per-sample table (hrSample, stepSample, …) and
+        // makes the hourly upsert idempotent. Additive only — a NEW table, no existing row touched, old
+        // readers unaffected.
+        migrator.registerMigration("v38-apple-step-hour") { db in
+            // ifNotExists: forks/sideloads that already carry this table under a different migration
+            // identifier converge cleanly instead of failing the migrator.
+            try db.create(table: "appleStepHour", options: [.ifNotExists]) { t in
+                t.column("deviceId", .text).notNull()   // "apple-health"
+                t.column("ts", .integer).notNull()      // hour-start unix seconds (local-hour aligned by HK)
+                t.column("steps", .integer).notNull()
+                t.primaryKey(["deviceId", "ts"])
+            }
+        }
+        // v39 (#979): keep the v26 per-burst counter beside the waveform it segments. Existing rows stay
+        // nil because the counter was discarded before this migration and cannot be reconstructed.
+        migrator.registerMigration("v39-ppg-burst-index") { db in
+            try db.alter(table: "ppgWaveformSample") { t in
+                t.add(column: "burstIndex", .integer)
+            }
+        }
+        // v40 (#1636): keep the nightly ABSOLUTE skin temperature beside the deviation derived from it.
+        // The engine computed this mean on every pass and discarded it the moment `skinTempDevC` was
+        // taken, so the app could show "+0.5 Δ°C" with no way to learn what it moved from — and a febrile
+        // night reads as a small delta where the absolute reads as a fever. Additive and nullable: old
+        // rows stay nil, and nothing reads it as a gate. Existing nights refill on the next scoring pass
+        // because the value is re-derived from raw `skinTempSample` rows that are still on disk — no
+        // separate backfill, and therefore no second implementation that could disagree with the live one.
+        migrator.registerMigration("v40-daily-skin-temp-absolute") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "skinTempC", .double)
+            }
+        }
+        // Retire the bounded, write-only legacy cache. Session-owned IMU now lives in the file-backed store.
+        migrator.registerMigration("v41-drop-raw-imu-sample") { db in
+            try db.drop(table: "rawImuSample")
+        }
+        // Whether every sleep session that day was staged from heart rate alone (#1801). The Kotlin twin
+        // is `DailyMetric.sleepHrOnly`, added by Room MIGRATION_35_36; the shared schema oracle pins the
+        // two shapes together, so this exists here even while only Android reads it — a column present on
+        // one side and absent on the other is the drift #775 tracks, and stagingSparse set the precedent
+        // for carrying a staging-quality flag on both.
+        migrator.registerMigration("v42-daily-sleep-hr-only") { db in
+            try db.alter(table: "dailyMetric") { t in
+                t.add(column: "sleepHrOnly", .boolean)
             }
         }
         return migrator

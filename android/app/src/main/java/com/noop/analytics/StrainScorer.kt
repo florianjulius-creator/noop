@@ -28,7 +28,10 @@ import kotlin.math.roundToLong
  *           (1..5 at 50/60/70/80/90 %HRR cut-offs) × duration.
  *        b. Banister exponential: sample contributes duration × x × 0.64 × e^(b·x).
  *   4. Logarithmic compression onto [0, 100]:
- *        effort = 100 × ln(TRIMP + 1) / ln(D),  D = STRAIN_DENOMINATOR.
+ *        effort = 100 × ln(TRIMP + 1) / ln(D)
+ *      D belongs to the METHOD, not to the scorer: Edwards uses [strainDenominator] (7201, from its
+ *      sex-independent 7200 ceiling), Banister its own sex-dependent ceiling + 1. See
+ *      [logMapDenominator] — reusing one for the other silently rescales the axis (#1545).
  *
  * References: Karvonen 1957 (%HRR); Edwards 1993 (5-zone TRIMP); Banister 1991
  * (exponential TRIMP, b = 1.92 men / 1.67 women); Tanaka 2001 (HRmax = 208 − 0.7×age).
@@ -69,6 +72,62 @@ object StrainScorer {
      * pure linear scaling of the whole curve).
      */
     const val strainDenominator: Double = 7201.0
+
+    /**
+     * Banister's daily ceiling: 24 h held at ΔHRR = 1.0. Unlike Edwards' 7200 this is SEX-DEPENDENT,
+     * because the exponent `b` differs — which is the whole reason [strainDenominator] cannot be reused
+     * for it. Feeding Banister TRIMP through the Edwards denominator would score every day against a
+     * ceiling ~14% (men) or ~32% (women) higher than Banister can actually reach, so nobody would ever
+     * see 100 and the two methods would not be on the same axis. (#1545)
+     */
+    fun banisterDailyCeiling(b: Double): Double = 24.0 * 60.0 * 1.0 * banisterScale * kotlin.math.exp(b)
+
+    /**
+     * The %HRR a waking, sedentary body sits at — the "cost of being alive", not training load.
+     *
+     * Banister pays at EVERY intensity by design, which is the point: it catches the intermittent work
+     * Edwards zeroes. The side effect is that sixteen waking hours of doing nothing accumulate real TRIMP,
+     * so a desk day cannot score zero however still you are — while the same day under Edwards, whose
+     * first zone starts at 50% HRR, scores exactly zero. A 24 h day held at 5% HRR scores 0 under Edwards
+     * and 45 under Banister on the shipped constants. That is not two recipes on one axis; that is two
+     * axes (#1624).
+     *
+     * THIS IS THE ONE TUNED CONSTANT here, and it is a judgement rather than a measurement: low enough not
+     * to erase genuine light activity, high enough that ordinary sitting nets to nothing. Resting HR is
+     * measured asleep, so a waking body sits above it even at complete rest — which is precisely the gap
+     * this closes. Treat it as calibratable, not as physiology.
+     */
+    const val banisterSedentaryHRR: Double = 0.10
+
+    /** TRIMP per minute at [banisterSedentaryHRR] — the rate subtracted from every day. */
+    fun banisterBaselineRatePerMinute(b: Double): Double =
+        banisterScale * banisterSedentaryHRR * kotlin.math.exp(b * banisterSedentaryHRR)
+
+    /**
+     * The sedentary TRIMP accrued over [minutes] — subtracted from a day's Banister TRIMP so the axis
+     * starts where Edwards' does.
+     *
+     * Subtracted from the DENOMINATOR too (see [logMapDenominator]), so the top of the axis is unmoved: a
+     * theoretical maximum day still maps to exactly [maxStrain]. Anchoring only the bottom would trade one
+     * mismatched end for the other.
+     */
+    fun banisterBaseline(minutes: Double, b: Double): Double = banisterBaselineRatePerMinute(b) * minutes
+
+
+    /**
+     * The log-map denominator for a method, so a caller never has to know which constant belongs to
+     * which recipe. Ceiling + 1 in both cases, mirroring how [strainDenominator] was derived, so a
+     * theoretical maximum day maps to exactly [maxStrain] under either method.
+     */
+    fun logMapDenominator(method: Method, sex: String): Double = when (method) {
+        Method.EDWARDS -> strainDenominator
+        Method.BANISTER -> {
+            val b = if (sex.lowercase().startsWith("f")) banisterBWomen else banisterBMen
+            // Ceiling MINUS a full day of sedentary baseline, matching what is subtracted from the day
+            // itself, so both ends of the axis line up with Edwards (#1624).
+            banisterDailyCeiling(b) - banisterBaseline(24.0 * 60.0, b) + 1.0
+        }
+    }
     val lnStrainDenominator: Double get() = ln(strainDenominator)
 
     /** Fallback per-sample duration (minutes) — 1 s at 1 Hz. */
@@ -191,6 +250,7 @@ object StrainScorer {
     fun effectiveEffort(live: Double?, stored: Double?): Double? {
         if (live == null) return stored
         if (stored == null) return live
+        if (live == 0.0 && stored == 0.0) return 0.0
         return kotlin.math.max(live, stored)
     }
 
@@ -254,11 +314,24 @@ object StrainScorer {
         hrReserve: Double,
         durations: List<Double>,
         b: Double,
+        /** Per-minute rate treated as "no effort" and subtracted from EVERY sample, floored at zero
+         *  (#1624). Zero — the default — is the original, unfloored Banister recipe, so every existing
+         *  caller and test is byte-identical. Pass [banisterBaselineRatePerMinute] to score the excess
+         *  over a sedentary day, which is what the daily scorer does.
+         *
+         *  Per SAMPLE, never as one lump off the total: a day quieter than the floor would otherwise run
+         *  a deficit that eats into real work done on top, and 90 minutes at 35% HRR inside an otherwise
+         *  still day would net negative and clamp to zero — erasing exactly the intermittent effort this
+         *  recipe exists to capture. */
+        floorRatePerMinute: Double = 0.0,
     ): Double {
         var acc = 0.0
         for (i in hr.indices) {
             val x = pctHRR(hr[i].bpm.toDouble(), restingHR, hrReserve) / 100.0
-            if (x > 0) acc += durations[i] * x * banisterScale * exp(b * x)
+            if (x > 0) {
+                val rate = x * banisterScale * exp(b * x)
+                acc += durations[i] * (rate - floorRatePerMinute).coerceAtLeast(0.0)
+            }
         }
         return acc
     }
@@ -268,6 +341,10 @@ object StrainScorer {
     /**
      * Map accumulated TRIMP onto [0, 100] via 100 × ln(TRIMP+1) / ln(D), 2 dp.
      * TRIMP ≤ 0 → 0.
+     *
+     * The default D is **Edwards'**. A Banister TRIMP passed here without an explicit denominator is
+     * scored against the wrong ceiling and reads low — prefer [strain], which resolves the method's own
+     * denominator, or pass [logMapDenominator] yourself. (#1545)
      */
     fun trimpToStrain(trimp: Double, denominator: Double = strainDenominator): Double {
         if (trimp <= 0) return 0.0
@@ -297,6 +374,38 @@ object StrainScorer {
         return exp(maxStrain * sumXX / sumXY)
     }
 
+    /**
+     * One line naming what an Effort score was computed FROM, or why it could not be computed.
+     *
+     * The gap this closes: [strain] is the only score in the app with no trace at all. WorkoutDetector,
+     * SleepStager and both engines each emit a funnel; the number on the Today hero ring emitted nothing,
+     * so a log could not distinguish "measured, and the day was genuinely calm" from "could not measure".
+     * A reader looking for the latter finds `effort detect`, which is WORKOUT-BOUT detection and answers a
+     * different question — a confusion that has already produced one wrong diagnosis.
+     *
+     * `enough` is the [strain] gate spelled out: dense (>= minReadings) OR sparse-but-sustained. `trimp`
+     * and `strain` are absent when the gate refused, which is exactly the case a bare 0 hides.
+     */
+    fun scoreFunnelLine(
+        day: String,
+        hrSamples: Int,
+        enough: Boolean,
+        maxHR: Double,
+        maxHRProvided: Boolean,
+        restingHR: Double,
+        method: Method,
+        trimp: Double?,
+        strain: Double?,
+    ): String =
+        "effort score day=$day hr=$hrSamples enough=$enough" +
+            " hrMax=${round1(maxHR)}(${if (maxHRProvided) "provided" else "default"})" +
+            " rhr=${round1(restingHR)} reserve=${round1(maxHR - restingHR)}" +
+            " method=${method.name.lowercase()}" +
+            " trimp=${trimp?.let { round1(it) } ?: "n/a"} strain=${strain?.let { round1(it) } ?: "n/a"}"
+
+    /** One decimal, locale-independent, so two platforms' lines compare byte for byte. */
+    private fun round1(v: Double): String = String.format(java.util.Locale.US, "%.1f", v)
+
     // ---- Public API ----
 
     /**
@@ -319,8 +428,16 @@ object StrainScorer {
         restingHR: Double = defaultRestingHR,
         method: Method = Method.EDWARDS,
         sex: String = "male",
-        denominator: Double = strainDenominator,
+        // null (the default) resolves to the denominator that BELONGS to [method] — Edwards' 7201, or
+        // Banister's sex-dependent ceiling. Pass a value only to override.
+        denominator: Double? = null,
+        // Optional diagnostic sink. Null by default and the line is built ONLY when one is supplied, so a
+        // scoring pass that nobody is watching pays nothing — which matters because a pass re-scores many
+        // days. Callers hand this in for the day worth explaining, not for all of them.
+        diag: ((String) -> Unit)? = null,
+        day: String = "",
     ): Double? {
+        val resolvedDenominator = denominator ?: logMapDenominator(method, sex)
         val effMax = maxHR ?: defaultMaxHR().toDouble()
         // Enough data to trust the score: a dense stream (≥ minReadings) OR a sparse-but-sustained
         // one spanning ≥ minSpanSeconds with a sample floor (#482 — the 5/MG's ~30 s HR cadence).
@@ -332,7 +449,15 @@ object StrainScorer {
             }
             else -> false
         }
-        if (!enoughData || effMax <= restingHR) return null
+        if (!enoughData || effMax <= restingHR) {
+            // The refusal is the half a bare number cannot show: null here and 0.0 on a calm day look
+            // identical on the ring, and only one of them is a measurement.
+            diag?.let {
+                it(scoreFunnelLine(day, hr.size, enoughData, effMax, maxHR != null, restingHR, method,
+                                   trimp = null, strain = null))
+            }
+            return null
+        }
 
         val durations = sampleDurationsMinutes(hr)
         val hrReserve = effMax - restingHR
@@ -340,12 +465,20 @@ object StrainScorer {
         val trimp: Double = when (method) {
             Method.BANISTER -> {
                 val b = if (sex.lowercase().startsWith("f")) banisterBWomen else banisterBMen
-                banisterTRIMP(hr, restingHR, hrReserve, durations, b)
+                // Excess over the sedentary baseline for the SAME span, floored at zero. Without this a
+                // desk day scores ~45 on a 0-100 axis whose bottom is supposed to be no exertion (#1624).
+                banisterTRIMP(hr, restingHR, hrReserve, durations, b,
+                    floorRatePerMinute = banisterBaselineRatePerMinute(b))
             }
             Method.EDWARDS -> {
                 edwardsTRIMP(hr, restingHR, hrReserve, durations)
             }
         }
-        return trimpToStrain(trimp, denominator)
+        val scored = trimpToStrain(trimp, resolvedDenominator)
+        diag?.let {
+            it(scoreFunnelLine(day, hr.size, enoughData, effMax, maxHR != null, restingHR, method,
+                               trimp = trimp, strain = scored))
+        }
+        return scored
     }
 }

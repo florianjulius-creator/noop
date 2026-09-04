@@ -1,5 +1,26 @@
 package com.noop.protocol
 
+/** Sensor-contact state carried by the standard BLE Heart Rate Measurement flags. */
+enum class StandardHrContact(val storageValue: String) {
+    UNSUPPORTED("unsupported"),
+    SUPPORTED_NOT_DETECTED("supported_not_detected"),
+    SUPPORTED_DETECTED("supported_detected"),
+
+    ;
+
+    companion object {
+        fun fromMeasurementFlags(flags: Int): StandardHrContact = when {
+            flags and 0x04 == 0 -> UNSUPPORTED
+            flags and 0x02 == 0 -> SUPPORTED_NOT_DETECTED
+            else -> SUPPORTED_DETECTED
+        }
+
+        fun fromStorageValue(value: String): StandardHrContact? = entries.firstOrNull {
+            it.storageValue == value
+        }
+    }
+}
+
 /**
  * Decoded stream rows — the durable, compact local record produced from parsed frames.
  *
@@ -98,6 +119,20 @@ data class Spo2Sample(val ts: Int, val red: Int, val ir: Int, val unit: String =
  * this carrier-level tag plus this comment document the convention until a migration adds one.)
  */
 data class SkinTempSample(val ts: Int, val raw: Int, val unit: String = "raw_adc")
+
+/**
+ * A respiration sample at wall-clock unix seconds [ts]. Mirrors the Room `RespSample` and the Swift
+ * `RespSample(ts:raw:unit:)` shape.
+ *
+ * UNIT CONVENTION, and it is not one convention: [raw] is a WHOOP 4.0's raw respiration ADC WAVEFORM
+ * sample (`resp_rate_raw@47`, ~1 Hz, `raw_adc`) — the signal the stager runs a peak detector over — OR,
+ * for an Oura ring, that ring's own already-computed per-window RATE in MILLI-breaths-per-minute
+ * (`0x6A breath`, one value per ~296 s, `milli_bpm`). Two physical quantities in one table, told apart
+ * by the row's OWNER: `com.noop.data.OuraRespScale` is the single place that conversion and the
+ * accompanying scoring refusal live. [unit] carries the scale tag for fidelity; as with SkinTempSample
+ * the Room entity has no unit column, so the deviceId is the durable discriminator.
+ */
+data class RespSample(val ts: Int, val raw: Int, val unit: String = "raw_adc")
 
 /**
  * WHOOP 4.0 (v24) skin-temp mapping constants (#938). The single provisional slope + anchor live in ONE
@@ -246,6 +281,11 @@ data class Streams(
     // unchanged; only a source that decodes these biometric signals live (the Oura ring) populates them.
     val spo2: MutableList<Spo2Sample> = mutableListOf(),
     val skinTemp: MutableList<SkinTempSample> = mutableListOf(),
+    // Same reasoning as spo2/skinTemp above: empty for every WHOOP live batch (a WHOOP's respiration
+    // rows arrive on the historical-offload path, which builds a StreamBatch directly), populated only
+    // by a live source that decodes a respiration value itself — today the Oura ring's 0x6A `breath`
+    // (see `OuraStreamMapping`, and `OuraRespScale` for the scale it is stored at).
+    val resp: MutableList<RespSample> = mutableListOf(),
 ) {
     companion object {
         val EMPTY: Streams get() = Streams()
@@ -326,6 +366,19 @@ internal fun appendBattery(out: Streams, ts: Int, p: Map<String, Any?>) {
 internal fun Map<String, Any?>.intOrNull(key: String): Int? = when (val v = this[key]) {
     is Int -> v
     is Long -> v.toInt()
+    else -> null
+}
+
+/**
+ * Read a parsed-map value in the LONG (unsigned-u32-safe) domain. Use this, never [intOrNull], for a
+ * field the decoder read with an unsigned u32 reader: [intOrNull]'s `is Long -> v.toInt()` branch
+ * narrows to Kotlin's 32-bit Int, which sends any value with bit 31 set negative and re-opens the
+ * cross-platform split against Swift's 64-bit Int. Swift needs no analogue — its `intValue` is
+ * already 64-bit, which is exactly why the divergence is Android-only.
+ */
+internal fun Map<String, Any?>.longOrNull(key: String): Long? = when (val v = this[key]) {
+    is Long -> v
+    is Int -> v.toLong()
     else -> null
 }
 

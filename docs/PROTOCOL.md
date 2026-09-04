@@ -424,6 +424,12 @@ public func frame(seq: UInt8, payload: [UInt8] = [0x00]) -> [UInt8] {
 | 122 | `STOP_HAPTICS` | `[0x00]` | stop an in-progress haptic |
 | 123 | `SELECT_WRIST` | — | set strap wrist |
 
+**5/MG raw-IMU sequence (hardware-verified):** command 106 accepting a write does not mean that the
+producer started. A bounded capture first sends `START_RAW_DATA` (81) `[0x01]`, then command 106 with
+the two-byte selector `[0x01, 0x01]`. Stop uses `STOP_RAW_DATA` (82) `[0x01]`, then command 106
+`[0x01, 0x00]`. The one-byte payload in the table remains the WHOOP 4 form. See
+[5/MG raw data capture](RAW_DATA_CAPTURE.md) for storage, history repair, and export semantics.
+
 **Payload builders** in `WhoopCommand`:
 
 - `setAlarmPayload(epochSec:)` → `[0x01] + epoch u32 LE + [0x00, 0x00]` (7 bytes).
@@ -459,9 +465,19 @@ mapping as unconfirmed — the 5/MG is known to remap opcodes into the high spac
 at 145/146/147 there versus 10/11 on a 4.0), so a code that is accepted is not evidence that it means
 what the name says.
 
-What is confirmed: on a real WHOOP 5 MG (`WS50_r03`), 124, 125 and 139 are all **accepted** — each
-answers `COMMAND_RESPONSE` with result `SUCCESS(1)` — and no ECG-shaped data followed in a 30-second
-window. That is a null result with several live explanations (an open electrode circuit, flash rather
+The turn-on ORDER and the 124 argument are attested on one device. On a WHOOP MG (`WS50_r00`, fw
+`50.39.1.0`), 139 gates the **stream**: with it off nothing arrives, so the working sequence is
+**`139 = 1` then `124 = 2`**, after which type-43 carries a ~100 Hz single-channel i16 waveform,
+present only while both clasp electrodes are held. 139 does not appear to gate the front end itself —
+with 139 closed, `124 = 2` still made the strap's own `CONSOLE_LOGS` report `MAX86176: Set ECG ON`
+while no packets arrived (eight sends, eight console lines, correlated on the strap's own uptime;
+#891). Both directions are reversible (`124 = 1` or `139 = 0` stop the stream, both `SUCCESS`);
+disconnecting also clears it. One device, one firmware — see the ⚠️ on `ControlSignal`.
+
+What is confirmed on the other device: on a real WHOOP 5 MG (`WS50_r03`), 124, 125 and 139 are all
+**accepted** — each answers `COMMAND_RESPONSE` with result `SUCCESS(1)` — and no ECG-shaped data
+followed in a 30-second window. Those runs used `124 = 1` as their start verb, which under the mapping
+above stops generation. That is a null result with several live explanations (an open electrode circuit, flash rather
 than a realtime channel, a wrong opcode mapping, no start verb, a flag block, an entitlement gate); see
 #891. The three reply frames are pinned as decode fixtures in `Whoop5CommandResponseTests` /
 `CommandCatalogueTest`.
@@ -551,10 +567,21 @@ the same `pay[2]` record start `GET_BATTERY_LEVEL` and `GET_CLOCK` already decod
 | 117 `START_FF_KEY_EXCHANGE` | `revision u8` · `numberOfFeatureFlags u16 LE` · padding |
 | 118 `SEND_NEXT_FF` | `revision u8` · `index u8` · `validKey u8` · `key` (ASCII, NUL-terminated) · padding |
 
-The walk stops on the strap's own end marker (`validKey = 0`, or `index = 0xFF`), on the announced count,
-or on a hard cap of 128 replies — and each 118 is only sent after the previous reply lands. Both CRCs are
-verified before any field is read; a failed CRC, a non-COMMAND_RESPONSE type, or a short record ends the
-walk with a named reason instead of a decode. Driven by `BLEManager.probeFeatureFlags()` /
+**The two terminator conditions are not interchangeable, and are separated deliberately.** The walk stops
+on `index = 0xFF` — the one end marker a strap has served here unambiguously. `validKey = 0` on its own
+does NOT stop it: that could equally mark an EMPTY or RETIRED SLOT with the list continuing past it, and
+the record layout above is derived from a WHOOP 4.0 and **unverified on 5/MG**. Neither reading is
+established, because on the walks this project has, the two have never been separated on the wire: the
+117/118 walk on a WS50_r03 served sixteen replies that were all `validKey = 1` with no `0xFF` at all,
+and its 115/116 walk ended on a single reply carrying `index = 255` **and** `validKey = 0` together. So a
+`validKey = 0` entry is recorded, stepped over, and the next record verb is sent again — what comes back
+separates the two readings, and the report states which it observed. Past that the bounds are all
+CLIENT-side and each names itself in the report's `Stop code:` line: 8 consecutive `validKey = 0` replies,
+a repeated index during such a run (a parked cursor — evidence for the terminator reading), the announced
+count plus 4, or a hard cap of 128 replies. Each next-record request is only sent after the previous reply
+lands. Both CRCs are verified before any field is read; a failed CRC, a non-COMMAND_RESPONSE type, or a
+short record ends the walk with a named reason instead of a decode, and the RAW record bytes of every
+reply are logged beside the fields decoded from them. Driven by `BLEManager.probeFeatureFlags()` /
 `WhoopBleClient.probeFeatureFlags()` (user-triggered, Test Centre → Connection, both families) and
 allowlisted for 5/MG framing **only while a probe is in flight**; parsed + rendered by the pure
 `FeatureFlagProbe` / `FeatureFlagProbeReport` twins (Swift↔Kotlin byte-parity, unit-tested on synthetic
@@ -802,7 +829,7 @@ Three reasons the numbers are **not** settled, all of which the on-hardware prob
 | Code | Command | Arg | Reversible? |
 |-----:|---------|-----|---|
 | 123 (0x7B) | `SELECT_WRIST` | `0` right / `1` left — **inferred from enum order, unconfirmed** | **Persistent device config** — survives disconnect; re-writable |
-| 124 (0x7C) | `TOGGLE_LABRADOR_DATA_GENERATION` | `0` stop / `1` start / `2` restart | yes — `stop` is the OFF path |
+| 124 (0x7C) | `TOGGLE_LABRADOR_DATA_GENERATION` | `1` stop / `2` start — `0` is REFUSED (`FAILURE(0)`, generation unchanged). Attested on one MG (`WS50_r00`, fw `50.39.1.0`); the earlier `0`/`1`/`2` reading came from the client's enum order | yes — `124 = 1` is the OFF path, and `139 = 0` also stops it |
 | 125 (0x7D) | `TOGGLE_LABRADOR_RAW_SAVE` | `0`/`1` | yes |
 | 139 (0x8B) | `TOGGLE_LABRADOR_FILTERED` | `0`/`1` | yes |
 

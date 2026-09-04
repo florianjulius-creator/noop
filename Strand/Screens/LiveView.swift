@@ -137,7 +137,7 @@ struct LiveView: View {
         }
         // Pick a named sport before starting (#519) — the live workout view then opens
         // off the activeWorkout change above, so no extra navigation is needed here.
-        .sheet(isPresented: $showStartSport) {
+        .workoutSelectionCover(isPresented: $showStartSport) {
             StartWorkoutSheet { name in model.startWorkout(sport: name) }
         }
         // Manual HRV snapshot (#127) — a still, seated 60s R-R reading.
@@ -165,13 +165,7 @@ struct LiveView: View {
         content()
             .padding(16)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .background(
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(StrandPalette.surfaceRaised)
-                    .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
-                        .strokeBorder(StrandPalette.hairline, lineWidth: 1))
-                    .opacity(cardOpacity)
-            )
+            .background(NoopPanelSurface(cornerRadius: 22, surfaceOpacity: cardOpacity))
     }
 
     // MARK: - Console header
@@ -367,28 +361,44 @@ struct LiveView: View {
             VStack(alignment: .leading, spacing: 12) {
                 HStack(spacing: 8) {
                     Circle().fill(StrandPalette.metricRose).frame(width: 8, height: 8)
-                    Text("RECORDING WORKOUT").font(StrandFont.overline)
-                        .tracking(StrandFont.overlineTracking).foregroundStyle(StrandPalette.metricRose)
+                    // "RECORDING" is a factual claim, and while paused nothing IS being recorded — the
+                    // sample capture drops every reading. So the label swaps rather than gaining a tag
+                    // beside it, which would leave the card asserting both at once. Reuses the "Paused"
+                    // string #1533 already localized. (The Today card says "IN PROGRESS", which stays
+                    // true while paused, so it keeps its label and takes the tag instead.)
+                    Text(w.isPaused ? "Paused" : "RECORDING WORKOUT").font(StrandFont.overline)
+                        .tracking(StrandFont.overlineTracking)
+                        .foregroundStyle(w.isPaused ? StrandPalette.textSecondary : StrandPalette.metricRose)
                     Spacer()
                     // Re-render once a second so the elapsed clock ticks without a manual Timer.
-                    TimelineView(.periodic(from: .now, by: 1)) { _ in
-                        Text(Self.elapsed(since: w.start)).font(StrandFont.number(17)).monospacedDigit()
+                    TimelineView(.periodic(from: .now, by: 1)) { context in
+                        Text(ActiveWorkoutClock.clock(Int(w.elapsed(at: context.date))))
+                            .font(StrandFont.number(17)).monospacedDigit()
                             .foregroundStyle(StrandPalette.textPrimary)
                     }
                 }
                 // Live HR / avg / peak / effort — the leaf owns LiveState + the active workout so the
                 // 1 Hz stat refresh re-renders only these tiles, plus a liquid effort tube under them.
                 ActiveWorkoutLive(workout: w, effortScale: effortScale)
+                // The card used to offer End and nothing else, so the only IRREVERSIBLE control was the
+                // one reachable without opening the live view, while Pause — the reversible one — was
+                // not. Pause/Resume is one toggle (a paused session has exactly one sensible action), and
+                // End moves to its own row so a destructive tap is not adjacent to a routine one.
                 HStack(spacing: NoopMetrics.rowSpacing) {
+                    NoopButton(w.isPaused ? "Resume" : "Pause",
+                               systemImage: w.isPaused ? "play.fill" : "pause.fill",
+                               kind: .secondary, fullWidth: true) {
+                        model.toggleWorkoutPause()
+                    }
                     // Re-open the full live workout screen (#238) after it's been dismissed.
                     NoopButton("Open live view", systemImage: "rectangle.expand.vertical",
                                kind: .secondary, fullWidth: true) {
                         showLiveWorkout = true
                     }
-                    NoopButton("End workout", systemImage: "stop.circle.fill",
-                               kind: .destructive, fullWidth: true) {
-                        confirmingEndWorkout = true
-                    }
+                }
+                NoopButton("End workout", systemImage: "stop.circle.fill",
+                           kind: .destructive, fullWidth: true) {
+                    confirmingEndWorkout = true
                 }
             }
         }
@@ -407,11 +417,6 @@ struct LiveView: View {
         .padding(.horizontal, 4)
     }
 
-    private static func elapsed(since start: Date) -> String {
-        let s = max(0, Int(Date().timeIntervalSince(start)))
-        return String(format: "%d:%02d", s / 60, s % 60)
-    }
-
     private func reconnectGuideBanner(_ guide: String) -> some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -427,7 +432,7 @@ struct LiveView: View {
             Spacer(minLength: 0)
         }
         .padding(NoopMetrics.space3)
-        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(NoopPanelSurface(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
             .strokeBorder(StrandPalette.statusWarning.opacity(0.5), lineWidth: 1))
         .accessibilityElement(children: .combine)
@@ -449,7 +454,7 @@ struct LiveView: View {
             Spacer(minLength: 0)
         }
         .padding(NoopMetrics.space3)
-        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(NoopPanelSurface(cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
             .strokeBorder(StrandPalette.statusWarning.opacity(0.5), lineWidth: 1))
         .accessibilityElement(children: .combine)
@@ -486,7 +491,7 @@ struct LiveView: View {
             Spacer(minLength: 0)
         }
         .padding(NoopMetrics.space3)
-        .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .background(NoopPanelSurface(tint: StrandPalette.accent, cornerRadius: 18))
         .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
             .strokeBorder(StrandPalette.accent.opacity(0.4), lineWidth: 1))
         .accessibilityElement(children: .combine)
@@ -598,9 +603,7 @@ struct LiveView: View {
                     .accessibilityHidden(true)
             }
             .padding(NoopMetrics.space3)
-            .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous)
-                .strokeBorder(StrandPalette.hairline, lineWidth: 1))
+            .background(NoopPanelSurface(cornerRadius: 18))
             .contentShape(Rectangle())
         }
         .buttonStyle(LiquidPressStyle())
@@ -765,7 +768,7 @@ private struct LiveHeartReadout: View {
     /// The live HR zone for the focal readout's colour world (presentation only). 0 = below Zone 1.
     private var liveZone: Int {
         guard let bpm = displayHR else { return 0 }
-        return HRZones.zones(maxHR: Double(hrMax)).zoneNumber(forBPM: Double(bpm))
+        return model.profile.hrZoneSet.zoneNumber(forBPM: Double(bpm))
     }
 
     /// The focal vessel / numeral colour: the live HR-zone hue when streaming, the Effort world otherwise.
@@ -942,9 +945,7 @@ private struct LivePhysiology: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(NoopMetrics.rowSpacing)
-        .background(StrandPalette.surfaceInset, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 14, style: .continuous)
-            .strokeBorder(StrandPalette.hairline, lineWidth: 1))
+        .background(NoopPanelSurface(cornerRadius: 14))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(label): \(value)")
     }
@@ -1148,6 +1149,9 @@ private struct LiveLogCard: View {
                         }
                     }
                 }
+                #if os(iOS)
+                .scrollBounceBehavior(.basedOnSize, axes: .horizontal)
+                #endif
                 .frame(height: 200)
                 .onChangeCompat(of: live.log.count) { _ in
                     if let last = live.log.indices.last { proxy.scrollTo(last, anchor: .bottom) }
@@ -1172,13 +1176,7 @@ private struct LiveLogCard: View {
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 22, style: .continuous)
-                .fill(StrandPalette.surfaceRaised)
-                .overlay(RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .strokeBorder(StrandPalette.hairline, lineWidth: 1))
-                .opacity(cardOpacity)
-        )
+        .background(NoopPanelSurface(cornerRadius: 22, surfaceOpacity: cardOpacity))
     }
 
     // MARK: - Strap-log export (issue #17 — let macOS users share the log for bug reports)
@@ -1259,13 +1257,7 @@ private struct SignalTrustTile: View {
         .padding(14)
         .frame(minHeight: 112, alignment: .top)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(
-            RoundedRectangle(cornerRadius: 20, style: .continuous)
-                .fill(StrandPalette.surfaceRaised)
-                .overlay(RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .strokeBorder(StrandPalette.hairline, lineWidth: 1))
-                .opacity(cardOpacity)
-        )
+        .background(NoopPanelSurface(cornerRadius: 20, surfaceOpacity: cardOpacity))
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(tile.title): \(tile.value). \(tile.detail)")
     }

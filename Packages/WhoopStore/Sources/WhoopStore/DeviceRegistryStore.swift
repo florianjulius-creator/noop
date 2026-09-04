@@ -48,6 +48,20 @@ public struct DeviceRegistryStore: Sendable {
         }
     }
 
+    /// Permanently remove a device's REGISTRY entry — both the `pairedDevice` row the Devices screen
+    /// lists and its `device` provenance row — so a duplicate/stale strap can be purged entirely
+    /// instead of lingering in the archived "Removed" list forever (issue #1193: today the only
+    /// removal is the soft `archive`, and `deleteAllData` empties recordings but leaves the row). The
+    /// device's recorded SAMPLES are NOT touched here — the caller wipes those first via
+    /// `deleteAllData(deviceId:)` (registry entry vs. recordings are separate ops, exactly as
+    /// `adoptSerialIdentity` treats them). Idempotent: removing an absent id is a no-op.
+    public func remove(_ id: String) throws {
+        try dbQueue.write { db in
+            try db.execute(sql: "DELETE FROM pairedDevice WHERE id = ?", arguments: [id])
+            try db.execute(sql: "DELETE FROM device WHERE id = ?", arguments: [id])
+        }
+    }
+
     public func rename(_ id: String, nickname: String?) throws {
         try dbQueue.write { db in
             try db.execute(sql: "UPDATE pairedDevice SET nickname = ? WHERE id = ?", arguments: [nickname, id])
@@ -59,6 +73,20 @@ public struct DeviceRegistryStore: Sendable {
     public func setModel(_ id: String, model: String) throws {
         try dbQueue.write { db in
             try db.execute(sql: "UPDATE pairedDevice SET model = ? WHERE id = ?", arguments: [model, id])
+        }
+    }
+
+    /// Stamp a row as seen right now. Called when a strap actually connects or drops, because nothing
+    /// else in the BLE path writes `lastSeenAt` — before #1527 it was only ever set when the row was
+    /// created or promoted to active, so the Devices card reported time-since-ADDED and a strap syncing
+    /// every day could read "Last seen 45 d ago".
+    ///
+    /// Archived rows are excluded: "Removed - data kept" is a deliberate resting state, and a stray
+    /// connect must not quietly resurrect one into looking live.
+    public func touchLastSeen(_ id: String, at ts: Int) throws {
+        try dbQueue.write { db in
+            try db.execute(sql: "UPDATE pairedDevice SET lastSeenAt = ? WHERE id = ? AND status != 'archived'",
+                           arguments: [ts, id])
         }
     }
 
@@ -79,6 +107,11 @@ public struct DeviceRegistryStore: Sendable {
                              arguments: [peripheralId]).map(Self.decode)
         }
     }
+
+    /// Suffix of the COMPUTED sibling every device id owns — the engine writes its derived days, detected
+    /// workouts and metric series under `<deviceId>-noop`. Spelled here so the adoption can carry it with
+    /// the pairing; the Kotlin twin is `WhoopRepository.computedDeviceId`.
+    public static let computedSuffix = "-noop"
 
     /// Every table whose rows are keyed by `deviceId` (the per-device sample/derived tables). This is
     /// the authoritative list `deleteAllData` clears — kept in sync with the `deviceId`-keyed tables in
@@ -106,10 +139,13 @@ public struct DeviceRegistryStore: Sendable {
         "ppgWaveformSample",
         // v28-raw-imu (#423): the opt-in 5/MG raw-IMU offload capture is deviceId-keyed too — "delete all
         // of this device's data" must clear it, or the raw inertial samples survive deletion (same defect).
-        "rawImuSample",
         // v31-deep-capture-channels: the banked 5/MG v18 auxiliary fields are deviceId-keyed per-second
         // rows like every stream above, so a "delete all of this device's data" must clear them too.
         "v18AuxSample",
+        // v38-apple-step-hour: the hourly Apple Health step buckets are deviceId-keyed ("apple-health"),
+        // so forgetting that source must clear them — otherwise an imported phone's hour-by-hour step
+        // history survives the delete (the same privacy defect this list exists to close).
+        "appleStepHour",
     ]
 
     /// Permanently delete every recorded sample/derived row belonging to one device, across all
@@ -167,9 +203,19 @@ public struct DeviceRegistryStore: Sendable {
                 """, arguments: [serialId, activeId])
             }
             // Move the active id's recordings onto the serial id (canonical wins a PK clash), then clear it.
-            for table in Self.deviceScopedTables {
-                try db.execute(sql: "UPDATE OR IGNORE \(table) SET deviceId = ? WHERE deviceId = ?", arguments: [serialId, activeId])
-                try db.execute(sql: "DELETE FROM \(table) WHERE deviceId = ?", arguments: [activeId])
+            //
+            // BOTH id shapes, not just the pairing's own. Every strap also owns a COMPUTED sibling keyed
+            // `<deviceId>-noop` — the scored days, detected workouts and metric series the engine derives
+            // — and that id is never equal to `activeId`, so an exact-match re-key silently left it behind.
+            // The next scoring pass then writes under `<serialId>-noop`, stranding the old computed
+            // history under an id nothing reads again: the orphaned-history failure this adoption exists
+            // to PREVENT, displaced onto the computed half. The ring path never hit it because a ring has
+            // no computed sibling to strand, which is why the shipped migration looked proven.
+            for (from, to) in [(activeId, serialId), (activeId + Self.computedSuffix, serialId + Self.computedSuffix)] {
+                for table in Self.deviceScopedTables {
+                    try db.execute(sql: "UPDATE OR IGNORE \(table) SET deviceId = ? WHERE deviceId = ?", arguments: [to, from])
+                    try db.execute(sql: "DELETE FROM \(table) WHERE deviceId = ?", arguments: [from])
+                }
             }
             // Drop ONLY the provisional CB-UUID registry rows; other oura-* pairings are left as-is.
             try db.execute(sql: "DELETE FROM pairedDevice WHERE id = ?", arguments: [activeId])
@@ -212,11 +258,34 @@ public struct DeviceRegistryStore: Sendable {
     }
 
     private static func decode(_ row: Row) -> PairedDevice {
-        let caps = (row["capabilities"] as String).split(separator: ",").compactMap { Metric(rawValue: String($0)) }
-        return PairedDevice(id: row["id"], brand: row["brand"], model: row["model"], nickname: row["nickname"],
+        // #1518: TRIM before matching. `Metric(rawValue:)` is exact, so a stored `"hr, hrv"` decoded to
+        // `{hr}` — the whitespace-bearing token simply failed to parse and `compactMap` dropped it, losing
+        // a real capability with nothing reporting it. Writes here are always canonical
+        // (`map(\.rawValue).sorted().joined`), so a spaced token can only arrive from history: rows the
+        // v36 migration rewrote before #1495 taught it to trim, or a restored backup.
+        //
+        // Fixing it on READ rather than with another migration is deliberate. A migration repairs the rows
+        // that exist when it runs, once; trimming here self-heals every row every time it is read, including
+        // any that arrive later from a restore. Kotlin never needed this — it keeps `capabilities` as a
+        // String and normalises it at the registry layer, so it has no typed decode to lose anything in.
+        var caps = Set(
+            (row["capabilities"] as String)
+                .split(separator: ",")
+                .compactMap { Metric(rawValue: $0.trimmingCharacters(in: .whitespacesAndNewlines)) }
+        )
+        // #548: calibrated SpO₂ % is never produced from a live WHOOP path — drop a stale registry bit
+        // so Devices / day-owner UI never advertise a capability AnalyticsEngine will not fill.
+        let brand = row["brand"] as String
+        let id = row["id"] as String
+        if brand.caseInsensitiveCompare("WHOOP") == .orderedSame
+            || id == "my-whoop"
+            || id.hasPrefix("whoop-") {
+            caps = WhoopLiveCapabilities.withoutCalibratedSpo2(caps)
+        }
+        return PairedDevice(id: id, brand: brand, model: row["model"], nickname: row["nickname"],
                             peripheralId: row["peripheralId"],
                             sourceKind: SourceKind(rawValue: row["sourceKind"]) ?? .liveBLE,
-                            capabilities: Set(caps), status: DeviceStatus(rawValue: row["status"]) ?? .paired,
+                            capabilities: caps, status: DeviceStatus(rawValue: row["status"]) ?? .paired,
                             addedAt: row["addedAt"], lastSeenAt: row["lastSeenAt"])
     }
 }

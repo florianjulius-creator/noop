@@ -22,11 +22,19 @@ import OuraProtocol
 /// missing stream stays empty here, never faked (Huami precedent).
 ///
 /// Tier-B (UNVERIFIED) events are dropped: only Tier-A decoded signals map into `Streams`, so an
-/// unverified summary can never silently feed scoring.
+/// unverified summary can never silently feed scoring. ONE exception, and it is explicit rather than
+/// silent: `.sleepPeriodInfo`'s `breath` field maps to `resp` (see the case below). That value is the
+/// RING's own measurement, not something NOOP derives, so keeping it is a decode question rather than a
+/// method question — but it is kept OUT of the sleep stager at the read (`OuraRespScale.forScoring`)
+/// rather than out of the database, because the stager reads this stream as a 1 Hz raw ADC waveform and
+/// a per-window rate is the wrong SHAPE for it, however good the rate is.
 public enum OuraStreamMapping {
-    /// WhoopEvent.kind for the ring's own HRV 0x5D tag. The payload carries the RAW decoded fields
-    /// (`time_ms`/`b1`/`b2`) only, never a fabricated `rmssd_ms` (the b1/b2 byte -> ms scale is not
-    /// Tier-A; see OURA_PROTOCOL.md s6.9). Must match the Kotlin twin (OuraStreamMapping.kt) exactly.
+    /// WhoopEvent.kind for the ring's own HRV 0x5D tag. The payload carries the honestly-labelled decoded
+    /// fields `pair_index` / `hr_bpm` / `rmssd_ms` — the 0x5D body is a run of `(u8 avg HR bpm, u8 avg
+    /// RMSSD ms)` pairs, one per 5-min bucket (layout pinned to open_oura, OURA_PROTOCOL.md s6.9). This is
+    /// the ring's OWN summary tag, NOT Oura's readiness score, and NOT NOOP's scoring RMSSD (that is
+    /// reconstructed from `rr`). Each bucket is stamped at its own 5-min offset (see `.hrv` below) so the
+    /// per-bucket series survives the (deviceId, ts, kind) event key. Must match the Kotlin twin exactly.
     public static let hrvEventKind = "OURA_HRV"
     /// WhoopEvent.kind for a decoded sleep-phase code (2-bit: awake/light/deep/rem).
     public static let sleepPhaseEventKind = "OURA_SLEEP_PHASE"
@@ -41,7 +49,7 @@ public enum OuraStreamMapping {
     /// (unix seconds). Pure → unit-testable. Section-4 table:
     ///   - `.hr`         (0x55 live-HR push)            → `hr:[HRSample]`
     ///   - `.ibi`        (0x44/0x60 IBI)                → `rr:[RRInterval]`
-    ///   - `.hrv`        (0x5D HRV tag, raw int8 b1/b2)  → `events:[WhoopEvent(kind: OURA_HRV)]`
+    ///   - `.hrv`        (0x5D HRV tag, u8 hr/rmssd pairs) → `events:[WhoopEvent(kind: OURA_HRV)]` (one row per 5-min bucket)
     ///   - `.spo2`       (0x6F/0x70/0x77)              → `spo2:[SpO2Sample]`, carrying the decoder's own
     ///     `unit` tag. NOT all one quantity: 0x6F/0x70 are firmware-computed PERCENTAGES (tagged `"raw"`,
     ///     a legacy channel label — see `OuraDecoders.decodeSpO2PerSample`), while 0x77 is a genuine raw
@@ -49,6 +57,8 @@ public enum OuraStreamMapping {
     ///   - `.temp`       (0x46/0x75)                    → `skinTemp:[SkinTempSample(raw_adc)]`
     ///   - `.sleepPhase` (0x4E/0x5A 2-bit codes)        → `events:[WhoopEvent(kind: OURA_SLEEP_PHASE)]`
     ///   - `.battery`                                   → `battery:[BatterySample]`
+    ///   - `.sleepPeriodInfo` (0x6A, Tier B)            → `resp:[RespSample(milli_bpm)]` — `breath` ONLY,
+    ///     as instrumentation; every other field of the record stays in the investigation log.
     /// Every other event case (`.motion`, `.state`, `.timeSync`, `.rtcBeacon`, `.debugText`, `.tierB`,
     /// `.activityInfo`) is intentionally not folded into a durable stream here. In particular the 0x50
     /// activity/MET decode NEVER mints a `steps` row: the formula is third-party and unvalidated (Tier B,
@@ -75,18 +85,42 @@ public enum OuraStreamMapping {
                 out.rr.append(RRInterval(ts: ts, rrMs: v.ibiMs, srcChannel: rrChannel(v.channel)))
 
             case .hrv(let v):
-                // The ring's own 0x5D tag, carried RAW for diagnostics/parity. The two int8 fields
-                // (b1/b2) plus the sample's relative time offset are surfaced under units-neutral keys.
-                // We do NOT mint an `rmssd_ms` here: the int8 b1/b2 byte -> millisecond scaling is NOT
-                // Tier-A (OURA_PROTOCOL.md s6.9 leaves it unpinned), so labelling a raw byte as a
-                // millisecond RMSSD would fabricate units (honest-data invariant). NOOP's own scoring
-                // RMSSD is reconstructed from the IBI stream (`rr`), never from this open tag. Keys and
-                // values are IDENTICAL to the Kotlin twin (OuraStreamMapping.kt) so both platforms emit
+                // The ring's OWN 0x5D 5-min bucket: average HR (bpm) + average RMSSD (ms), both u8, no
+                // scaling (layout pinned to open_oura's (u8 hr, u8 rmssd) pairs — the byte->unit scaling
+                // that was "unpinned" is now known, so these are honestly labelled, not raw bytes).
+                // `pair_index` is the bucket's position in the record. This is the ring's open summary
+                // tag, NOT Oura's readiness score; NOOP's own scoring RMSSD still comes from the IBI
+                // stream (`rr`). Keys/values are IDENTICAL to the Kotlin twin so both platforms emit
                 // byte-for-byte the same OURA_HRV payload.
-                out.events.append(WhoopEvent(ts: ts, kind: hrvEventKind, payload: [
-                    "time_ms": .int(v.timeMs),
-                    "b1": .int(v.b1),
-                    "b2": .int(v.b2),
+                //
+                // Each bucket gets its OWN timestamp so it lands on a distinct event row. The event PK is
+                // (deviceId, ts, kind), so N pairs sharing the record `ts` would collide on insert and only
+                // one survive — silently dropping the rest of the ring's per-5-min series.
+                //
+                // ORDER (#1167): the record's FIRST byte-pair is its OLDEST bucket, and the record `ts`
+                // marks the END of the span it covers — so the LAST pair's 5 minutes end at `ts`. This
+                // matches the two sibling per-record series in this file rather than contradicting them:
+                // `.spo2` below lays its samples back from the record time (`count - 1 - index`), and the
+                // hypnogram assembler lays a burst's codes backward from its anchored end. A bucket is an
+                // INTERVAL stamped at its start, not an instant, hence `count - index` where SpO2 uses
+                // `count - 1 - index`.
+                //
+                // This corrects an earlier `ts - index * 300`, which mirrored every bucket within its own
+                // record (up to +30/-20 min out on a 6-pair record). Measured against an independent
+                // reconstruction — the median HR of the `0x60` beats in each 5-min window, a different tag
+                // and a different decoder — over three consecutive overnights: r = +0.970 / +0.959 / +0.894
+                // with this ordering, against -0.079 / +0.629 / +0.111 with the old one. Reversing within
+                // the same span (no shift) collapses the best night to +0.060, so it is the ORDER that is
+                // being measured, not a clock offset.
+                //
+                // `count` is the record's ORIGINAL pair count, including a `00 00` pad dropped at decode
+                // (#1131) — the offset is measured from the record's tail, so an uncounted pad would slide
+                // every surviving bucket in that record.
+                let bucketTs = ts - (v.count - v.index) * 300
+                out.events.append(WhoopEvent(ts: bucketTs, kind: hrvEventKind, payload: [
+                    "pair_index": .int(v.index),
+                    "hr_bpm": .int(v.hrBpm),
+                    "rmssd_ms": .int(v.rmssdMs),
                 ]))
 
             case .spo2(let v):
@@ -165,10 +199,58 @@ public enum OuraStreamMapping {
                 if let hi = m.highIntensity { payload["high_intensity"] = .int(hi) }
                 out.events.append(WhoopEvent(ts: ts, kind: motionEventKind, payload: payload))
 
-            case .motion, .state, .timeSync, .rtcBeacon, .debugText, .tierB, .activityInfo:
+            case .sleepPeriodInfo(let v):
+                // 0x6A `breath` → a `respSample` row under the RING's deviceId, and on a ring night that
+                // row set supplies the SCORED `dailyMetric.respRateBpm` (AnalyticsEngine.vendorRespRateBpm
+                // takes the in-session median). `OuraRespScale.forScoring` still refuses these rows at the
+                // STAGING read — a per-window rate is the wrong shape for a peak detector expecting a
+                // ~1 Hz raw ADC waveform.
+                //
+                // Why this one field is stored: `breath` is the RING's own measurement, read off the wire
+                // — not a signal NOOP derives from raw sensor data. The #194 rule governs the latter
+                // (PPG→HR, RSA-from-R-R: methods where NOOP invents the number), so the question here is
+                // whether the DECODE is right, and that is settled structurally: 3,493 records over four
+                // nights, every value an exact multiple of 0.125, both of the source's declared invariants
+                // upheld. It has the same standing as the ring's own hypnogram, which NOOP already
+                // persists and scores from (#773/#877). Cross-checks, in order of weight: these records
+                // median 14.75/min against the SAME wearer's 851-night Oura APP export at 15.250 (IQR
+                // 14.875–15.625) — same quantity, same band (distribution, not paired: the corpora do not
+                // overlap in date); against a WHOOP worn the same nights the decode reproduces the
+                // VENDOR's own offset (Oura below WHOOP 18/18, Δ −1.158; ours Δ −1.458 sign-stable 6/6,
+                // r = +0.599 / +0.748 well-covered, against Oura's own +0.680 ceiling); and the date
+                // falsifier passed (wrong mapping collapses r to −0.151).
+                //
+                // Scale: `raw` is MILLI-breaths-per-minute (`OuraRespScale`), which is exact for every
+                // wire value rather than merely close. `respSample.raw` otherwise carries a WHOOP raw ADC
+                // WAVEFORM sample — a different physical quantity in the same table — so the row's owner
+                // is what tells the two apart, and `OuraRespScale` is the one place that knows it.
+                //
+                // What this record does NOT persist, and why: `averageHrBpm` would land in the same `hr`
+                // series as the beat-derived channel at a different cadence and provenance;
+                // `breathVariability` / `mzci` / `dzci` / `cv` are named but uninterpreted; `sleepState`
+                // has no documented code meaning. They stay in the investigation log. The scored slot
+                // `dailyMetric.respRateBpm` is fed from these rows in `AnalyticsEngine`, not here — this
+                // layer only mints the durable row; the coverage guards and the era-scoped baseline that
+                // make it safe to score live there.
+                // PARITY: the Kotlin twin stores the IDENTICAL integer for a given decoded value.
+                out.resp.append(RespSample(ts: ts,
+                                           raw: OuraRespScale.milliBpm(fromBreathsPerMin: v.breathsPerMin),
+                                           unit: OuraRespScale.unitTag))
+
+            case .motion, .state, .timeSync, .rtcBeacon, .debugText, .tierB, .activityInfo,
+                 .realStepsFields:
                 // Not a durable per-device stream row (timeSync/rtcBeacon anchor the transport's clock;
-                // motion/state/debug are diagnostics; Tier-B / .activityInfo are UNVERIFIED and must
-                // never feed scoring or the steps stream).
+                // motion/state/debug are diagnostics; Tier-B / .activityInfo / .realStepsFields are
+                // UNVERIFIED and must never feed scoring or the steps stream). In particular the 0x50
+                // activity/MET decode NEVER mints a `steps` row: the formula is third-party and
+                // unvalidated, and MET is not a step count — fabricating one would break the honest-data
+                // invariant. Nor may .realStepsFields mint one: ground truth showed no field is a count,
+                // they are the inputs to Oura's step model (see OuraRealStepsFields).
+                //
+                // `.sleepPeriodInfo` used to be dropped here too. It is now mapped above, to ONE stream
+                // and one field: `breath` → `resp`. Its `averageHrBpm` is still refused, for the reason
+                // that kept the whole record out — it would land in the same HR series as the
+                // beat-derived channel at a DIFFERENT cadence and a different provenance.
                 continue
             }
         }

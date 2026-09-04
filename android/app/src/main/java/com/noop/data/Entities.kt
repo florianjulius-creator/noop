@@ -3,6 +3,7 @@ package com.noop.data
 import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.Index
+import androidx.room.PrimaryKey
 
 /*
  * Room entities mirroring the verified GRDB schema in
@@ -148,6 +149,9 @@ data class RrInterval(
     val synced: Int = 0,
     val ord: Int? = null,
     val srcChannel: Int? = null,
+    /** #1073 (Room v29): 1 when this beat's ts is in the FUTURE (corrupt ring time); NULL otherwise.
+     *  Marked, never deleted; `WhoopDao.rrIntervals` filters it at READ. Twin of GRDB `tsSuspect`. */
+    val tsSuspect: Int? = null,
 )
 
 /**
@@ -315,6 +319,25 @@ data class DailyMetric(
     // (imports/cloud never carry them), so old rows + non-4.0 nights stay null.
     val spo2Red: Int? = null,           // mean raw red PPG ADC during detected sleep
     val spo2Ir: Int? = null,            // mean raw IR PPG ADC during detected sleep
+    // Five-minute SDNN index (ms), separate from avgHrv (RMSSD). Strap rows compute it from in-bed R-R;
+    // Apple Health rows mirror the source SDNN. Health Connect RMSSD does not populate this column.
+    val avgSdnn: Double? = null,
+    // Nightly ABSOLUTE skin temperature (°C): the wear-gated mean over the night's detected sleep, the
+    // value skinTempDevC is derived FROM (#1636). Appended LAST so the column order matches the Room
+    // CREATE TABLE and the Swift row. Distinct from skinTempDevC, which is bimodal — CSV/Health imports
+    // write an absolute wrist °C into that column and SkinTempDisplay separates them by magnitude. This
+    // one is unambiguous: always absolute, and only the strap pipeline writes it. Nullable: nights scored
+    // before v34 stay null until a re-score re-derives them from the same raw samples.
+    val skinTempC: Double? = null,
+    // Whether EVERY sleep session this day was staged from heart rate alone, with no motion to work from
+    // (#1801). The two vitals below it are not missing by accident on such a night: the HR-only spine
+    // constructs its sessions with restingHR and avgHRV null on purpose, because sleep bounds inferred
+    // from heart rate are not firm enough to hang a resting HR or a nightly RMSSD on, and AnalyticsEngine
+    // then gates both on `!hrOnly`. Persisted so the card can say WHICH of those it is — a blank next to
+    // a populated respiratory rate reads as a sync failure, and a field log showed a week of exactly that
+    // misreading. Appended LAST so the column order matches the Room CREATE TABLE and the Swift row.
+    // Null on every row scored before v36 and on any day with no sleep at all.
+    val sleepHrOnly: Boolean? = null,
 )
 
 /**
@@ -357,6 +380,13 @@ data class SleepSession(
     // through the targeted DAO methods (not the @Upsert path, which never names them and so preserves them).
     val motionJSON: String? = null,
     val sleepStateJSON: String? = null,
+    // v34 (Swift WhoopStore v34-sleep-staging-sparse parity, MIGRATION_27_28). True when this night was
+    // staged on SPARSE motion coverage (SleepStager.isGravitySparse, #345) — a night that can UNDER-detect
+    // and read short ("slept 8h, shows 1h"), so the Sleep tab captions it honestly. Nullable INTEGER (Kotlin
+    // Boolean? -> INTEGER affinity, matching GRDB's `.integer` twin — no boolean-affinity divergence); old
+    // rows / imported nights read null = unknown. Declared LAST so the ALTER-appended column matches this
+    // fresh-schema order.
+    val stagingSparse: Boolean? = null,
 ) {
     /** The bed (onset) time to DISPLAY / sort / re-stage by: the user's hand-set onset when edited,
      *  else the immutable detected [startTs]. Mirrors Swift `CachedSleepSession.effectiveStartTs`. */
@@ -404,8 +434,8 @@ data class MetricSeriesRow(
 )
 
 /**
- * Provider provenance for one NOOP-computed score. Separate from `dayOwnership`: ownership controls
- * raw-input resolution, while this records the source actually used for a persisted metric.
+ * Provenance for one NOOP-computed score. [sourceId] normally records the provider actually used, while
+ * `vo2max_est` records its estimator id. Separate from `dayOwnership`, which controls input resolution.
  */
 @Entity(
     tableName = "scoreInputProvenance",
@@ -418,6 +448,22 @@ data class ScoreInputProvenanceRow(
     @ColumnInfo(name = "key") val key: String,
     val sourceId: String,
 )
+
+/** Estimator identity persisted beside a `vo2max_est` point in [ScoreInputProvenanceRow.sourceId].
+ *  Existing points have no such row and therefore remain explicitly unknown; never infer their method
+ *  from the user's current profile because a waist measurement may have changed since they were scored. */
+enum class Vo2MaxEstimator(val provenanceId: String) {
+    NES("nes"),
+    UTH("uth");
+
+    companion object {
+        fun fromProvenanceId(value: String?): Vo2MaxEstimator? = entries.firstOrNull {
+            it.provenanceId == value
+        }
+
+        fun forWaistCm(waistCm: Double): Vo2MaxEstimator = if (waistCm > 0.0) NES else UTH
+    }
+}
 
 /**
  * Lab Book marker reading (Health Records pillar). Swift `labMarker` (Database.swift v17 /
@@ -566,6 +612,28 @@ data class AppleDaily(
 )
 
 /**
+ * Cached hourly Apple-Health step count (v38 / MIGRATION_30_31). Swift `appleStepHour` (WhoopStore
+ * Database.swift `v38-apple-step-hour` migration). `ts` is the hour-BUCKET START (wall-clock unix
+ * seconds, local-hour aligned by the HealthKit collection query); `steps` is the cumulative step sum
+ * within that hour. Natural key (deviceId, ts) mirrors every other per-sample table so the hourly
+ * upsert is idempotent. [AppleDaily.steps] answers "how many steps that day"; this table answers
+ * "which HOURS were recorded", so a dead/absent phone for part of a day is visible instead of a single
+ * flattened daily total.
+ *
+ * Fields are declared in the SAME order as the Swift GRDB schema (deviceId, ts, steps) so the
+ * migration's CREATE TABLE column order matches Room's generated shape. SCHEMA-ONLY twin: the
+ * Apple-Health IMPORT that populates it is iOS-only (HealthKit has no Android analogue), so Android
+ * carries the table for `.noopbak` byte-parity but no importer writes to it — exactly as it already
+ * does for [AppleDaily].
+ */
+@Entity(tableName = "appleStepHour", primaryKeys = ["deviceId", "ts"])
+data class AppleStepHour(
+    val deviceId: String,
+    val ts: Long,
+    val steps: Int,
+)
+
+/**
  * The RAW WHOOP 5.0 v26 optical PPG waveform, one record per second (v27 / MIGRATION_18_19, issue #156
  * follow-up). Swift `ppgWaveformSample` (WhoopStore Database.swift `v27-ppg-waveform` migration). The
  * strap's 24 Hz buffer was fully decoded but only ever used to derive [PpgHrSample]; the samples
@@ -577,56 +645,29 @@ data class AppleDaily(
  * keeping a v26-heavy night to roughly the same order of magnitude as ONE extra per-second stream. The
  * BLOB format is byte-identical to the Swift GRDB `WhoopStore.packPpgSamples` so a `.noopbak` round-trips.
  * PK (deviceId, ts) mirrors every other per-second stream; a truncated frame can decode fewer than 24
- * samples. Fields are declared in the SAME order as the GRDB schema (deviceId, ts, samples) so the
- * migration's CREATE TABLE column order matches Room's generated shape.
+ * samples. Fields are declared in the SAME order as the GRDB schema
+ * (deviceId, ts, samples, burstIndex) so Room's generated shape stays byte-identical.
  */
 @Entity(tableName = "ppgWaveformSample", primaryKeys = ["deviceId", "ts"])
 data class PpgWaveformSampleEntity(
     val deviceId: String,
     val ts: Long,
     val samples: ByteArray,
+    val burstIndex: Int? = null,
 ) {
     // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is PpgWaveformSampleEntity) return false
-        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples)
+        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples) &&
+            burstIndex == other.burstIndex
     }
 
     override fun hashCode(): Int {
         var result = deviceId.hashCode()
         result = 31 * result + ts.hashCode()
         result = 31 * result + samples.contentHashCode()
-        return result
-    }
-}
-
-/**
- * One 1-second WHOOP 5/MG raw-IMU offload buffer (#423): 100 Hz 6-axis inertial data. [samples] is a
- * packed little-endian i16 BLOB of the six columns in wire order — ax×100, ay×100, az×100, gx×100, gy×100,
- * gz×100 (1200 bytes) — decoded by [com.noop.protocol.Whoop5RawImu] (scales 1/4096 g/LSB, 2000/32768 dps/
- * LSB). The strap already delivers this in the connect-time offload burst; capturing it needs NO arming.
- * Instrument-first + bounded: written only when raw capture is enabled, and pruned to a rolling recent
- * window ([WhoopRepository.RAW_IMU_RETENTION_ROWS]). Twin of the GRDB `rawImuSample` table. Natural key
- * (deviceId, ts) = one row per strap-second.
- */
-@Entity(tableName = "rawImuSample", primaryKeys = ["deviceId", "ts"])
-data class RawImuSampleEntity(
-    val deviceId: String,
-    val ts: Long,
-    val samples: ByteArray,
-) {
-    // ByteArray needs structural equals/hashCode (the generated identity ones break round-trip asserts).
-    override fun equals(other: Any?): Boolean {
-        if (this === other) return true
-        if (other !is RawImuSampleEntity) return false
-        return deviceId == other.deviceId && ts == other.ts && samples.contentEquals(other.samples)
-    }
-
-    override fun hashCode(): Int {
-        var result = deviceId.hashCode()
-        result = 31 * result + ts.hashCode()
-        result = 31 * result + samples.contentHashCode()
+        result = 31 * result + (burstIndex ?: 0)
         return result
     }
 }

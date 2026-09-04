@@ -157,6 +157,40 @@ object SleepStager {
      *  this conservative. Mirrors Swift `morningReonsetBandAsleepFrac`. (H8 consume) */
     const val morningReonsetBandAsleepFrac: Double = 0.6
 
+    /** Default-OFF gate for the band sleep_state WAKE-veto (the SHIPPED state; the pre-veto hypnogram is what
+     *  users see). [bandStateAsleep] is WHOOP's OWN banked verdict (not a signal we re-derive), so vetoing
+     *  false-wakes with it is well-founded on the n=12 that motivated it — but the PSG harness measures the
+     *  recipe UNDER-calling wake overall (bias -4.92 pp), so a veto that converts wake->light moves the
+     *  population result AWAY from truth. Flip to true only with PSG evidence in hand (see #1210), and set
+     *  [bandStateWakeVetoCutoffTs] alongside to spare history. It stays a single flip-point + fully tested
+     *  (tests pass `enabled = true` explicitly). An absent band stream (WHOOP 4.0 / unbanded window) makes the
+     *  veto a no-op regardless of this flag. Mirrors Swift `bandStateWakeVetoEnabled`. (band sleep_state veto) */
+    const val bandStateWakeVetoEnabled: Boolean = false
+
+    /** #1210 item 2 (retroactive-rescore story): the new-nights-only cutoff. When the veto is flipped on
+     *  ([bandStateWakeVetoEnabled] = true), a NON-ZERO cutoff (a unix second) restricts the correction to
+     *  sessions whose `start >= cutoffTs` — nights already in history keep their raw efficiency, so flipping
+     *  the default cannot silently re-score months of banked nights upward. `0` (the default) applies the veto
+     *  to every banded night (the "just ship the one-time shift" path). Inert while the flag is off. Set this
+     *  to the flip date at the same time as the flag. Byte-identical to Swift `bandStateWakeVetoCutoffTs`. */
+    const val bandStateWakeVetoCutoffTs: Long = 0L
+
+    /** The sleep stage a band-vetoed false-wake epoch is reclassified to. [bandStateAsleep] (band sleep_state == 2) means
+     *  only "asleep" — the band carries NO light/deep/REM resolution — so the veto maps it to the generic,
+     *  most-common sleep stage rather than inventing deep/REM detail the strap never asserted (deep/REM
+     *  minutes feed the recovery gate; the veto must not inflate them). "light" is the honest projection of a
+     *  bare "asleep". Mirrors Swift `bandVetoRecoverStage`. (band sleep_state veto) */
+    const val bandVetoRecoverStage: String = "light"
+
+    /** #1210: a TRACE-ONLY line reporting what the (dormant) band wake-veto WOULD recover on a banded night,
+     *  so a validator gathers the recovered-minutes distribution across real nights without any output change
+     *  (the persisted hypnogram stays the flag-gated, unchanged one). Namespaced `bandVeto(shadow):` and free
+     *  of a `day=` / `t=…s` token so `CaptureAccumulator` never counts it as a captured day. Byte-identical to
+     *  Swift `bandVetoShadowLine`. (band sleep_state veto) */
+    internal fun bandVetoShadowLine(startTs: Long, recoveredMin: Double, rawEff: Double, shadowEff: Double): String =
+        "bandVeto(shadow): startTs=$startTs recoveredMin=${Math.round(recoveredMin)} " +
+            "eff ${Math.round(rawEff * 100)}%->${Math.round(shadowEff * 100)}%"
+
     /** Seconds in a calendar day (for local-hour-of-day arithmetic). */
     const val secondsPerDay: Long = 86_400L
 
@@ -285,6 +319,48 @@ object SleepStager {
      * continuous night never has a true >90 min wake bridge mid-sleep).
      */
     const val sparseBridgeGapMin: Int = 90
+
+    /**
+     * A single intervening ACTIVE run up to this long may be absorbed when bridging two sleep runs
+     * (#1657).
+     *
+     * This started as [maxGapMin] (20), on the reasoning that the file already had a threshold for
+     * "a discontinuity this long is decisive". An end-to-end test through [detectSleep] showed that was
+     * too tight to reach the case the issue is about: a FIFTEEN-minute interruption produced a
+     * TWENTY-ONE-minute active run, because [classifyStill] smears the still/moving boundary by roughly
+     * its rolling window and [buildRuns] closes runs at sample edges. The detected run is systematically
+     * longer than the interruption it represents, so a bound set from the interruption's true length
+     * rejects it.
+     *
+     * 30 is a judgement, and stated as one rather than dressed up as derived: a realistic trip out of
+     * bed of up to about a quarter of an hour, plus the ~6 minutes of smear that measurement showed,
+     * with a little headroom. It is deliberately well under [minSleepMin] — an interruption long enough
+     * to be a session in its own right is a genuine awakening and should split the night.
+     *
+     * The bound is the cheap half of the guard. The real one is the HR band across the whole span: a
+     * wearer who is actually up keeps HR elevated for the duration and fails it, while a brief stir does
+     * not. [mergeMin] (15) already absorbs shorter active runs upstream in [mergePeriods].
+     */
+    const val sparseBridgeActiveMaxMin: Int = 30
+
+    /**
+     * The same bound when HR across the whole span stays in the sleep band.
+     *
+     * [sparseBridgeActiveMaxMin]'s own doc calls the minute bound "the cheap half of the guard" and the HR
+     * band "the real one" — but the check order meant the cheap half vetoed first, so the real one never
+     * got to speak for a run over 30 minutes. A 42-minute active run with sleep-band HR was rejected
+     * identically to one with a wearer plainly up and about.
+     *
+     * That is the wrong way round on a strap whose "active" verdict comes from MOTION, which is the sparse
+     * and unreliable signal on the hardware this fires for (field log 260901-1022: 20,647 gravity samples
+     * across a 54-hour window, against 109,868 HR). HR is the better witness there, and it is already
+     * computed. 60 rather than something larger because it is [minSleepMin]: an interruption long enough
+     * to be a session in its own right is a genuine awakening whatever HR says, and must still split.
+     *
+     * Applied as a MAXIMUM against [sparseBridgeActiveMaxMin], never a replacement, so the in-band path
+     * can only ever be more permissive — an out-of-band span keeps the 30-minute bound exactly.
+     */
+    const val sparseBridgeActiveMaxInBandMin: Int = 60
 
     // ── Stage 1–3 constants (sleep_features.py) ──────────────────────────────
 
@@ -437,8 +513,273 @@ object SleepStager {
         if (baseline == null) return false
         val seg = hr.filter { it.ts > a && it.ts <= b }
         if (seg.isEmpty()) return false
-        val meanHR = seg.sumOf { it.bpm }.toDouble() / seg.size.toDouble()
-        return meanHR <= baseline * hrSleepBandMult
+        // MEDIAN, not mean (#1657). [confirmSleepWithHR] twelve lines below already documents why the
+        // mean is the wrong statistic here — "a real sleep night carries brief arousal / wake HR spikes
+        // (observed to ~190 bpm)" that drag it above the band — and uses the median for exactly that
+        // reason. This gate answers the same question over a SHORTER window, where a single spike
+        // dominates the mean even harder: a two-minute stir inside a fifteen-minute interval can put the
+        // mean out of band while the wearer was asleep for thirteen of those minutes. The median rejects
+        // a SUSTAINED elevation just as firmly, which is the discrimination this gate exists to make.
+        val medianHR = HrvAnalyzer.median(seg.map { it.bpm.toDouble() })
+        return medianHR <= baseline * hrSleepBandMult
+    }
+
+    /**
+     * Percentile of the window's bpm that anchors the HR-only sleep band.
+     *
+     * NOT [hrBaseline]. That is the window MEDIAN, and it is the right anchor where it is used — as a
+     * CONFIRMATION gate on a run gravity stillness already found, where being permissive is deliberate.
+     * As a PRIMARY threshold it is disqualified by arithmetic rather than by tuning: a median splits the
+     * samples in half by definition, so a band of `median * 1.05` admits strictly more than half of any
+     * window whatever the data. Measured on a realistic 24 h (16 h awake 74-96, 8 h night 59-70) it
+     * called 14.4 hours sleep against a truth of 8.
+     *
+     * A tenth percentile sits in the night's trough instead, which is what a sleep band should be
+     * anchored to, and cannot admit half the window however the day is shaped.
+     */
+    const val hrOnlyAnchorPercentile: Double = 0.10
+
+    /**
+     * Multiplier above [hrOnlyAnchorPercentile] that still counts as asleep.
+     *
+     * Numerically equal to [hrSleepBandMult] today, and deliberately a SEPARATE constant: that one is a
+     * confirmation gate's tolerance and this one is a detector's, and a future change to either has no
+     * business silently moving the other.
+     *
+     * Chosen conservatively from a sweep over anchor x multiplier against windows with known truth,
+     * because the two failure directions are not symmetric. Over-detection puts a wrong Rest number on
+     * screen; under-detection leaves "No data", which is the state this feature is trying to improve on
+     * and therefore a safe place to fail. p10 x 1.05 measured 8.1 h against a truth of 8 on a field-shaped
+     * 24 h window, and under-reads a long multi-night window rather than over-reading it (8.7 h of 16 h
+     * across two nights in 54 h) — pinned in `SleepStagerHrOnlyAnchorTest`.
+     */
+    const val hrOnlyBandMult: Double = 1.05
+
+    /**
+     * The [hrOnlyAnchorPercentile] of `hr` by bpm, or null when empty. Nearest-rank (no interpolation), so
+     * the value is always one the wearer actually recorded and the two platforms cannot disagree on a
+     * rounding rule.
+     */
+    internal fun hrOnlyBaseline(hr: List<HrSample>): Double? = hrPercentile(hr, hrOnlyAnchorPercentile)
+
+    /**
+     * The `p` percentile of `hr` by bpm, nearest-rank. Shared with [hrOnlyBaseline] so the spread the
+     * trace reports is measured by the SAME rule as the anchor it is meant to be judged against — a
+     * diagnostic computed a different way would invite exactly the wrong conclusion.
+     */
+    internal fun hrPercentile(hr: List<HrSample>, p: Double): Double? =
+        percentileOfSorted(hr.map { it.bpm.toDouble() }.sorted(), p)
+
+    /**
+     * The `p` percentile of an ALREADY-SORTED bpm list, nearest-rank.
+     *
+     * Split out because the caller needs three percentiles from the same window, and the obvious
+     * spelling sorts once per percentile. On a 5/MG day that is ~160k samples sorted three times, on
+     * every scored day, across the 21-day rescore window - a cost this file has been burned by before
+     * (#836, #841). One sort, three reads.
+     */
+    internal fun percentileOfSorted(sorted: List<Double>, p: Double): Double? {
+        if (sorted.isEmpty()) return null
+        val idx = ((sorted.size - 1) * p).toInt().coerceIn(0, sorted.size - 1)
+        return sorted[idx]
+    }
+
+    /**
+     * How many distinct [hrOnlyEpochS] buckets `sortedByTs` spans.
+     *
+     * A single pass rather than a set, because `hrS` is already sorted by timestamp so the bucket key
+     * is non-decreasing and a running comparison is enough. The obvious spelling
+     * (`mapTo(HashSet()) { it.ts / hrOnlyEpochS }`) boxes EVERY sample to end up with a few thousand
+     * distinct keys - ~160k boxed longs per scored day across the 21-day rescore, which is the exact
+     * allocation shape #707 names as the heap-churn source under the OOM. A diagnostic must not cost
+     * what it is measuring.
+     */
+    internal fun distinctEpochs(sortedByTs: List<HrSample>): Int {
+        var count = 0
+        var last = Long.MIN_VALUE
+        for (s in sortedByTs) {
+            val key = s.ts / hrOnlyEpochS
+            if (key != last) { count++; last = key }
+        }
+        return count
+    }
+
+    /** Epoch for the HR-only spine, in seconds. */
+    const val hrOnlyEpochS: Long = 60
+
+    /**
+     * Sleep/active runs built from HEART RATE ALONE, for a strap that streams HR but banks no motion.
+     *
+     * Stage 0 is normally a gravity-stillness spine (Cole-Kripke) that HR only CONFIRMS, via
+     * [hrSleepBandAcross] and `confirmSleepWithHR`. A WHOOP 5/MG that cannot bond never banks motion at
+     * all — `SET_CLOCK` rides a handshake it never completes — so `grav` is empty, there is no spine, and
+     * no quantity of HR can stage the night (#1801). This builds the spine from the one signal such a
+     * strap does provide.
+     *
+     * Deliberately the SAME rule the confirm path already trusts: per-epoch MEDIAN bpm against
+     * `baseline * `[hrSleepBandMult], median for the reason [hrSleepBandAcross] spells out. The run
+     * construction follows [buildRuns] — close on a class change or a gap over [maxGapMin] — so the two
+     * spines segment alike once flags exist, and only the flag SOURCE differs.
+     *
+     * With ONE branch deliberately absent, and it is not an oversight. [buildRuns] can forgive a gap when
+     * [hrSleepBandAcross] vouches that HR stayed in band across it, which rescues a night whose GRAVITY
+     * dropped out. Here the gap IS in the heart rate, so there is nothing left to vouch with and no
+     * analogue to port. A long HR dropout therefore breaks an HR-only run where it would not break a
+     * motion-backed one, and a night fragmented that way is dropped by the caller's minimum-duration
+     * gate rather than bridged.
+     *
+     * WEAKER THAN THE MOTION SPINE, by construction rather than by tuning. The file already notes that a
+     * long still daytime stretch is gravity-indistinguishable from a nap and that HR is what saves it;
+     * with motion gone the inverse is exposed, and a quiet evening at rest can sit in the sleep band. A
+     * caller must treat these runs as lower-confidence than a motion-backed night and must not let one
+     * reach a baseline it cannot be unwound from.
+     *
+     * Bucket order does not depend on sort stability: samples are grouped by epoch and reduced with a
+     * median, so their order within an epoch cannot change the result.
+     */
+    internal fun hrOnlySleepRuns(
+        hr: List<HrSample>,
+        baseline: Double?,
+        epochS: Long = hrOnlyEpochS,
+        maxGapMinutes: Int = maxGapMin,
+    ): List<Period> {
+        if (baseline == null || baseline <= 0.0) return emptyList()
+        if (hr.isEmpty() || epochS <= 0L) return emptyList()
+        val byEpoch = HashMap<Long, MutableList<Double>>()
+        val lastTs = HashMap<Long, Long>()
+        for (s in hr) {
+            val k = s.ts / epochS
+            byEpoch.getOrPut(k) { ArrayList() }.add(s.bpm.toDouble())
+            lastTs[k] = maxOf(lastTs[k] ?: Long.MIN_VALUE, s.ts)
+        }
+        val keys = byEpoch.keys.sorted()
+        // Two axes, deliberately. A gap and a run's START use the epoch's own start, so a gap is measured
+        // between epochs rather than between whichever samples sat at their edges. A run's END is the last
+        // SAMPLE observed in its final epoch, which is what [buildRuns] means by `end` — reading the epoch
+        // start there would report every run one whole epoch shorter than the data it covers, and that
+        // understatement would then be weighed against the caller's minimum-duration gate.
+        val times = keys.map { it * epochS }
+        val ends = keys.map { lastTs.getValue(it) }
+        val flags = keys.map { HrvAnalyzer.median(byEpoch.getValue(it)) <= baseline * hrOnlyBandMult }
+        val maxGapS = (maxGapMinutes * 60).toLong()
+        val periods = ArrayList<Period>()
+        var runStart = 0
+        for (i in 1..keys.size) {
+            val atEnd = (i == keys.size)
+            val close = if (atEnd) {
+                true
+            } else {
+                flags[i] != flags[runStart] || (times[i] - times[i - 1]) > maxGapS
+            }
+            if (close) {
+                periods.add(
+                    Period(
+                        stage = if (flags[runStart]) "sleep" else "active",
+                        start = times[runStart],
+                        end = ends[i - 1],
+                    )
+                )
+                runStart = i
+            }
+        }
+        return periods
+    }
+
+    /**
+     * Whole sleep SESSIONS from heart rate alone, for a strap that banks no motion (#1801).
+     *
+     * [hrOnlySleepRuns] supplies the spine this normally gets from gravity stillness; [SleepStagerV2]
+     * then stages each surviving run from HR and R-R with an EMPTY gravity list. That is not a
+     * degenerate call: V2's epoch features read HR and R-R directly and only its motion-quiescence terms
+     * go quiet, so it returns a real hypnogram rather than one flat stage. A stageless session would be
+     * dropped by `AnalyticsEngine.sleepSessionFromProvided` anyway, so a night that fails to stage is
+     * correctly omitted here rather than passed on hollow.
+     *
+     * The anchor is [hrOnlyBaseline] — the [hrOnlyAnchorPercentile] of the window — and NOT the
+     * [hrBaseline] median the motion path derives. Reusing that median looked like parity and was a bug:
+     * as a confirmation gate on an already-detected run it is deliberately permissive, but as a primary
+     * threshold it admits over half of any window by definition. See [hrOnlyAnchorPercentile].
+     *
+     * [DetectedSleep.restingHR] and [DetectedSleep.avgHRV] are left NULL deliberately, and that is the
+     * whole display-only guarantee. An HR-only night may describe itself — duration, stages, Rest — but
+     * the resting HR and HRV it would contribute are exactly what Charge and the baselines fold in, and
+     * a baseline is the one thing a false positive cannot be unwound from. Withholding the values is
+     * structural; a downstream filter would be one forgotten call site away from failing open.
+     */
+    internal fun hrOnlySessions(
+        hr: List<HrSample>,
+        rr: List<RrInterval>,
+        resp: List<RespSample>,
+        minMinutes: Int = minSleepMin,
+        /**
+         * #1801 follow-up: this path shipped SILENT, and the first field log then showed
+         * `reason=no-motion` with no way to tell whether the spine ran and found nothing or never ran.
+         * Everything it decides is derived from the wearer's own window, so a report is unreadable
+         * without it. Optional, so pure-function callers and tests stay free of a sink.
+         */
+        traceSink: ((String) -> Unit)? = null,
+    ): List<DetectedSleep> {
+        val hrS = hr.sortedBy { it.ts }
+        // ONE sort of the bpm axis, reused for the anchor and for the spread the trace reports.
+        val sortedBpm = hrS.map { it.bpm.toDouble() }.sorted()
+        val baseline = percentileOfSorted(sortedBpm, hrOnlyAnchorPercentile)
+        if (baseline == null) {
+            traceSink?.invoke(SleepStagerTrace.hrOnlyLine(
+                anchorBpm = null, bandBpm = null, hrP50 = null, hrP90 = null, epochs = 0, runs = 0, mergedRuns = 0,
+                sleepRuns = 0, longestSleepMin = 0, staged = 0, kept = 0, minSleepMin = minMinutes,
+            ))
+            return emptyList()
+        }
+        val rrS = rr.sortedBy { it.ts }
+        val out = ArrayList<DetectedSleep>()
+        // mergePeriods for the same reason the motion path calls it: a run boundary is a threshold
+        // crossing, and a sleeping heart rate oscillates across the band all night. Without this the
+        // spine returns the night's minutes correctly but shredded into sub-mergeMin fragments, every one
+        // of which then fails the minimum-duration gate below — 8 h of detected sleep yielding zero
+        // sessions. Absorbing the short runs first is what turns a spine into a night.
+        val rawRuns = hrOnlySleepRuns(hrS, baseline)
+        val merged = mergePeriods(rawRuns)
+        var staged = 0
+        var longestSleepS = 0L
+        for (p in merged) {
+            if (p.stage != "sleep") continue
+            longestSleepS = maxOf(longestSleepS, p.end - p.start)
+            if ((p.end - p.start) < minMinutes * 60L) continue
+            val stages = SleepStagerV2.stageSession(p.start, p.end, emptyList(), hrS, rrS, resp)
+            staged++
+            if (stages.isEmpty()) continue
+            out.add(
+                DetectedSleep(
+                    start = p.start,
+                    end = p.end,
+                    efficiency = efficiency(start = p.start, end = p.end, stages = stages),
+                    stages = stages,
+                    restingHR = null,
+                    avgHRV = null,
+                    hrOnly = true,
+                )
+            )
+        }
+        traceSink?.invoke(SleepStagerTrace.hrOnlyLine(
+            anchorBpm = baseline,
+            bandBpm = baseline * hrOnlyBandMult,
+            // The wearer's own spread. An anchor alone cannot be judged: p10 of 60 means one thing when
+            // the median is 63 and quite another when it is 74, and only the second leaves a night the
+            // band can separate.
+            hrP50 = percentileOfSorted(sortedBpm, 0.50),
+            hrP90 = percentileOfSorted(sortedBpm, 0.90),
+            // The real epoch count, not the sample count: the spine buckets by [hrOnlyEpochS] before it
+            // decides anything, so this is the axis every other number here is measured on.
+            epochs = distinctEpochs(hrS),
+            runs = rawRuns.size,
+            mergedRuns = merged.size,
+            sleepRuns = merged.count { it.stage == "sleep" },
+            longestSleepMin = (longestSleepS / 60L).toInt(),
+            staged = staged,
+            kept = out.size,
+            minSleepMin = minMinutes,
+        ))
+        return out
     }
 
     /** Per-record sleep flags from a rolling fraction of "still" samples. */
@@ -560,31 +901,125 @@ object SleepStager {
     }
 
     /**
-     * Sparse-gravity bridge (#308): merge two adjacent SLEEP runs separated ONLY by a gap up to
-     * sparseBridgeGapMin minutes when the intervening HR stays in the sleep band — so a real night
-     * fragmented by gravity dropouts is re-stitched into one continuous in-bed span BEFORE the
-     * minSleepMin gate drops the pieces. Active runs and over-threshold gaps are left untouched; the
-     * span between two bridged sleep runs (an "active"/gap run, if present) is absorbed. A no-op when
-     * [sparse] == false, so the dense 4.0 path is unchanged. Mirrors Swift.
+     * Sparse-gravity bridge (#308): merge two SLEEP runs when the intervening HR stays in the sleep
+     * band — so a real night fragmented by gravity dropouts is re-stitched into one continuous in-bed
+     * span BEFORE the minSleepMin gate drops the pieces. A no-op when [sparse] == false, so the dense
+     * 4.0 path is unchanged. Mirrors Swift.
+     *
+     * What sits between the two runs may be a bare gap (up to [sparseBridgeGapMin]) or ONE active run
+     * (additionally up to [sparseBridgeActiveMaxMin]). Over-threshold gaps, longer active runs and two
+     * consecutive active runs are all left untouched.
+     *
+     * The previous wording here — "Active runs … are left untouched; the span between two bridged sleep
+     * runs (an "active"/gap run, if present) is absorbed" — read as though an intervening active run was
+     * already handled. It was not: only a bare gap was, and that sentence is a large part of why #1657
+     * went unnoticed. Kept in the history rather than quietly deleted, because the next person to widen
+     * this function will read this comment first.
      */
     internal fun bridgeSparseSleep(
         periods: List<Period>, sparse: Boolean, hr: List<HrSample>, baseline: Double?,
-    ): List<Period> {
-        if (!sparse || periods.isEmpty()) return periods
+    ): List<Period> = bridgeSparseSleepTraced(periods, sparse, hr, baseline).first
+
+    /**
+     * One pair the bridge looked at, for the Sleep & Rest trace. Kept beside the merge itself rather
+     * than recomputed by a shadow pass: a second implementation of this loop would have to be edited in
+     * step with the first, and a trace that silently disagrees with the behaviour it describes is worse
+     * than no trace. Mirrors Swift `SparseBridgeAttempt`.
+     */
+    internal data class SparseBridgeAttempt(
+        /** Gap between the two sleep runs, whole minutes (negative when they overlap). */
+        val gapMin: Long,
+        /** Minutes of intervening ACTIVE run, or 0 when the pair was only separated by a gap. */
+        val activeMin: Long,
+        /** The bound this pair was actually judged against — 30, or 60 when HR stayed in the sleep band. */
+        val activeCapMin: Long,
+        /** Whether the intervening HR stayed in the sleep band. */
+        val hrInSleepBand: Boolean,
+        /** Whether this pair was merged. */
+        val bridged: Boolean,
+        /** Stable token: bridged / gapTooLong / hrOutOfBand / overlap / activeTooLong. */
+        val reason: String,
+    )
+
+    /**
+     * The bridge, plus what it considered. See [bridgeSparseSleep] for the merge rule.
+     *
+     * #1657: an intervening ACTIVE run no longer blocks the merge permanently. The original loop could
+     * only join runs already adjacent in its own output, so any active run between two sleep runs was
+     * appended first and made the next pair unreachable — and a field trace found the bridge merging
+     * NOTHING on 14 of 14 sparse nights for exactly that reason. Since a bathroom trip is definitionally
+     * an active run, the rescue built for fragmentation was unavailable in the case that needs it most.
+     *
+     * A single active run up to [sparseBridgeActiveMaxMin] is now absorbed, with the whole span still
+     * subject to [sparseBridgeGapMin] and to the HR band. Two or more consecutive active runs are not:
+     * that is a night with real structure in it, not one interruption.
+     */
+    internal fun bridgeSparseSleepTraced(
+        periods: List<Period>, sparse: Boolean, hr: List<HrSample>, baseline: Double?,
+    ): Pair<List<Period>, List<SparseBridgeAttempt>> {
+        if (!sparse || periods.isEmpty()) return periods to emptyList()
         val bridgeGapS = (sparseBridgeGapMin * 60).toLong()
+        val activeMaxS = (sparseBridgeActiveMaxMin * 60).toLong()
+        val activeMaxInBandS = (sparseBridgeActiveMaxInBandMin * 60).toLong()
         val out = ArrayList<Period>()
+        val attempts = ArrayList<SparseBridgeAttempt>()
         for (p in periods) {
-            val last = out.lastOrNull()
-            if (last != null && last.stage == "sleep" && p.stage == "sleep") {
-                val gap = p.start - last.end
-                if (gap in 0..bridgeGapS && hrSleepBandAcross(last.end, p.start, hr, baseline)) {
-                    out[out.size - 1] = Period(stage = "sleep", start = last.start, end = p.end)
-                    continue
+            if (p.stage == "sleep") {
+                val last = out.lastOrNull()
+                // Case 1: the previous run is sleep — the original adjacent-pair merge.
+                if (last != null && last.stage == "sleep") {
+                    if (considerBridge(out, attempts, last, p, activeS = 0L, bridgeGapS, hr, baseline)) continue
+                }
+                // Case 2: exactly one active run sits between two sleep runs. Absorbed when short
+                // enough, which is the #1657 case the original loop could never reach.
+                val prev = if (out.size >= 2) out[out.size - 2] else null
+                if (last != null && last.stage == "active" && prev != null && prev.stage == "sleep") {
+                    val activeS = last.end - last.start
+                    if (considerBridge(out, attempts, prev, p, activeS, bridgeGapS, hr, baseline,
+                                       dropTrailing = true, activeMaxS = activeMaxS,
+                                       activeMaxInBandS = activeMaxInBandS)) continue
                 }
             }
             out.add(p)
         }
-        return out
+        return out to attempts
+    }
+
+    /**
+     * Judge one candidate pair, record it, and merge when it passes. Returns true when [p] was absorbed.
+     *
+     * [dropTrailing] removes the intervening active run from [out] before merging — the whole point of
+     * case 2. The order of the checks fixes which reason a failing pair reports, and it is deliberate:
+     * overlap and gap are properties of the pair, activeTooLong is a property of what sits between them,
+     * and hrOutOfBand is last because it is the only one that needed the HR series to decide.
+     */
+    private fun considerBridge(
+        out: ArrayList<Period>, attempts: ArrayList<SparseBridgeAttempt>,
+        left: Period, right: Period, activeS: Long, bridgeGapS: Long,
+        hr: List<HrSample>, baseline: Double?,
+        dropTrailing: Boolean = false, activeMaxS: Long = 0L, activeMaxInBandS: Long = 0L,
+    ): Boolean {
+        val gap = right.start - left.end
+        val inBand = hrSleepBandAcross(left.end, right.start, hr, baseline)
+        // The HR band is the real guard, so let it widen the minute bound rather than be vetoed by it.
+        // maxOf, not a swap: in-band can only ever be MORE permissive, and case 1 (activeMaxS = 0, no
+        // intervening run) is untouched because activeS is 0 there too.
+        val activeCapS = if (inBand) maxOf(activeMaxS, activeMaxInBandS) else activeMaxS
+        val reason = when {
+            gap < 0 -> "overlap"
+            gap > bridgeGapS -> "gapTooLong"
+            activeS > activeCapS -> "activeTooLong"
+            !inBand -> "hrOutOfBand"
+            else -> "bridged"
+        }
+        val bridged = reason == "bridged"
+        attempts.add(SparseBridgeAttempt(gapMin = gap / 60, activeMin = activeS / 60,
+                                         activeCapMin = activeCapS / 60,
+                                         hrInSleepBand = inBand, bridged = bridged, reason = reason))
+        if (!bridged) return false
+        if (dropTrailing) out.removeAt(out.size - 1)
+        out[out.size - 1] = Period(stage = "sleep", start = left.start, end = right.end)
+        return true
     }
 
     // ── HR refinement ────────────────────────────────────────────────────────
@@ -786,6 +1221,89 @@ object SleepStager {
         if (inBlock.isEmpty()) return false
         val asleep = inBlock.count { it.second == bandStateAsleep }
         return asleep.toDouble() / inBlock.size.toDouble() >= morningReonsetBandAsleepFrac
+    }
+
+    // ── Band sleep_state WAKE-veto (recover strap-disputed false wakes) ───────
+    //
+    // NOOP's cardiorespiratory stager is known to OVER-CALL wake: an EEG-free stager reads a still, low-HR
+    // but not-quite-asleep epoch as wake far more often than the wearer was actually awake. WHOOP's OWN
+    // per-second sleep-state band (the persisted v18 @81 high-nibble `(sb>>4)&3`: 0 wake/1 still/2 asleep/
+    // 3 up — banked as `sleepStateJSON`, gridded by [sessionEpochSleepState]) is an INDEPENDENT scored
+    // signal, not a re-derivation of ours. On real banded nights the strap scores "asleep"
+    // ([bandStateAsleep]) across ~two-thirds of the epochs NOOP calls wake, while the reverse disagreement
+    // (NOOP asleep, strap wake) is an order of magnitude smaller. So letting the strap's OWN "asleep"
+    // verdict VETO an INTERIOR wake call recovers most of the spurious wake with near-zero downside.
+    // Unlike the H8 consume confirm (which only ever KEEPS a whole borderline re-onset session), this
+    // operates per EPOCH on the final hypnogram and only ever turns wake INTO sleep.
+
+    /**
+     * Band sleep_state WAKE-veto. Given a staged hypnogram [stages] (StageSegments tiling `[start, end]`)
+     * and the strap's OWN per-timestamp band sleep_state, reclassify INTERIOR wake epochs the strap itself
+     * scored "asleep" ([bandStateAsleep]) to [bandVetoRecoverStage]. Conservative by construction:
+     *   - ONLY [bandStateAsleep] (2) vetoes — a "still" (1) / "up" (3) / "wake" (0) band reading is LEFT as
+     *     wake, so the veto never blind-trusts the band, only its explicit "asleep";
+     *   - the LEADING wake block (sleep-onset latency, before the first sleep epoch) and the TRAILING wake
+     *     block (final-morning wake, after the last sleep epoch) are NEVER touched — the veto cannot move
+     *     sleep onset earlier or final wake later, it only recovers wake FLANKED by sleep;
+     *   - it only ever turns wake INTO sleep (raising efficiency), never sleep into wake.
+     * The band is gridded to the SAME 30 s epochs as `stagesJSON` / `sessionEpochMotion` via
+     * [sessionEpochSleepState], so epoch i here is epoch i of the persisted `sleepStateJSON`. Empty band
+     * state, the flag off, or a hypnogram with no interior sleep -> returns [stages] UNCHANGED (byte-
+     * identical). Applies to whichever stager (V1 or V2) produced [stages]. Pure + deterministic.
+     * Mirrors Swift `applyBandStateWakeVeto`. (band sleep_state veto)
+     */
+    internal fun applyBandStateWakeVeto(
+        stages: List<StageSegment>, start: Long, end: Long,
+        bandSleepState: List<Pair<Long, Int>>,
+        enabled: Boolean = bandStateWakeVetoEnabled,
+        cutoffTs: Long = bandStateWakeVetoCutoffTs,
+    ): List<StageSegment> {
+        if (!enabled || bandSleepState.isEmpty() || stages.isEmpty() || end <= start) {
+            return stages
+        }
+        // #1210 item 2: new-nights-only gate. A non-zero cutoff spares nights that started before it (history
+        // keeps its raw efficiency); `0` applies to every banded night. Inert while the flag is off.
+        if (cutoffTs > 0L && start < cutoffTs) return stages
+        // Per-epoch band on the 30 s stagesJSON grid — byte-identical to the persisted sleepStateJSON.
+        val states = sessionEpochSleepState(start, end, bandSleepState)
+        if (states.isEmpty()) return stages
+        val n = states.size
+        // Epoch i spans [start + i·epochS, …); boundaries sit on 30 s edges, so expanding the segment tiling
+        // to a per-epoch stage array and re-collapsing it is an exact round-trip (no-op when nothing changes).
+        fun epochStart(i: Int): Long = start + (i.toDouble() * epochS).toLong()
+        val labels = MutableList(n) { "wake" }
+        for (i in 0 until n) {
+            val t = epochStart(i)
+            val seg = stages.firstOrNull { it.start <= t && t < it.end }
+                ?: stages.firstOrNull { it.start <= t && t <= it.end }
+            if (seg != null) labels[i] = seg.stage
+        }
+        // Interior = [firstSleep, lastSleep]; leading/trailing wake blocks are excluded from the veto.
+        val onset = labels.indexOfFirst { it != "wake" }
+        val finalWake = labels.indexOfLast { it != "wake" }
+        if (onset < 0 || finalWake < 0 || onset > finalWake) return stages   // no sleep at all -> nothing to recover
+        var changed = false
+        for (i in onset..finalWake) {
+            if (labels[i] == "wake" && states[i] == bandStateAsleep) {
+                labels[i] = bandVetoRecoverStage
+                changed = true
+            }
+        }
+        if (!changed) return stages   // the band disputed nothing -> byte-identical hypnogram
+        // Re-collapse consecutive same-stage epochs back into segments tiling [start, end].
+        val out = ArrayList<StageSegment>()
+        for (i in 0 until n) {
+            val segStart = epochStart(i)
+            val segEnd = if (i == n - 1) end else epochStart(i + 1)
+            val last = out.lastOrNull()
+            if (last != null && last.stage == labels[i]) {
+                out[out.size - 1].end = segEnd
+            } else {
+                out.add(StageSegment(start = segStart, end = segEnd, stage = labels[i]))
+            }
+        }
+        if (out.isNotEmpty()) out[out.size - 1].end = end
+        return out
     }
 
     /**
@@ -1031,7 +1549,8 @@ object SleepStager {
         runs = mergePeriods(runs)
         // Re-stitch sleep runs fragmented by pure gravity dropouts (sparse only) before minSleepMin.
         val runsBeforeBridge = if (traceSink == null) 0 else runs.count { it.stage == "sleep" }
-        runs = bridgeSparseSleep(runs, sparse = sparse, hr = hrS, baseline = baseline)
+        val bridged = bridgeSparseSleepTraced(runs, sparse = sparse, hr = hrS, baseline = baseline)
+        runs = bridged.first
         // Sleep & Rest test mode (E10): record the sparse-gravity bridge result, so a sparse 5.0 night
         // rescued from fragmentation is visible. Only when gravity is sparse and only when tracing.
         if (traceSink != null && sparse) {
@@ -1039,6 +1558,24 @@ object SleepStager {
             traceSink(SleepStagerTrace.runLine(-1, 0, 0,
                 if (runsAfterBridge < runsBeforeBridge) SleepStagerTrace.Verdict.KEPT else SleepStagerTrace.Verdict.DROPPED,
                 "sparseBridge", "sparse=true gapMin=$sparseBridgeGapMin runsBefore=$runsBeforeBridge runsAfter=$runsAfterBridge"))
+            // #1657: one line per pair the bridge CONSIDERED, ported from Swift and extended with the
+            // intervening active run's length. No lines at all still means no candidate pair existed;
+            // an activeTooLong line names the bound that blocked one, which is the number a future
+            // reader needs and the old trace could not supply. Android had NONE of this before — the
+            // line that made #1657 diagnosable was iOS-only, so an Android reporter saw runsBefore ==
+            // runsAfter and no reason at all.
+            if (bridged.second.isEmpty()) {
+                traceSink(SleepStagerTrace.runLine(-1, 0, 0, SleepStagerTrace.Verdict.DROPPED,
+                    "sparseBridge",
+                    "no candidate pairs (one sleep run, or fragments split by consecutive active runs)"))
+            }
+            for ((i, a) in bridged.second.withIndex()) {
+                traceSink(SleepStagerTrace.runLine(-1, 0, 0,
+                    if (a.bridged) SleepStagerTrace.Verdict.KEPT else SleepStagerTrace.Verdict.DROPPED,
+                    "sparseBridgePair",
+                    "pair=$i gapMin=${a.gapMin} activeMin=${a.activeMin} activeCapMin=${a.activeCapMin} " +
+                        "hrInSleepBand=${a.hrInSleepBand} reason=${a.reason}"))
+            }
         }
 
         val minSleepS = (minSleepMin * 60).toLong()
@@ -1059,11 +1596,23 @@ object SleepStager {
         // traceSink calls are the only addition and never alter `sessions`. `runIndex` counts only
         // sleep-stage runs so the trace numbers match the candidate ordinal.
         var runIndex = -1
+        // #737 follow-up: counters for the one-line detection summary emitted before `return` (below).
+        // Trace-only — never read back into `sessions`, so the untraced path stays byte-identical. They
+        // make the "slept 8h, app shows 1h" shape legible at a glance: a big detectedSpan with most runs
+        // dropped by the 60-min gate is the fragmentation signature. Mirrors Swift.
+        var sleepRunsSeen = 0
+        var minSleepDrops = 0
+        var firstSleepStart = Long.MAX_VALUE
+        var lastSleepEnd = 0L
         for (p in runs) {
             if (p.stage != "sleep") continue
             runIndex += 1
+            sleepRunsSeen += 1
+            firstSleepStart = minOf(firstSleepStart, p.start)
+            lastSleepEnd = maxOf(lastSleepEnd, p.end)
             val spanMin = ((p.end - p.start) / 60).toInt()
             if ((p.end - p.start) <= minSleepS) {
+                minSleepDrops += 1
                 traceSink?.invoke(SleepStagerTrace.runLine(runIndex, p.start, p.end,
                     SleepStagerTrace.Verdict.DROPPED, "minSleepMin", "spanMin=$spanMin minSleepMin=$minSleepMin"))
                 continue
@@ -1124,13 +1673,19 @@ object SleepStager {
                     "daytime=true restingHR=${resting ?: -1} baseline=${baseline?.toInt() ?: -1} nightTail=false"))
                 continue
             }
-            val stages = if (useSleepStagerV2) {
+            val rawStages = if (useSleepStagerV2) {
                 SleepStagerV2.stageSession(start = p.start, end = p.end, grav = grav,
                     hr = hrS, rr = rrS, resp = respS)
             } else {
                 stageSession(start = p.start, end = p.end, grav = grav,
                     hr = hrS, rr = rrS, resp = respS)
             }
+            // Band sleep_state WAKE-veto: recover INTERIOR false-wake epochs the strap's OWN band
+            // ([bandSleepState]) scored "asleep". No-op when the band is absent (WHOOP 4.0) or the flag is
+            // off; stager-agnostic (corrects whichever hypnogram V1/V2 produced). Efficiency below is then
+            // computed on the corrected stages, so a night NOOP over-called wake on reports true efficiency.
+            val stages = applyBandStateWakeVeto(rawStages, start = p.start, end = p.end,
+                bandSleepState = bandSleepState)
             val eff = efficiency(start = p.start, end = p.end, stages = stages)
             val avgHrv = sessionAvgHRV(start = p.start, end = p.end, rr = rrS)
             sessions.add(
@@ -1142,11 +1697,42 @@ object SleepStager {
             traceSink?.invoke(SleepStagerTrace.runLine(runIndex, p.start, p.end,
                 SleepStagerTrace.Verdict.KEPT, "accepted",
                 "spanMin=$spanMin eff=${SleepStagerTrace.round2(eff)} restingHR=${resting ?: -1} daytime=$isDaytime"))
+            // #1210 shadow: the band wake-veto is dormant (default-off), but its recovered-vs-reverse ratio
+            // can only come from banded nights. When a band stream is present, compute what the veto WOULD
+            // recover and trace it — OUTPUT-NEUTRAL: `stages`/`eff` persisted above are the flag-gated
+            // (unchanged) values and nothing reads `shadowStages`. Guarded on `traceSink`, so it fires ONLY
+            // while a diagnostic is collecting (zero production cost). Retire once the flip (#1210) lands.
+            if (traceSink != null && !bandStateWakeVetoEnabled && bandSleepState.isNotEmpty()) {
+                // cutoffTs = 0 on purpose: the shadow measures the FULL veto potential across EVERY banded
+                // night (history included) to build the validation distribution, independent of whatever
+                // new-nights cutoff the eventual flip uses.
+                val shadowStages = applyBandStateWakeVeto(rawStages, start = p.start, end = p.end,
+                    bandSleepState = bandSleepState, enabled = true, cutoffTs = 0L)
+                val shadowEff = efficiency(start = p.start, end = p.end, stages = shadowStages)
+                val recoveredMin = (shadowEff - eff) * (p.end - p.start).toDouble() / 60.0
+                if (recoveredMin >= 1.0) {
+                    traceSink(bandVetoShadowLine(startTs = p.start, recoveredMin = recoveredMin,
+                        rawEff = eff, shadowEff = shadowEff))
+                }
+            }
             // A run that does NOT continue the chain re-anchors it on this run's onset.
             if (!continuesChain) chainFromOvernight = isOvernightOnset(p.start, tzOffsetSeconds)
             chainPrevEnd = p.end
         }
         sessions.sortBy { it.start }
+        // #737 follow-up: one glanceable line summarising the whole detection pass. A large
+        // detectedSpanMin with most runs droppedMinSleep and a small survivingSpanMin is exactly the
+        // "slept ~8h, only ~1h confirmed" fragmentation the field reports describe. Trace-only. Byte-
+        // identical string to Swift's summary line.
+        if (traceSink != null) {
+            val detectedSpanMin = if (lastSleepEnd > firstSleepStart) ((lastSleepEnd - firstSleepStart) / 60).toInt() else 0
+            val survivingSpanMin = (sessions.sumOf { it.end - it.start } / 60).toInt()
+            traceSink(
+                "sleep-detect summary: sleepRuns=$sleepRunsSeen droppedMinSleep=$minSleepDrops " +
+                    "kept=${sessions.size} detectedSpanMin=$detectedSpanMin survivingSpanMin=$survivingSpanMin " +
+                    "sparse=$sparse grav=${grav.size} hr=${hrS.size}"
+            )
+        }
         return sessions
     }
 
@@ -1579,7 +2165,7 @@ object SleepStager {
      * enough that only an unambiguous dropout trips it, and deliberately not tuned to a corpus.
      * Byte-parity twin of Swift `rsaGapToleranceS`.
      */
-    private const val rsaGapToleranceS: Double = 3.0
+    internal const val rsaGapToleranceS: Double = 3.0
 
     /** Physiologic breath-interval band (seconds): 0.1–0.4 Hz = 6–24 breaths/min. */
     private const val rsaMinBreathIntervalS: Double = 2.5  // 24 bpm
@@ -1639,6 +2225,43 @@ object SleepStager {
             .sortedBy { it.ts }
             .filter { it.rrMs.toDouble() >= HrvAnalyzer.RR_MIN_MS && it.rrMs.toDouble() <= HrvAnalyzer.RR_MAX_MS }
             .toList()
+
+        // Beat-accuracy gate (#882/#883): RSA needs per-beat-accurate TIMING - each row's wall-clock gap
+        // must be ≈ its own R-R value. A BANKED stream (an Oura overnight IBI stamps a whole record of
+        // intervals on one coarse ring-time) fails this, and the estimate it produces is not physiology;
+        // return NaN instead. Beat-accurate callers (WHOOP R-R, the synthetic RSA fixtures) measure ~100%
+        // and pass unchanged. Needs a few beats to judge; below that the count gate below handles it.
+        //
+        // Shares HrvAnalyzer's ONE definition of the judgement (#1108) rather than keeping a second copy:
+        // "is each stored interval a real beat-to-beat measurement?" is the same question SDNN asks, and
+        // one boundary deserves one set of constants. The range filter has already run, so an out-of-range
+        // R-R cannot fail the accuracy test spuriously.
+        //
+        // WHAT THIS ACTUALLY CATCHES, measured (2026-08-07, two Oura nights, 31,460 and 30,754 in-bed
+        // beats, fraction 0.0246 / 0.0235): NOT a corrupted time AXIS - the ring's records tile the night,
+        // sum(R-R) over wall span is 1.030 / 1.008, so beat-time reconstructs the night to 1-3%. What is
+        // unusable is the interval VALUES: the ring decomposes each ~6.6 s record into ~6 intervals whose
+        // SUM is right to ~1% while the individual values are not beat-to-beat measurements (the same
+        // decomposition documented on HrvAnalyzer.beatValuesAreTrustworthy). RSA reads the beat-to-beat
+        // variation, so it has nothing to read, and the peak-picker returns its own floor: on both nights
+        // the ungated estimate is 13.33 bpm, and SHUFFLING or REVERSING the night's R-R values returns the
+        // SAME 13.3333 to four decimals. It is a plausible-looking number carrying zero information -
+        // squarely inside respPlausibleRangeBpm, so the range clamp below never sees it. That is why the
+        // gate is on BANKED-ness rather than on the output value.
+        //
+        // DISTINCT FROM #977's splice skip below, and BOTH are needed - they catch opposite banking
+        // GEOMETRIES. #977 catches banking that TILES time (the real ring: a ~7 s record boundary against a
+        // ~1.1 s interval reads as a splice, and on those two nights it independently discards 113/113 and
+        // 114/114 windows). This catches banking that COMPRESSES time - respRateFromRR_batchedTimestampsIsNaN
+        // stamps 6 beats per single second, so no gap ever exceeds rsaGapToleranceS and the splice skip
+        // never fires. Neither subsumes the other; a firmware that changes its record period moves a stream
+        // from one geometry to the other without warning. Byte-identical twin of the Swift gate.
+        if (inBedRows.size >= 30) {
+            val fraction = HrvAnalyzer.beatAccurateFraction(
+                inBedRows.map { it.ts }, inBedRows.map { it.rrMs.toDouble() })
+            if (!HrvAnalyzer.beatValuesAreTrustworthy(fraction)) return nan
+        }
+
         val filtered = inBedRows.map { it.rrMs.toDouble() }
         if (filtered.size < 30) return nan // need enough beats for any RSA estimate
 

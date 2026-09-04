@@ -24,19 +24,30 @@ import kotlin.math.roundToInt
 /**
  * The AI Coach.
  *
- * Privacy posture: this is the ONE networked feature in the app. Nothing leaves the device
- * until the user has saved their own API key (see [AiKeyStore]) and asked a question. Only a
- * compact plain-text summary of their metrics plus their question is sent to the provider the
- * user picked. No raw samples, no identifiers.
+ * Privacy posture: this is an opt-in networked feature, independent of the default-off Experimental
+ * self-hosted push. Nothing leaves through the Coach until the user has saved their own API key (see
+ * [AiKeyStore]) and asked a question. Only a compact plain-text summary of their metrics plus their
+ * question is sent to the provider the user picked. No raw samples, no identifiers.
  *
  * Anonymous: the only branding is the provider name the user selected. The system prompt does
  * not name any app author or model vendor.
  */
-class AiCoach(private val repo: WhoopRepository) {
+class AiCoach(
+    private val repo: WhoopRepository,
+    /** #1304/#512: resolves the ACTIVE strap id. A lambda (not a plain `String`) so it is read at
+     *  call time rather than frozen when `AiCoach` is constructed — the app's active id resolves lazily
+     *  at startup, and the coach may be built first. The strap-telemetry reads below
+     *  ([WhoopRepository.daysMerged] / [WhoopRepository.rrIntervals] / Lab markers) union the active strap
+     *  with the canonical "my-whoop"; a live-BLE strap banks under "whoop-<uuid>", so a raw "my-whoop"
+     *  read would leave the coach reasoning off the wrong strap. Defaults to canonical so an import-only
+     *  install (and any test) is byte-identical to the old behaviour. */
+    private val activeStrapId: () -> String = { WhoopRepository.WHOOP_SOURCE },
+) {
 
-    /** The device key the rest of the app reads/writes daily metrics under. Coach reads go
-     *  through the MERGED raw+computed view ([WhoopRepository.daysMerged]), the same per-field
-     *  coalesce every screen uses, so on-device "-noop" scores are visible too (#124). */
+    /** The canonical bucket the imported journal answers ([WhoopRepository.journal]) live under — the app
+     *  keys journal to "my-whoop" everywhere (it is user-global, not strap telemetry), matching Swift
+     *  `AICoach.journalEntries()`. Daily metrics, R-R and Lab Book markers read the active strap via
+     *  [activeStrapId]. */
     private val deviceId = "my-whoop"
 
     /** The source id native (in-app) journal answers are stored under (matches the UI's
@@ -89,7 +100,7 @@ class AiCoach(private val repo: WhoopRepository) {
         val groundedFull = if (consent) {
             // Merged read, NOT raw days(): a live-strap user's scores live under "my-whoop-noop"
             // and a raw read misses them, the coach then claimed it had no data. (#124)
-            val days = runCatching { repo.daysMerged(deviceId) }.getOrDefault(emptyList())
+            val days = runCatching { repo.daysMerged(activeStrapId()) }.getOrDefault(emptyList())
             // Derived stress: a single Baevsky Stress Index summary line over TODAY's R-R, read the
             // same way StressScreen does (repo.rrIntervals over the local day) and gated UNDER this same
             // `consent` block as the HRV/RHR summary, a derived number, never raw R-R egress. Absent
@@ -140,15 +151,16 @@ class AiCoach(private val repo: WhoopRepository) {
 
     /**
      * Today's derived stress line for the consent-gated coach context. Reads R-R for the local day
-     * via [WhoopRepository.rrIntervals] (the SAME path StressScreen uses) and summarises it with the
-     * pure [stressIndexLine]. Returns null when there aren't enough clean beats. Summary number only,      * the raw R-R never leaves the device.
+     * via [WhoopRepository.rrIntervalsUnion] (the SAME path StressScreen uses) and summarises it with the
+     * pure [stressIndexLine]. Returns null when there aren't enough clean beats. Summary number only;
+     * the raw R-R never leaves the device.
      */
     private suspend fun stressLineToday(): String? {
         val nowSeconds = System.currentTimeMillis() / 1000L
         val tzOffset = java.util.TimeZone.getDefault().getOffset(nowSeconds * 1_000L) / 1_000L
         val localNow = nowSeconds + tzOffset
         val from = (localNow - Math.floorMod(localNow, 86_400L)) - tzOffset
-        val rr = repo.rrIntervals(deviceId, from, nowSeconds, limit = 200_000)
+        val rr = repo.rrIntervalsUnion(activeStrapId(), from, nowSeconds, limit = 200_000)
         return stressIndexLine(rr)
     }
 
@@ -243,8 +255,19 @@ class AiCoach(private val repo: WhoopRepository) {
             val sleepH = d.totalSleepMin?.let { fmt1(it / 60.0) + "h" } ?: "-"
             val hrv = d.avgHrv?.let { "${it.roundToInt()}ms" } ?: "-"
             val rhr = d.restingHr?.let { "${it}bpm" } ?: "-"
+            // The stage breakdown and efficiency, which the coach could not see at all: a user asked why
+            // it said it had no access to sleep stages, and it was answering honestly — `rest 7.8h` was
+            // every word it got about a night. These sit on the SAME DailyMetric this line already reads.
+            // Always emitted, "-" when absent, like every other field: a night with no staging then says
+            // so, rather than the schema changing shape between days and inviting the model to read a
+            // missing field as a zero. Twin of the Swift `AICoach.dayLine`.
+            val deep = d.deepMin?.let { fmt1(it / 60.0) + "h" } ?: "-"
+            val rem = d.remMin?.let { fmt1(it / 60.0) + "h" } ?: "-"
+            val light = d.lightMin?.let { fmt1(it / 60.0) + "h" } ?: "-"
+            val eff = effPctOrDash(d.efficiency)
             sb.append(
-                "  ${d.day}: charge $recovery, effort $strain, rest $sleepH, HRV $hrv, RHR $rhr\n"
+                "  ${d.day}: charge $recovery, effort $strain, rest $sleepH, " +
+                    "deep $deep, REM $rem, light $light, eff $eff, HRV $hrv, RHR $rhr\n"
             )
         }
 
@@ -296,11 +319,12 @@ class AiCoach(private val repo: WhoopRepository) {
         val sb = StringBuilder()
 
         // --- Strongest associations on the user's own logged days (recovery as the outcome) ---
-        val behaviours = runCatching { journalBehaviours() }.getOrDefault(emptyMap())
-        val days = runCatching { repo.daysMerged(deviceId) }.getOrDefault(emptyList())
+        val (behaviours, controls) = runCatching { journalBehaviours() }
+            .getOrDefault(emptyMap<String, Set<String>>() to emptyMap())
+        val days = runCatching { repo.daysMerged(activeStrapId()) }.getOrDefault(emptyList())
         if (behaviours.isNotEmpty() && days.isNotEmpty()) {
             val recoveryByDay = days.mapNotNull { d -> d.recovery?.let { d.day to it } }.toMap()
-            val ranked = runCatching { EffectRanker.rank(behaviours, recoveryByDay, "Charge") }
+            val ranked = runCatching { EffectRanker.rank(behaviours, controls, recoveryByDay, "Charge") }
                 .getOrDefault(emptyList())
                 .take(3)
             if (ranked.isNotEmpty()) {
@@ -329,23 +353,31 @@ class AiCoach(private val repo: WhoopRepository) {
         return sb.toString().trim().takeIf { it.isNotEmpty() }
     }
 
-    /** Behaviour → set of "yyyy-MM-dd" days it was logged "yes" (imported ∪ native), for EffectRanker. */
-    private suspend fun journalBehaviours(): Map<String, Set<String>> {
+    /** Behaviour → the days it was logged YES and the days it was logged NO (imported ∪ native), for
+     *  EffectRanker. Kept apart: a day with no journal row for a question belongs to neither, so an
+     *  unanswered day is never counted as a No — see [EffectRanker.effect]. */
+    private suspend fun journalBehaviours(): Pair<Map<String, Set<String>>, Map<String, Set<String>>> {
         val imported = repo.journal(deviceId, "0000-01-01", "9999-12-31")
         val native = repo.journal(journalDeviceId, "0000-01-01", "9999-12-31")
         val byKey = LinkedHashMap<Pair<String, String>, JournalEntry>()
         for (e in imported) byKey[e.day to e.question] = e
         for (e in native) byKey[e.day to e.question] = e   // native wins on a collision
-        val out = HashMap<String, MutableSet<String>>()
-        for (e in byKey.values) if (e.answeredYes) out.getOrPut(e.question) { mutableSetOf() }.add(e.day)
-        return out.mapValues { it.value.toSet() }
+        val yes = HashMap<String, MutableSet<String>>()
+        val no = HashMap<String, MutableSet<String>>()
+        for (e in byKey.values) {
+            val bucket = if (e.answeredYes) yes else no
+            bucket.getOrPut(e.question) { mutableSetOf() }.add(e.day)
+        }
+        return yes.mapValues { it.value.toSet() } to no.mapValues { it.value.toSet() }
     }
 
-    /** The latest reading per Lab Book marker key (stored under the strap deviceId). */
+    /** The latest reading per Lab Book marker key (stored under the ACTIVE strap deviceId). #1304/#512:
+     *  read under the active strap id — matching Swift `AICoach` (`labMarkers(deviceId: repo.deviceId)`) —
+     *  so a 2nd strap's markers under "whoop-<uuid>" aren't missed. */
     private suspend fun latestLabMarkers(): List<LabMarkerRow> {
         val all = ArrayList<LabMarkerRow>()
         for (category in LabMarkerCategory.entries) {
-            all += runCatching { repo.labMarkersByCategory(deviceId, category.raw) }.getOrDefault(emptyList())
+            all += runCatching { repo.labMarkersByCategory(activeStrapId(), category.raw) }.getOrDefault(emptyList())
         }
         return all.groupBy { it.markerKey }.values.map { rows -> rows.maxByOrNull { it.takenAt }!! }
             .sortedBy { it.markerKey }
@@ -699,6 +731,27 @@ class AiCoach(private val repo: WhoopRepository) {
     // Small numeric formatting helpers
     // ---------------------------------------------------------------------------------------
 
+    /**
+     * Efficiency as a percentage, NORMALISING the stored value first.
+     *
+     * `DailyMetric.efficiency` is not reliably a 0-1 fraction - it arrives as a percentage on some
+     * import paths, which SleepMetricDetailLogic and SleepModelLogic each guard against inline. A bare
+     * `* 100` would hand the coach "eff 9400%" for an imported night, and a model given a nonsense
+     * number reasons about it confidently rather than ignoring it.
+     *
+     * 1.5 rather than 1.0 because a genuine fraction can exceed 1.0 only by floating-point noise, while
+     * a genuine percentage is 30-100. The two existing Kotlin copies split at 1.0; matching the Swift
+     * twin here keeps the COACH line consistent across platforms, and the wider divergence between
+     * those thresholds is pre-existing and not this change's to settle.
+     */
+    private fun effPctOrDash(raw: Double?): String {
+        var e = raw ?: return "-"
+        if (e <= 0.0) return "-"
+        if (e > 1.5) e /= 100.0
+        if (e <= 0.0 || e > 1.0) return "-"
+        return "${(e * 100).roundToInt()}%"
+    }
+
     private fun fmt1(v: Double): String =
         if (v == v.roundToInt().toDouble()) v.roundToInt().toString()
         else String.format("%.1f", v)
@@ -884,7 +937,8 @@ class AiCoach(private val repo: WhoopRepository) {
         const val DEFAULT_SYSTEM_PROMPT =
             "You are an elite, supportive recovery and performance coach with a real training " +
                 "methodology. You may be given a summary of the user's own wearable data (charge " +
-                "0-100, effort 0-100, rest/sleep, HRV, resting heart rate) and recent workouts. " +
+                "0-100, effort 0-100, rest/sleep and its deep/REM/light breakdown, sleep " +
+                "efficiency, HRV, resting heart rate) and recent workouts. " +
                 "Charge is the daily recovery/readiness score; effort is the day's cardiovascular " +
                 "load. Coach using autoregulation: charge 67-100 = green light to build/push, " +
                 "higher effort is fine; 34-66 = maintain, quality over volume, keep it controlled; " +

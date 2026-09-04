@@ -166,9 +166,29 @@ object Whoop5Ecg {
         RIGHT(0, "right"), LEFT(1, "left")
     }
 
-    /** The mainControlECGDataGeneration argument. */
+    /**
+     * The mainControlECGDataGeneration argument.
+     *
+     * ⚠️ These raw values are ATTESTED ON ONE DEVICE, and they are NOT the vendor client's declaration
+     * order. The previous `STOP(0) / START(1) / RESTART(2)` was read off that order and shipped
+     * unverified (#896). On a WHOOP MG (`WS50_r00`, fw `50.39.1.0`) each argument was sent on its own
+     * while watching the type-43 stream rather than the ack:
+     *
+     *  - `0` is REFUSED — the strap answers `FAILURE(0)` and generation is unchanged, so there is no
+     *    case for it here and nothing can send it.
+     *  - `1` STOPS generation.
+     *  - `2` STARTS it. The type-43 stream only follows once `TOGGLE_LABRADOR_FILTERED (139)` is on, so
+     *    the working turn-on order is `139 = 1` then `124 = 2`. 139 gates the STREAM rather than the
+     *    front end: with 139 closed, `124 = 2` still made the strap's own console log
+     *    `MAX86176: Set ECG ON` while no packets arrived (8 sends, 8 console lines, #891).
+     *
+     * One device, one firmware. #1100 ran `WS50_r03` / `50.40.1.0` and nothing here says the two agree.
+     * Whether `2` is a plain start or a stop-then-start is NOT distinguishable from a stream that was
+     * already off, so the case is named for what it achieves rather than for the client's third name.
+     * Twin of Swift `ControlSignal`.
+     */
     enum class ControlSignal(val raw: Int, val token: String) {
-        STOP(0, "stop"), START(1, "start"), RESTART(2, "restart")
+        STOP(1, "stop"), START(2, "start")
     }
 
     fun commandPayload(arg: Int): List<Int> = listOf(COMMAND_REVISION, arg)
@@ -229,7 +249,9 @@ object Whoop5Ecg {
     fun requestsRealtimeData(cmd: Int, arg: Int): Boolean = when (cmd) {
         TOGGLE_REALTIME_FILTERED_ECG_CMD -> arg != 0
         MAIN_CONTROL_ECG_DATA_GENERATION_CMD ->
-            arg == ControlSignal.START.raw || arg == ControlSignal.RESTART.raw
+            // Only the START value. `ControlSignal.STOP` (1) halts generation, so a run whose last act
+            // was that one asked for nothing and its silence is the expected outcome, not a finding.
+            arg == ControlSignal.START.raw
         else -> false
     }
 
@@ -357,6 +379,90 @@ object Whoop5Ecg {
     /** CRC-gated raw decode straight off a complete 5/MG frame, with an explicit sample width. */
     fun decodeRawFrame(frame: ByteArray, bytesPerSample: Int, payloadStart: Int = PUFFIN_PAYLOAD_START): RawLabradorPacket? =
         innerPayload(frame, payloadStart)?.let { decodeRaw(it, bytesPerSample) }
+
+    // ---- The type-43 REALTIME_RAW_DATA record: the live ECG sample carrier (#891/#1100) -----------
+    //
+    // OBSERVED on one WHOOP MG (WS50_r00, fw 50.39.1.0), not attested by any vendor document: once
+    // TOGGLE_LABRADOR_FILTERED(139)=1 has opened the master gate, the strap emits fixed-size 240-byte
+    // REALTIME_RAW_DATA (type 43) records whose body carries an i16-LE series. The offsets below are the
+    // OBSERVED layout, and they live here — with the other Labrador protocol facts — rather than in the app
+    // layer, so the three consumers (live view, signal classifier, waveform export) cannot drift apart and
+    // so the decode is unit-testable without a strap.
+    //
+    // What this layout is NOT: the documented 17-byte status header ([HEADER_LENGTH]) is the FILTERED
+    // packet's, and it is a separate question whether it also sits inside this record (see #891 §7). Nothing
+    // here decodes a status field, an HR, or a rhythm classification — only the sample series and a byte-fill
+    // count. A record that fails CRC must never reach these helpers: callers gate on the frame's CRC first.
+
+    /** Every REALTIME_RAW_DATA record OBSERVED on the MG was exactly this long. */
+    const val RAW_RECORD_LENGTH = 240
+
+    /** Frame offset of the inner record's type byte on 5/MG (`[8]type [9]seq [10]cmd`). */
+    const val RAW_TYPE_OFFSET = 8
+
+    /** First body byte considered by [realtimeRawBodyNonZeroBytes] — excludes the constant sub-header. */
+    const val RAW_BODY_START = 24
+
+    /** First waveform byte. Bytes 24..33 are a constant 5x i16 sub-header that is NOT waveform. */
+    const val RAW_WAVEFORM_START = 34
+
+    /** One past the last body byte; the remaining 4 bytes are the frame's CRC32 trailer. */
+    const val RAW_BODY_END = 236
+
+    /**
+     * Samples one record carries: 101. Load-bearing beyond arithmetic — a fixed sample count per record is
+     * exactly the shape that makes autocorrelation manufacture a peak at the record period, so anything
+     * estimating a rate from these samples must exclude this lag. See the #194 withdrawal.
+     */
+    const val SAMPLES_PER_RAW_RECORD = (RAW_BODY_END - RAW_WAVEFORM_START) / 2
+
+    /** Non-zero body bytes above which a record is treated as carrying a waveform rather than baseline. */
+    const val RAW_BODY_ACTIVE_NONZERO_BYTES = 20
+
+    /** True for a frame shaped like a REALTIME_RAW_DATA record. Shape only — says nothing about CRC. */
+    fun isRealtimeRawRecord(frame: ByteArray): Boolean =
+        frame.size == RAW_RECORD_LENGTH &&
+            (frame[RAW_TYPE_OFFSET].toInt() and 0xFF) == PacketType.REALTIME_RAW_DATA.rawValue
+
+    /**
+     * The record's i16-LE sample series, or null when [frame] is not a REALTIME_RAW_DATA record.
+     *
+     * Signed two's-complement, little-endian, exactly [SAMPLES_PER_RAW_RECORD] values. Zero samples are
+     * returned as zeros and never trimmed: for a research artifact a trailing run of zeros is evidence
+     * about the record, not padding to be tidied away.
+     */
+    fun realtimeRawSamples(frame: ByteArray): IntArray? {
+        if (!isRealtimeRawRecord(frame)) return null
+        val out = IntArray(SAMPLES_PER_RAW_RECORD)
+        var i = RAW_WAVEFORM_START
+        var n = 0
+        while (i + 1 < RAW_BODY_END) {
+            var v = (frame[i].toInt() and 0xFF) or ((frame[i + 1].toInt() and 0xFF) shl 8)
+            if (v >= 0x8000) v -= 0x10000
+            out[n] = v
+            n += 1
+            i += 2
+        }
+        return out
+    }
+
+    /** Non-zero bytes in the body region, or null when [frame] is not a REALTIME_RAW_DATA record. */
+    fun realtimeRawBodyNonZeroBytes(frame: ByteArray): Int? {
+        if (!isRealtimeRawRecord(frame)) return null
+        var n = 0
+        for (i in RAW_BODY_START until RAW_BODY_END) if (frame[i].toInt() != 0) n += 1
+        return n
+    }
+
+    /**
+     * ONE definition of "this record carries a waveform", so the live view, the command-lab signal line and
+     * the reliability scorer cannot disagree about the same record. Null when not such a record.
+     *
+     * What it cannot tell you: a flat record means the electrode circuit is open OR generation is off. It is
+     * a byte-fill observation, never a statement about the wearer.
+     */
+    fun realtimeRawSignalPresent(frame: ByteArray): Boolean? =
+        realtimeRawBodyNonZeroBytes(frame)?.let { it > RAW_BODY_ACTIVE_NONZERO_BYTES }
 
     // Discovery
 

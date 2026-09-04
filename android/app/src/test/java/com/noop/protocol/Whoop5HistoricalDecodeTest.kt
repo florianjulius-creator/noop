@@ -32,10 +32,37 @@ class Whoop5HistoricalDecodeTest {
         assertNotNull(p)
         p!!
         assertEquals(18, p["hist_version"])
-        assertEquals(1780916150, p["unix"])
+        // Long, not Int: `unix` is an unsigned u32 kept in the unsigned domain so a post-2038 value
+        // cannot go negative on Kotlin's 32-bit Int and get dropped by the #547 gate (see `histU32`).
+        assertEquals(1780916150L, p["unix"])
         assertEquals(102, p["heart_rate"])
         assertEquals(2, p["rr_count"])
         assertEquals(listOf(602, 613), p["rr_intervals"])
+
+        // Physiological cross-check: 60000 / mean(R-R) ≈ heart_rate, from the PARSE rather than literals.
+        // Twin of the Swift `testHistoricalV18HeartRateRRAndGravity` check, which this side never had.
+        //
+        // The pins above already fix both values, so this catches nothing a wrong offset would not
+        // already trip. What it guards is the PINS: a decoder change "fixed" by regenerating the
+        // expected values until they pass has to produce numbers that are still physiologically
+        // coherent. See the Swift twin for the fuller note.
+        //
+        // It does NOT discriminate UNITS and tightening it will not make it: milliseconds and 1/1024-s
+        // ticks differ by 2.4% (~2.5 bpm here), less than a two-beat sample varies against a heart_rate
+        // averaged over the record. See the Swift twin for why, and where the units question was settled.
+        @Suppress("UNCHECKED_CAST")
+        val rr = p["rr_intervals"] as List<Int>
+        assertTrue("no R-R decoded — the cross-check below would be vacuous", rr.isNotEmpty())
+        val meanRr = rr.sum().toDouble() / rr.size
+        // Delta 4.0, bounded from both sides rather than picked: it must exceed this record's real
+        // 3.2 bpm error under the shipped reading (a two-beat sample against an averaged heart_rate
+        // differs by that much, so anything tighter fails on CORRECT data), and stay well below the
+        // ~96 bpm a misread offset produces. Do not tighten it to look stricter.
+        // Fitted to THIS record, not a general invariant. `secondDeviceHR63` below (hr 63, a single
+        // interval of 1020) computes 58.8 bpm, an error of 4.18 — so copying this assertion onto that
+        // frame fails at this tolerance. A single interval against an averaged rate is simply noisier;
+        // widen it there with its own reason rather than loosening this one.
+        assertEquals((p["heart_rate"] as Int).toDouble(), 60_000.0 / meanRr, 4.0)
 
         val gx = p["gravity_x"] as Double
         val gy = p["gravity_y"] as Double
@@ -86,7 +113,10 @@ class Whoop5HistoricalDecodeTest {
         // Fields read off the same real worn frame, justified by observed behaviour (parity with the
         // Swift Whoop5HistoricalTests.testHistoricalV18ObservedFields).
         val p = decodeHistorical(bytes(wornV18), DeviceFamily.WHOOP5)!!
-        assertEquals(25443699, p["record_index"])               // @11 per-record counter
+        // Long, not Int: record_index is an unsigned u32 and Kotlin's Int is 32-bit while Swift's is
+        // 64-bit, so it is carried as a Long to keep the two decoders' output identical (see the
+        // decoder comment and the high-bit oracle fixture).
+        assertEquals(25443699L, p["record_index"])              // @11 per-record counter
         assertEquals(141, p["hr_quality_flags"])                // @36 flag byte (0x8D), NOT a fixed-point HR
         assertEquals(101, p["heart_rate_alt"])                  // @37 duplicate HR (hr@22 = 102)
         assertEquals(170, p["step_cadence"])                    // @59 cadence-like byte (raw)
@@ -233,7 +263,7 @@ class Whoop5HistoricalDecodeTest {
         assertNotNull(p)
         p!!
         assertEquals(18, p["hist_version"])
-        assertEquals(1781047486, p["unix"])
+        assertEquals(1781047486L, p["unix"])
         assertEquals(66, p["heart_rate"])
         assertEquals(3238, p["skin_temp_raw"]) // 32.38 °C on the wrist
         val gx = p["gravity_x"] as Double
@@ -253,8 +283,8 @@ class Whoop5HistoricalDecodeTest {
     @Test
     fun decodesV18FromASecondDevice() {
         for ((hex, expectHR, expectUnix) in listOf(
-            Triple(secondDeviceHR57, 57, 1781120109),
-            Triple(secondDeviceHR63, 63, 1781124622),
+            Triple(secondDeviceHR57, 57, 1781120109L),
+            Triple(secondDeviceHR63, 63, 1781124622L),
         )) {
             val p = decodeHistorical(bytes(hex), DeviceFamily.WHOOP5)
             assertNotNull(p); p!!

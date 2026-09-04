@@ -12,7 +12,9 @@ extension TodaySection {
         case .heartRate: return "waveform.path.ecg"
         case .recoveryVitals: return "heart.text.square"
         case .yourCards: return "rectangle.stack"
+        case .menstrualCycle: return "drop.degreesign"
         case .journal: return "book.closed"
+        case .addedCards: return "rectangle.stack.badge.plus"
         }
     }
 
@@ -26,7 +28,9 @@ extension TodaySection {
         case .heartRate: return StrandPalette.metricRose
         case .recoveryVitals: return StrandPalette.metricCyan
         case .yourCards: return StrandPalette.accent
+        case .menstrualCycle: return StrandPalette.restColor
         case .journal: return StrandPalette.metricAmber
+        case .addedCards: return StrandPalette.accent
         }
     }
 }
@@ -44,6 +48,8 @@ extension KeyMetric {
         case .steps: return "figure.walk"
         case .weight: return "scalemass"
         case .calories: return "flame.fill"
+        // Same glyph the sibling "Your Cards" tile (`DashboardCard.skinTemp`) already uses.
+        case .skinTemp: return "thermometer.medium"
         }
     }
 
@@ -55,7 +61,7 @@ extension KeyMetric {
         case .restingHr: return StrandPalette.metricRose
         case .bloodOxygen, .steps: return StrandPalette.metricCyan
         case .respiratory, .weight: return StrandPalette.accent
-        case .calories: return StrandPalette.metricAmber
+        case .calories, .skinTemp: return StrandPalette.metricAmber
         }
     }
 }
@@ -65,6 +71,7 @@ extension DashboardCard {
         switch self {
         case .stress, .respiratory: return StrandPalette.accent
         case .fitnessAge: return StrandPalette.chargeColor
+        case .vo2max: return StrandPalette.chargeColor
         case .vitality, .hrv: return StrandPalette.metricPurple
         case .restingHr: return StrandPalette.metricRose
         case .steps, .bloodOxygen, .hydration: return StrandPalette.metricCyan

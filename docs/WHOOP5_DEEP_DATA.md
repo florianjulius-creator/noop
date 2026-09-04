@@ -79,6 +79,19 @@ that otherwise reproduced flags 1–15 byte-for-byte in this order.
 - **iOS / Android only on real hardware:** macOS CoreBluetooth can't complete the authenticated SMP bond
   the command characteristic requires, so the write path is unavailable on Mac.
 
+## High-rate IMU capture is a separate switch
+
+The R22 feature flags above govern deep-history products; they are not the missing step for an explicit
+100 Hz motion session. Hardware testing found a separate bounded raw-data sequence: `START_RAW_DATA`
+(81) must precede the two-byte 5/MG `TOGGLE_IMU_MODE` (106) selector. Sending 106 alone can return
+`SUCCESS` while producing no packets. With `[0x01, 0x01]` after command 81, NOOP receives and decodes
+the six-axis 100 Hz buffers; stop uses command 82 followed by `[0x01, 0x00]`.
+
+This establishes an on-demand research/workout capture path, not a safe continuous mode. Battery,
+retention, and BLE-airtime cost over day-scale recording remain unmeasured. The session collector,
+file-backed storage, Bluetooth-gap repair, and export contract are documented in
+[5/MG raw data capture](RAW_DATA_CAPTURE.md).
+
 ## Honest limits
 
 - **No cloud scores.** Recovery/strain/sleep *scores* are computed in WHOOP's cloud and no public
@@ -90,9 +103,10 @@ that otherwise reproduced flags 1–15 byte-for-byte in this order.
   `get_data_range`/`send_historical_data` loop NOOP already runs. If it does, the write path is belt-and-
   suspenders.
 - **The large records are no longer an undifferentiated type-`0x2F` blob.** Layout v21 (1,244 bytes)
-  contains six-axis IMU data; layout v20 (2,140 bytes) contains five repeated optical measurement
-  blocks; layout v26 contains a 24-sample PPG waveform. The v20 blocks are preserved without
-  wavelength labels because the current capture does not prove red/IR identity.
+  contains six-axis IMU data; layout v20 (2,140 bytes) contains five repeated measurement blocks whose
+  sensor identity remains open; layout v26 contains a 24-sample PPG waveform. The v20 blocks are
+  preserved without optical/wavelength labels because the current capture does not prove what produced
+  them, let alone red/IR identity.
 - **SpO₂ is not “one calibration away.”** The current v20 corpus has three active measurement blocks,
   but it has not established two separate red and infrared illumination measurements. See
   [`WHOOP5_OPTICAL_EXPERIMENT.md`](WHOOP5_OPTICAL_EXPERIMENT.md) for the passive controlled experiment
@@ -146,6 +160,52 @@ that research in progress. What would flip it to a real reading: the `spo2_candi
 tracking the WHOOP app's own SpO₂ across many nights on **multiple devices** (a varying signal, not one
 coincidental match), including on the device where the two checked nights currently move opposite.
 Until that clears the bar, SpO₂ stays import-only on the 5.0.
+
+Wire-level facts (no SpO₂ opcode, export vs on-device aggregation, sleep-only product) are also summarised
+in [`PROTOCOL.md` §10](PROTOCOL.md#10-spo₂-on-50--mg--what-the-wire-does-and-does-not-carry). This section
+keeps the **promotion bar** and the harness that measures it.
+
+### `@82` validation checklist (what would promote the candidate)
+
+Only research — never a silent UI flip. A promote of `spo2_candidate_82` → `spo2Pct` needs all of:
+
+1. **Multiple devices / firmwares** (not one lucky strap): the nightly aggregate of in-band (70–100)
+   `@82` samples during `sleep_state = asleep` tracks the official app or CSV `blood_oxygen_pct` with
+   real night-to-night spread (not a flat 98 %).
+2. **Offset specificity:** nearby bytes (the 74–92 scan the harness already runs) must *not* track
+   better than `@82`.
+3. **Incomplete nights:** when the export omits SpO₂, the wire candidate should be empty or
+   out-of-band — not invent a number. This is a falsification test: an "always 97 %" decoder fails it.
+4. **Resolution of the #103 contradiction** on the original capture device (or a documented
+   extraction / phase / duty-cycle error on one side).
+5. **No recovery / illness gating** on the candidate until (1)–(4) clear — same rule as other
+   derived biosignals.
+
+The multi-device tool below implements the **measurable** half of this list: default gates include
+≥5 paired nights, export range ≥1 %, r ≥ 0.7, MAE ≤ 1.0, best offset = 82, in-band value variance,
+and duty-window coverage (with `feature_absent` when a long-enough asleep capture never emits `@82`).
+Points 4–5 stay human judgment on [#103](https://github.com/ryanbr/noop/issues/103).
+
+Until that bar is met, SpO₂ stays **import-only** on the 5.0, with `@82` available as instrumentation
+for owners who opt into deep-timeline / experimental logging.
+
+Related capability / UX roadmap: [#761](https://github.com/ryanbr/noop/issues/761) (honest labels when
+SpO₂ / skin temp / stages are unavailable vs experimental).
+
+### Band sleep flag vs hypnogram (quick reference)
+
+v18 byte `@81` high nibble is the strap's **coarse on-device sleep flag** (decoded as `sleep_state`):
+
+| High nibble | Name | Meaning |
+|------------:|------|---------|
+| 0 | wake | awake / active |
+| 1 | still | on-wrist still (not yet scored as sleep) |
+| 2 | asleep | scored night / sleep window |
+| 3 | up | post-sleep up |
+
+Useful for sleep *detection* and for gating sleep-only products (including SpO₂ candidates). It is
+**not** Light / SWS / REM — those stages are off-band. Full field notes live with the historical
+decode in `Interpreter.swift` / the Android twin.
 
 ### Multi-device validation tool (`validate_spo2_candidate.py`)
 
@@ -237,7 +297,8 @@ lands in `parseFrameWhoop5` / `whoop_protocol.json`.
 5. **SpO₂ multi-device check:** after you have a history capture + your data export, run
    `python3 Tools/linux-capture/validate_spo2_candidate.py capture.json export/ --device <label> --postable`
    and paste the postable summary on [#103](https://github.com/ryanbr/noop/issues/103). Keep the capture
-   and CSV private; only the aggregate r / MAE / checklist line is needed.
+   and CSV private; only the aggregate r / MAE / checklist line is needed. See the **`@82` validation
+   checklist** above for what “PASS” is meant to mean before any promote.
 
 Credit to **judes.club**, **Asherlc/dofek**, and **b-nnett/goose** for the public protocol work this
 builds on.

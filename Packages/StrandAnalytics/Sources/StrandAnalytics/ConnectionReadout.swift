@@ -22,12 +22,13 @@ public enum ConnectionTrace {
     /// before anyone could start on it.
     ///
     /// An unknown start yields NO suffix rather than `after 0.0s` — "instant drop" and "we do not know"
-    /// are different diagnoses. Locale-fixed so a decimal comma cannot follow the phone language into a
-    /// log people paste into issues. Twin of the Kotlin `ConnectionTrace.sessionHeldSuffix`.
+    /// are different diagnoses. Integer half-up quantization makes exact 50 ms ties deterministic, and
+    /// rendering the whole and fractional digits directly keeps locale out of pasted logs. Twin of the
+    /// Kotlin `ConnectionTrace.sessionHeldSuffix`.
     public static func sessionHeldSuffix(millis: Int) -> String {
         guard millis >= 0 else { return "" }
-        return " after " + String(format: "%.1f", locale: Locale(identifier: "en_US_POSIX"),
-                                  Double(millis) / 1000.0) + "s"
+        let tenths = millis / 100 + (millis % 100 >= 50 ? 1 : 0)
+        return " after \(tenths / 10).\(tenths % 10)s"
     }
 
 
@@ -159,7 +160,9 @@ public enum ConnectionReadout {
 
     /// Last offload result for the readout's `lastOffloadResult` id: the most recent "offload result=<...>"
     /// fragment the offload-progress emitter writes (e.g. "complete rows=42 nights=2", "empty (console
-    /// only)", "stalled (idle timeout)"). nil when no offload has finished this session.
+    /// only)", "idle-timeout after rows=17205", "stalled (idle timeout, rows=0)"). #1466: the last two are
+    /// distinct on purpose — an idle timeout that banked rows is a productive end, and only rows=0 is a
+    /// stall. nil when no offload has finished this session.
     public static func lastOffloadResult(taggedTail: [String]) -> String? {
         for line in taggedTail.reversed() {
             if let r = line.range(of: "offload result=") {
@@ -224,23 +227,121 @@ public enum ConnectionReadout {
         if let d = deviceClockUnix {
             return d < ConnectionTrace.rtcEpochCeilingUnix ? "no (RTC reads 1970/71)" : "yes"
         }
+        // #1823: this branch has NOT read a clock. It is reached when no clock correlation exists - which
+        // is every 5/MG, whose GET_CLOCK reply rides the puffin notify chars and never touches the WHOOP4
+        // correlation path - so the only evidence is how the strap DATED its banked records. Saying "RTC
+        // reads 1970/71" there claimed a reading we never took, in the one readout a reporter quotes when
+        // asking why nothing syncs. Report the evidence we actually have.
         if let n = strapNewestUnix {
-            return n < ConnectionTrace.rtcEpochCeilingUnix ? "no (RTC reads 1970/71)" : "yes"
+            return n < ConnectionTrace.rtcEpochCeilingUnix ? "no (records dated 1970/71)" : "yes"
         }
         return "no (waiting for the strap clock)"
     }
+
+    /// #1818: at or above this charge the "charge it" remedy is already satisfied, so repeating it is
+    /// noise. Twin of the Kotlin constant - the two must move together or the platforms give
+    /// different advice for the same strap.
+    public static let rtcAlreadyChargedPct: Double = 95
 
     /// #987: a plain-words warning when the strap RTC reads epoch-era (~1970/71), from EITHER signal we
     /// hold: the correlated device clock or the strap's newest banked-record timestamp. nil when both
     /// look sane (or neither was seen yet - we never fabricate a fault). One string, shown verbatim on
     /// the Devices / Test Centre connection readout, naming the consequence and the fix.
-    public static func rtcWarning(deviceClockUnix: Int?, strapNewestUnix: Int?) -> String? {
+    ///
+    /// #1818: the remedy is battery-dependent. A flat battery resets the RTC, so on a low strap
+    /// "charge it" is real advice. On an ALREADY-charged strap it is not, and the old copy sent users
+    /// at 100% round a loop they had already run.
+    ///
+    /// The charged branch deliberately states only what holds for EVERY strap - that charging again
+    /// will not change it - and asks for a log. It must NOT claim NOOP re-sends the clock on every
+    /// connect: that is true on WHOOP4 (`runConnectHandshake` calls SET_CLOCK unconditionally, both
+    /// payload forms, #120) but FALSE on a 5/MG, where the clock write is gated behind `didBond`, and
+    /// an unbondable 5/MG (#1635) is never clocked at all - precisely the strap most likely to be
+    /// showing this warning. Explaining the mechanism in the sentence is how the original bug happened.
+    /// `batteryPct` nil (not yet read) keeps the charge advice - we only withdraw it on evidence.
+    /// Callers MUST pass a reading from the CURRENT link (iOS: `batterySamples.last?.soc`, which is
+    /// cleared on disconnect) and not a last-known charge that outlives it - a stale 100% would
+    /// suppress the advice in the one case it is right, a strap that ran flat and reset its RTC.
+    public static func rtcWarning(deviceClockUnix: Int?, strapNewestUnix: Int?,
+                                  batteryPct: Double? = nil) -> String? {
         let ceiling = ConnectionTrace.rtcEpochCeilingUnix
         let clockBad = deviceClockUnix.map { $0 > 0 && $0 < ceiling } ?? false
         let newestBad = strapNewestUnix.map { $0 > 0 && $0 < ceiling } ?? false
         guard clockBad || newestBad else { return nil }
-        return "Strap clock reads 1970/71 (never set since its last reset), so it is not banking history. "
-            + "Charge the strap to 100% and reconnect so the clock latches."
+        let lead = "Strap clock reads 1970/71 (never set since its last reset), so it is not banking history. "
+        if let batteryPct, batteryPct >= rtcAlreadyChargedPct {
+            return lead
+                + "The strap is already charged, so charging again will not change this. Export a strap "
+                + "log from Test Centre so the clock exchange can be read."
+        }
+        return lead + "Charge the strap to 100% and reconnect so the clock latches."
+    }
+
+    /// #1809: one-line account of a finished BLE link, logged on every disconnect.
+    ///
+    /// A strap log could not previously answer "did the strap send anything?". Inbound notifications only
+    /// stamped a liveness timestamp that was then discarded, and the disconnect error reached the log as
+    /// the OS `localizedDescription` while the `CBError` code the #617 branch computes was thrown away. A
+    /// reporter chasing a silent strap had to infer silence from the fact that every LOGGED line happened
+    /// to be outgoing - which measures NOOP's logging, not the strap. This measures the strap.
+    ///
+    /// `armed` matters because the #80 marginal-radio fallback only counts a drop when the R10/R11 burst
+    /// was actually armed; `armed=no` says up front that the detector cannot trip for this link, however
+    /// many times the loop repeats.
+    ///
+    /// Milliseconds are printed raw: no float formatting, so the two platforms cannot round apart.
+    public static func linkEpitaph(upMillis: Int, inboundFrames: Int, inboundBytes: Int,
+                                   cmdChannelFrames: Int, realtimeArmed: Bool, ended: String) -> String {
+        let armed = realtimeArmed ? "yes" : "no"
+        var line = "Link epitaph: up \(max(0, upMillis))ms, inbound \(max(0, inboundFrames)) frames / "
+            + "\(max(0, inboundBytes)) bytes (cmd-channel \(max(0, cmdChannelFrames))), "
+            + "realtime armed=\(armed), ended=\(ended)"
+        if inboundFrames <= 0 {
+            line += " - the strap sent NOTHING on this link"
+        }
+        return line
+    }
+
+    /// #1635: which STREAMS banked rows on a finished link, beside `linkEpitaph`'s "did anything arrive".
+    ///
+    /// The epitaph counts frames, which is the right measure for a silent strap and the wrong one for a
+    /// strap talking over only part of its surface: an unbonded 5/MG streams heart rate and R-R over the
+    /// standard profile all night while every bond-gated stream banks nothing, and the epitaph reports
+    /// that as hundreds of healthy inbound frames. A field diagnosis had to establish the split by
+    /// exporting twice, hours apart, and diffing stored row counts by hand.
+    ///
+    /// Zero-banking streams are named rather than left to be inferred, because "gravity=0 among six other
+    /// zeros" and "gravity=0 while hr=456" read identically and mean opposite things. Counts are ROWS
+    /// ACCEPTED, so a stream arriving as duplicates reads zero and is named — correct here: the question
+    /// is what the database gained on this link.
+    ///
+    /// LIVE streams only, and the sentence says so. The history offload persists through its own path and
+    /// already has its own accounting; counting one and labelling it "this link" would make every healthy
+    /// bonded sync read as "nothing banked for: gravity" — the false alarm this line exists to prevent.
+    ///
+    /// Pure and total, and every count clamped, so it cannot become the reason a teardown path throws.
+    /// Twin of the Kotlin formatter. Apple does not emit it yet; the formatter exists so the two logs
+    /// cannot drift apart when it does.
+    /// `steps` is OPTIONAL because this platform's store does not return a step count at all — steps are
+    /// persist-only here, deliberately outside the 8-field insert tuple, while Room counts them. A
+    /// platform that cannot measure a stream must OMIT it rather than report zero: "banked nothing" is a
+    /// finding and "not measured here" is not, and printing the second as the first would put a permanent
+    /// false alarm in every Apple link's log.
+    public static func linkBankedSummary(hr: Int, rr: Int, gravity: Int, resp: Int,
+                                         skinTemp: Int, spo2: Int, steps: Int?, battery: Int) -> String {
+        var raw: [(String, Int)] = [
+            ("hr", hr), ("rr", rr), ("gravity", gravity), ("resp", resp),
+            ("skinTemp", skinTemp), ("spo2", spo2),
+        ]
+        if let steps { raw.append(("steps", steps)) }
+        raw.append(("battery", battery))
+        let pairs: [(String, Int)] = raw.map { ($0.0, max(0, $0.1)) }
+        let body = pairs.map { "\($0.0)=\($0.1)" }.joined(separator: " ")
+        let total = pairs.reduce(0) { $0 + $1.1 }
+        if total == 0 { return "banked live this link: \(body) - NOTHING was stored from the live streams" }
+        let empty = pairs.filter { $0.1 == 0 }.map { $0.0 }
+        if empty.isEmpty { return "banked live this link: \(body)" }
+        return "banked live this link: \(body) - nothing banked live for: \(empty.joined(separator: ", "))"
     }
 
     /// #987: freshness label for the "last frame" readout row: how long ago the most recent strap frame

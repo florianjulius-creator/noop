@@ -267,17 +267,21 @@ fun SectionHeader(
     trailing: String? = null,
     modifier: Modifier = Modifier,
 ) {
-    Row(
+    Column(
         modifier = modifier.fillMaxWidth(),
-        verticalAlignment = Alignment.Top,
     ) {
-        Column(modifier = Modifier.weight(1f)) {
-            if (overline != null) Overline(overline)
-            Text(title, style = NoopType.title2, color = Palette.textPrimary)
+        if (overline != null || trailing != null) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.Top,
+            ) {
+                if (overline != null) Overline(overline, modifier = Modifier.weight(1f))
+                if (trailing != null) {
+                    Text(trailing, style = NoopType.footnote, color = Palette.textSecondary)
+                }
+            }
         }
-        if (trailing != null) {
-            Text(trailing, style = NoopType.footnote, color = Palette.textSecondary)
-        }
+        Text(title, style = NoopType.title2, color = Palette.textPrimary)
     }
 }
 
@@ -484,6 +488,7 @@ internal fun AutoSizeValue(
     color: Color,
     modifier: Modifier = Modifier,
     minScale: Float = 0.6f,
+    textAlign: TextAlign = TextAlign.Start,
 ) {
     var scale by remember(text, style) { mutableStateOf(1f) }
     Text(
@@ -494,6 +499,7 @@ internal fun AutoSizeValue(
         maxLines = 1,
         softWrap = false,
         overflow = TextOverflow.Ellipsis,
+        textAlign = textAlign,
         modifier = modifier,
         onTextLayout = { result ->
             if (result.didOverflowWidth && scale > minScale) {
@@ -1203,7 +1209,16 @@ fun ScreenScaffold(
         Column(
             modifier = columnModifier
                 .verticalScroll(rememberScrollState())
-                .padding(start = 28.dp, end = 28.dp, top = topPadding, bottom = 28.dp),
+                // #1836: the bar's height is added to the CONTENT's bottom padding, not to the screen's
+                // layout. That distinction is the whole overlay: the screen reaches the bottom edge so its
+                // backdrop paints behind and around the glass, while the scrolling content still stops
+                // clear of the bar. Zero when the overlay is off, so the slot layout is untouched.
+                .padding(
+                    start = 28.dp,
+                    end = 28.dp,
+                    top = topPadding,
+                    bottom = 28.dp + BottomBarStyleStore.barHeightForContent(),
+                ),
             // #765: one shared inter-card spacing token (was a bare `20.dp`), so the eager + lazy scaffolds
             // and every screen through them keep the SAME uniform gap between top-level cards.
             verticalArrangement = Arrangement.spacedBy(Metrics.screenRowSpacing),

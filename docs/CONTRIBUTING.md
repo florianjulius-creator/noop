@@ -19,6 +19,7 @@ non-negotiable (especially on the Bluetooth path).
 ## Table of contents
 
 - [Ground rules](#ground-rules)
+- [Contributor roles & the issue/PR workflow](#contributor-roles--the-issuepr-workflow)
 - [Repository layout](#repository-layout)
 - [Build & test](#build--test)
 - [The design system is the law](#the-design-system-is-the-law)
@@ -39,9 +40,16 @@ non-negotiable (especially on the Bluetooth path).
 
 A few principles run through the whole codebase. Internalize them before opening a PR.
 
-1. **Offline by design.** There is no server, no telemetry, no account, no network call. A change
-   that phones home — for any reason — does not belong here. Strap data, imports, and computed
-   metrics live in a local SQLite database and never leave the device.
+1. **Offline by design.** There is no NOOP server, telemetry, or account, and **nothing about you
+   leaves the device unless you explicitly switch on a feature that sends it.** Strap data, imports,
+   and computed metrics live in a local SQLite database.
+   The app makes exactly four network requests, all documented in
+   [docs/PRIVACY_SECURITY.md §1.1](PRIVACY_SECURITY.md): the opt-in AI Coach, the
+   compile-time-optional Oura history import, the update check (a read of a public version number,
+   on by default, switchable off), and Android's default-off Experimental one-way export to a
+   user-owned endpoint. Adding a fifth needs a very good reason and the same treatment: named in the
+   privacy doc, and switchable off. New hosted services or undisclosed network calls do not belong
+   here; see [Scope](SCOPE.md).
 2. **Interoperability, not impersonation.** NOOP talks to a strap the user already owns. It does not
    log into a WHOOP account, bypass a paywall, or ship WHOOP's proprietary code/firmware/assets/logos.
    Keep contributions on the right side of that line, and keep all WHOOP references *nominative*
@@ -54,6 +62,38 @@ A few principles run through the whole codebase. Internalize them before opening
 5. **Credit upstream.** The protocol work is built on prior community reverse-engineering —
    `johnmiddleton12/my-whoop` (WHOOP 4.0) and `b-nnett/goose` (WHOOP 5.0). Preserve those credits in
    code comments and in [`../ATTRIBUTION.md`](../ATTRIBUTION.md).
+
+---
+
+## Contributor roles & the issue/PR workflow
+
+### Community help vs. maintainer decisions
+
+Community members may help triage issues, answer setup questions, test fixes, or point to existing
+documentation — that participation is welcome and valuable. Unless explicitly stated by the
+repository maintainer, those replies are **community help, not official maintainer decisions**.
+Official project decisions, release calls, security ownership, and merge decisions remain with the
+maintainer.
+
+### How issues and PRs are handled here
+
+NOOP runs a **lightweight, maintainer-judgment workflow**, not a strict issue-first gate. Concretely,
+that means:
+
+- There are no dedicated triage/approval labels (e.g. `needs-triage`, `confirmed-bug`,
+  `approved-feature`, `approved-enhancement`, `needs-review`) and no requirement that a PR link a
+  pre-approved issue via `Closes`/`Fixes`/`Resolves #N` before work can start.
+- Issues and PRs are reviewed and merged at the maintainer's discretion, weighed against the ground
+  rules and safety contracts in this document, rather than moved through a formal multi-stage gate.
+- A PR opened without a matching issue, or an issue without a triage label, is **not** by itself a
+  process violation in this repo. Contributors and any external review or automated check (including
+  strict-gate-style audits) should not treat the absence of gate labels as a contribution failure —
+  it reflects how this project currently runs, not an oversight.
+
+This is a deliberate choice for a small, anonymous, offline project; it may change as the project
+grows, in which case this section and the issue/PR templates will be updated together. Until then,
+opening an issue first to coordinate on anything non-trivial (as this guide recommends throughout) is
+still the best way to avoid wasted work — it's just not an enforced gate.
 
 ---
 
@@ -214,14 +254,19 @@ NOOP runs a **deliberately lean CI**: fast, no-hardware checks guard the point o
 and hardware-dependent verification runs at release time or on demand. This is a choice for an
 anonymous, offline, sideloaded project — not a gap to fill with more gates.
 
-- **On every PR (required):** `swift-packages` runs `swift test` for `Packages/**`; `i18n-coverage`
-  runs the string audit. These catch the regressions that matter most (protocol/analytics math,
-  storage, i18n) without a device or an Xcode/Gradle app build.
+- **On every PR (required):** `source-hygiene`, `tools-python` and `i18n-coverage` have no path
+  filter, so all three run on everything. `swift-packages` (`swift test` for `Packages/**`) and
+  `android` (`assembleFullDebug` + `testFullDebugUnitTest`) are **path-filtered** — they run when you
+  touch what they cover, which is most substantive PRs. Between them these catch the regressions that
+  matter most (protocol/analytics math, storage, i18n) without a device or an app build. The check
+  names you see are JOB names and do not resemble the workflow names; the table in the root
+  [CONTRIBUTING.md](../CONTRIBUTING.md#what-ci-checks) maps them.
 - **Disabled by design — you build the app yourself:** `app-build.yml` (app-target compile, iOS needs
-  `macos-26`) and `android.yml` (Android app build) are **off**. So a compile error in **app-target**
-  code (SwiftUI Views, `BLEManager`, `Repository`, a Compose screen) passes every default check.
-  Before you push app-layer changes, compile locally — `xcodebuild … build` /
-  `./gradlew compileFullDebugKotlin` — or dispatch `app-build.yml` on demand.
+  `macos-26`) is **off**. So a compile error in **app-target** code (SwiftUI Views, `BLEManager`,
+  `Repository`, a Compose screen) passes every default check — `android.yml` builds and unit-tests the
+  Android app but nothing compiles the Apple app target. Before you push app-layer changes, compile
+  locally — `xcodebuild … build` / `./gradlew compileFullDebugKotlin` — or dispatch `app-build.yml`
+  on demand.
 - **Gated at release, not per PR:** Android release lint (`lintVitalFullRelease`) runs inside
   `assembleFullRelease` in the staging/release builds, so lint-fatal issues (e.g. an
   `ExtraTranslation` in a `values-<lang>` file) surface there. Run `./gradlew lintVitalFullRelease`
@@ -499,6 +544,15 @@ Schema lives in `Packages/WhoopStore/Sources/WhoopStore/Database.swift` as a **v
   workout detection), and the CSV / Apple Health importers (including real-export tests).
 - **`Fixtures/`** holds a sample WHOOP export for the import tests; `StrandImport` test resources are
   bundled via the package's `Package.swift`.
+- **The golden decoder oracle is where cross-platform decode parity is pinned.** `decoder_oracle.json`
+  lives in two byte-identical copies (`Packages/WhoopProtocol/Tests/WhoopProtocolTests/Resources/`
+  and `android/app/src/test/resources/`) and both `DecoderOracleTests.swift` and `DecoderOracleTest.kt`
+  run the *same* assertions against it: decoded field VALUES per fixture frame, and the assembled
+  `Streams`/`StreamBatch` shape (per-stream row counts + the emptiness verdict) per fixture batch.
+  Pinning values rather than bytes is the point — the wire bytes are identical on both platforms, so
+  a 32-vs-64-bit or signedness split is invisible to a per-platform fixture-hex test. **Extend the
+  oracle rather than adding a parallel mechanism**; a `coverage` manifest in the file makes silently
+  dropping an assertion a test failure, so adding one means listing it there too.
 - **Prefer pure tests.** Because `WhoopProtocol`, `StrandAnalytics`, and `FrameRouter` are
   framework-free, you can (and should) cover new decode/routing/math with captured frames and
   fixtures rather than requiring a strap.
