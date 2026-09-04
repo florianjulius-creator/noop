@@ -1,21 +1,24 @@
 #if os(iOS)
 import Foundation
 import BackgroundTasks
-import UserNotifications
+import StrandDesign
 import WhoopStore
 
 // MARK: - Morning briefing — Claude's daily "hoe sta ik ervoor" push
 //
-// Every morning (~06:45 background task, with a foreground catch-up on first open) the phone builds
-// a compact summary of last night — Recovery, HRV vs the 30-day baseline, resting HR, sleep,
-// yesterday's Strain — sends it to the SAME AI provider/key the in-app Coach is configured with
-// (Settings → AI Coach; Anthropic + a Claude model for this user), and delivers the reply as a local
-// notification. Dutch by design: the reply is read on a Dutch user's lock screen.
+// Every morning (the Watch's T − 10 min `requestMorning`, the ~06:45 background task as a fallback,
+// and a foreground catch-up on first open) the phone builds a compact summary of last night —
+// Recovery, HRV vs the 30-day baseline, resting HR, sleep, yesterday's Strain — and sends it to the
+// SAME AI provider/key the in-app Coach is configured with (Settings → AI Coach; Anthropic + a Claude
+// model for this user). Dutch by design: the reply is read by a Dutch user.
 //
 // Honest by design, like every other surface:
 // - No key configured, or no scored night yet → generate nothing (never a made-up briefing).
-// - One briefing per local day (`lastDayKey`), regenerated only via `force` (future settings hook).
+// - One briefing per local day (`lastDayKey`), regenerated only via `force`.
 // - The API payload carries day-level aggregates only — never raw R-R/HR streams.
+// - No notification is posted on the iPhone any more: the text travels to the Watch inside the
+//   WatchScoreSnapshot and is read there (the morning moment). Every outcome, good or bad, is
+//   recorded as a `BriefingStatus` so the Watch can show WHY there is no text.
 @MainActor
 enum MorningBriefing {
 
@@ -28,6 +31,19 @@ enum MorningBriefing {
     static let enabledKey = "briefing.enabled"
     static let lastDayKey = "briefing.lastDay"
     static let lastTextKey = "briefing.lastText"
+    /// The last outcome, as `BriefingStatus.text` (Dutch), shipped to the Watch settings page.
+    static let lastStatusKey = "briefing.lastStatus"
+
+    private static func record(_ status: BriefingStatus) {
+        UserDefaults.standard.set(status.text, forKey: lastStatusKey)
+    }
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "nl_NL")
+        f.dateFormat = "HH:mm"
+        return f
+    }()
 
     /// Opt-out toggle (default ON — the feature stays dormant anyway until an AI key is configured).
     static var enabled: Bool {
@@ -87,36 +103,47 @@ enum MorningBriefing {
 
     // MARK: - Generation
 
-    /// Generate + notify once per local day. Called from the BGTask and as a foreground catch-up on
-    /// every scenePhase-active (cheap: the day guard exits immediately after the first success).
-    static func generateIfDue(model: AppModel, force: Bool = false, now: Date = Date()) async {
-        guard enabled else { return }
+    /// Generate once per local day. Called from the Watch's `requestMorning`, the BGTask and as a
+    /// foreground catch-up on every scenePhase-active (cheap: the day guard exits immediately after the
+    /// first success). Returns true when a NEW briefing was produced by this call, so the caller knows
+    /// to push the wrist right away. Every exit records a `BriefingStatus`.
+    @discardableResult
+    static func generateIfDue(model: AppModel, force: Bool = false, now: Date = Date()) async -> Bool {
+        guard enabled else { record(.disabled); return false }
         let todayKey = Repository.localDayKey(now)
         let defaults = UserDefaults.standard
-        if !force, defaults.string(forKey: lastDayKey) == todayKey { return }
+        // Already done today: keep the OK status as it is.
+        if !force, defaults.string(forKey: lastDayKey) == todayKey { return false }
         // Before 06:00 the night isn't scored yet — wait for the morning run / next open.
-        if !force, Calendar.current.component(.hour, from: now) < 6 { return }
+        if !force, Calendar.current.component(.hour, from: now) < 6 { record(.tooEarly); return false }
         // Same provider/key/model the in-app Coach uses; no key → dormant, never a fake briefing.
-        guard let key = AIKeyStore.read(), !key.isEmpty else { return }
-        guard let context = buildContext(model: model, todayKey: todayKey) else { return }
+        guard let key = AIKeyStore.read(), !key.isEmpty else { record(.noKey); return false }
+        guard let context = buildContext(model: model, todayKey: todayKey) else {
+            record(.noScoredNight); return false
+        }
 
         let provider = UserDefaults.standard.string(forKey: "ai.provider")
             .flatMap(AIProvider.init(rawValue:)) ?? .anthropic
         let storedModel = UserDefaults.standard.string(forKey: "ai.model") ?? ""
         let modelId = storedModel.isEmpty ? provider.defaultModel : storedModel
 
-        let reply = try? await provider.client.send(
-            key: key,
-            model: modelId,
-            systemPrompt: Self.systemPrompt,
-            messages: [(role: .user, content: context)],
-            session: .shared)
-        guard let reply, !reply.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
-
+        let reply: String
+        do {
+            reply = try await provider.client.send(
+                key: key,
+                model: modelId,
+                systemPrompt: Self.systemPrompt,
+                messages: [(role: .user, content: context)],
+                session: .shared)
+        } catch {
+            record(.apiError(error.localizedDescription)); return false
+        }
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { record(.emptyReply); return false }
         defaults.set(todayKey, forKey: lastDayKey)
         defaults.set(text, forKey: lastTextKey)
-        await notify(text, dayKey: todayKey)
+        record(.ok(time: clock.string(from: now)))
+        return true
     }
 
     /// The coaching contract: Dutch, compact, concrete — status, duiding, één trainingsadvies
@@ -141,12 +168,7 @@ enum MorningBriefing {
         // A briefing needs at least one overnight signal for the anchor day.
         guard day.recovery != nil || day.avgHrv != nil || day.totalSleepMin != nil else { return nil }
 
-        let trailing = Array(days.suffix(30))
-        func avg(_ values: [Double]) -> Double? {
-            values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
-        }
-        let hrvBase = avg(trailing.compactMap(\.avgHrv))
-        let rhrBase = avg(trailing.compactMap(\.restingHr).map(Double.init))
+        let base = WatchSessionBridge.baselines(days: days)
         let yesterday = days.last(where: { $0.day < day.day })
 
         var lines: [String] = ["dag: \(day.day)"]
@@ -158,9 +180,9 @@ enum MorningBriefing {
         }
         add("recovery", fmt(day.recovery))
         add("hrv_ms", fmt(day.avgHrv))
-        add("hrv_baseline_30d_ms", fmt(hrvBase))
+        add("hrv_baseline_30d_ms", base.hrvMs.map(String.init))
         add("rustpols_bpm", day.restingHr.map(String.init))
-        add("rustpols_baseline_30d_bpm", fmt(rhrBase))
+        add("rustpols_baseline_30d_bpm", base.restingHr.map(String.init))
         add("slaap_min", fmt(day.totalSleepMin))
         add("slaap_efficiency_pct", fmt((day.efficiency).map { $0 <= 1 ? $0 * 100 : $0 }))
         add("ademhaling_rpm", fmt(day.respRateBpm, 1))
@@ -170,22 +192,5 @@ enum MorningBriefing {
         return lines.joined(separator: "\n")
     }
 
-    // MARK: - Delivery
-
-    private static func notify(_ text: String, dayKey: String) async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        if settings.authorizationStatus == .notDetermined {
-            _ = try? await center.requestAuthorization(options: [.alert, .sound])
-        }
-        let content = UNMutableNotificationContent()
-        content.title = "Ochtendrapport"
-        content.body = text
-        content.sound = .default
-        // One identifier per day: a forced regenerate replaces rather than stacks.
-        let request = UNNotificationRequest(identifier: "morning-briefing-\(dayKey)",
-                                            content: content, trigger: nil)
-        try? await center.add(request)
-    }
 }
 #endif

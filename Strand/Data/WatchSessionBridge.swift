@@ -72,7 +72,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     ///
     /// `async` because Rest (sleep_performance) lives in a computed metric series rather than a
     /// `DailyMetric` column, so it needs an `exploreSeries` read (mirrors `WidgetSnapshot.publish`).
-    func sendLatest(from model: AppModel) async {
+    func sendLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false) async {
         let snap = await Self.buildSnapshot(from: model)
         // A contentless snapshot (a cold launch races the first repo refresh, so `days` is still empty)
         // must NOT push: it would stomp the watch's last REAL data with the empty state AND burn the
@@ -82,9 +82,10 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             && snap.rest == nil && snap.sleepSummary.isEmpty
         if contentless { return }
         let now = Date()
-        guard shouldPush(snap, now: now) else { return }
+        // `force` (the morning path only) skips the 30-minute spacing gate but still requires substance.
+        guard force ? Self.headlineChanged(from: lastSent, to: snap) : shouldPush(snap, now: now) else { return }
         lastPushedAt = now
-        send(snap)
+        send(snap, wakeWatch: wakeWatch)
     }
 
     /// Build the latest snapshot off `model` and push it to the watch. The entrypoint the iOS app entry
@@ -92,8 +93,8 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     /// Health sync, and on an active-phase refreshSeq bump), so the wrist updates in lockstep with the
     /// widget instead of only ever showing placeholder data. Thin alias over `sendLatest` and therefore
     /// self-throttled the same way; named for the app-entry call site to read clearly.
-    func pushLatest(from model: AppModel) async {
-        await sendLatest(from: model)
+    func pushLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false) async {
+        await sendLatest(from: model, force: force, wakeWatch: wakeWatch)
     }
 
     /// The budget gate: complication/context transfers share a ~50/day system budget, so a push must
@@ -122,6 +123,13 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             || last.sleepSummary != next.sleepSummary
             || last.scoreDay != next.scoreDay
             || last.hrvMs != next.hrvMs
+            || last.restingHr != next.restingHr
+            || last.restingHrBaseline != next.restingHrBaseline
+            || last.hrvBaselineMs != next.hrvBaselineMs
+            || last.sleepMin != next.sleepMin
+            || last.sleepEfficiencyPct != next.sleepEfficiencyPct
+            || last.briefingDay != next.briefingDay
+            || last.briefing != next.briefing
     }
 
     /// Build the snapshot off the app state. Pure read; no side effects. Split out so the wiring is easy
@@ -167,7 +175,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
         let effort = day?.strain
         let rest = restScore
 
-        let snap = WatchScoreSnapshot(
+        var snap = WatchScoreSnapshot(
             charge: charge,
             chargeCalibrating: hasAnyDay && charge == nil,
             effort: effort,
@@ -184,7 +192,32 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             // the wrist and the widget can never quote different values for the same day.
             hrvMs: day?.avgHrv.map { Int($0.rounded()) }
         )
+        // Morning-moment fields. Baselines off the same trailing window the briefing coach uses;
+        // the briefing text/status straight from MorningBriefing's storage keys.
+        let base = baselines(days: days)
+        snap.restingHr = day?.restingHr
+        snap.restingHrBaseline = base.restingHr
+        snap.hrvBaselineMs = base.hrvMs
+        snap.sleepMin = day?.totalSleepMin.map { Int($0.rounded()) }
+        snap.sleepEfficiencyPct = day?.efficiency.map { eff in Int((eff <= 1 ? eff * 100 : eff).rounded()) }
+        let defaults = UserDefaults.standard
+        snap.briefing = defaults.string(forKey: MorningBriefing.lastTextKey)
+        snap.briefingDay = defaults.string(forKey: MorningBriefing.lastDayKey)
+        snap.briefingStatus = defaults.string(forKey: MorningBriefing.lastStatusKey)
         return snap
+    }
+
+    /// 30-day trailing averages for HRV (ms) and resting HR (bpm), rounded to whole numbers. The
+    /// morning briefing context and the watch snapshot both read THESE so the wrist and the coach
+    /// never quote different baselines.
+    static func baselines(days: [DailyMetric]) -> (hrvMs: Int?, restingHr: Int?) {
+        let trailing = days.suffix(30)
+        func avg(_ values: [Double]) -> Double? {
+            values.isEmpty ? nil : values.reduce(0, +) / Double(values.count)
+        }
+        let hrv = avg(trailing.compactMap(\.avgHrv))
+        let rhr = avg(trailing.compactMap(\.restingHr).map(Double.init))
+        return (hrv.map { Int($0.rounded()) }, rhr.map { Int($0.rounded()) })
     }
 
     /// A one line sleep summary for the glance, formatted on the phone (the watch never recomputes it).
@@ -213,7 +246,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     /// Push a snapshot to the watch via application context (latest-state) and mirror it into the shared
     /// app group so a cold-launched watch reads it at once. A no-op (bar the app-group write) when the
     /// session is unsupported or not yet activated.
-    func send(_ snap: WatchScoreSnapshot) {
+    func send(_ snap: WatchScoreSnapshot, wakeWatch: Bool = false) {
         lastSent = snap
         // Always mirror into the shared group: the watch app + complication read this on launch even if
         // the live context has not been delivered yet.
@@ -226,6 +259,15 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             // updateApplicationContext replaces any previous context, so the watch always gets exactly
             // the latest snapshot and never a queued backlog.
             try session.updateApplicationContext([Self.contextKey: data])
+            // The morning wake: ONE complication transfer per local day launches the watch app in the
+            // background so it persists today's snapshot before the wrist notification fires. Only
+            // meaningful (and only budgeted) while a complication is on the active face.
+            let today = WatchScoreSnapshot.localDayKey(Date())
+            if wakeWatch, session.isComplicationEnabled,
+               UserDefaults.standard.string(forKey: Self.lastWakeDayKey) != today {
+                UserDefaults.standard.set(today, forKey: Self.lastWakeDayKey)
+                session.transferCurrentComplicationUserInfo([Self.contextKey: data])
+            }
         } catch {
             // A failed context update is non-fatal: the app-group mirror above still carries the latest
             // value, and the next dashboard refresh will try again.
@@ -236,6 +278,13 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     static let contextKey = "snapshot"
     /// The message key the watch sends on launch to ask for the latest snapshot right now.
     static let requestLatestKey = "requestLatest"
+    /// The watch's "make this morning's briefing now" request (background refresh or the settings page).
+    static let requestMorningKey = "requestMorning"
+    static let forceKey = "force"
+    /// The local day the once-a-day complication wake was last sent on.
+    static let lastWakeDayKey = "watch.lastWakeDay"
+    /// Set by the app entry: generate the briefing (day-guarded unless forced) and push the wrist.
+    var onMorningRequested: ((Bool) async -> Void)?
 }
 
 // MARK: - WCSessionDelegate
@@ -285,16 +334,26 @@ extension WatchSessionBridge: WCSessionDelegate {
     nonisolated func session(_ session: WCSession,
                              didReceiveMessage message: [String: Any],
                              replyHandler: @escaping ([String: Any]) -> Void) {
-        guard message[Self.requestLatestKey] != nil else {
+        let wantsLatest = message[Self.requestLatestKey] != nil
+        let wantsMorning = message[Self.requestMorningKey] != nil
+        guard wantsLatest || wantsMorning else {
             replyHandler([:])
             return
         }
         // Read the last value we mirrored into the shared group and hand it straight back. Done off the
-        // main actor since the request arrives on WC's queue; the app-group read is process-safe.
+        // main actor since the request arrives on WC's queue; the app-group read is process-safe. For a
+        // morning request this is the "something now" reply; the briefing is generated afterwards and
+        // reaches the wrist as application context (+ the once-a-day complication wake).
         if let snap = WatchScoreSnapshot.load(), let data = try? JSONEncoder().encode(snap) {
             replyHandler([Self.contextKey: data])
         } else {
             replyHandler([:])
+        }
+        if wantsMorning {
+            let force = message[Self.forceKey] as? Bool ?? false
+            Task { @MainActor in
+                await self.onMorningRequested?(force)
+            }
         }
     }
 }

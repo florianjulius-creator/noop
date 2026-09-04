@@ -20,7 +20,7 @@ struct StrandiOSApp: App {
     @StateObject private var health: HealthKitBridge
     /// The phone→watch link. Built + activated here so the watch app actually receives snapshots on a
     /// real device; without an owner that pushes it, the watch only ever shows placeholder data.
-    @StateObject private var watch = WatchSessionBridge()
+    @StateObject private var watch: WatchSessionBridge
     /// Shared cross-screen navigation hook (e.g. Live → Devices). The iOS shell (`RootTabView`)
     /// observes it and presents the Devices manager.
     @StateObject private var router = NavRouter()
@@ -71,6 +71,18 @@ struct StrandiOSApp: App {
         UNUserNotificationCenter.current().delegate = NotificationPresenter.shared
         let model = AppModel()
         _model = StateObject(wrappedValue: model)
+        // The watch link comes up in init, not in a view `.task`: a WatchConnectivity message from the
+        // wrist can launch this app in the BACKGROUND (no scene, no `.task`), and the delegate must
+        // already be set for that message to be delivered. Same reason MorningBriefing.model is set here.
+        let watchBridge = WatchSessionBridge()
+        watchBridge.activate()
+        watchBridge.onMorningRequested = { [weak model, weak watchBridge] force in
+            guard let model, let watchBridge else { return }
+            let fresh = await MorningBriefing.generateIfDue(model: model, force: force)
+            await watchBridge.pushLatest(from: model, force: true, wakeWatch: fresh || force)
+        }
+        _watch = StateObject(wrappedValue: watchBridge)
+        MorningBriefing.model = model
         // #1538: a strap offload completes while the app is BACKGROUNDED — it stays alive as a
         // bluetooth-central to receive it — and the re-score it triggers took nearly eight minutes on the
         // reporter's install, far longer than that wake survives. The pass is all-or-nothing, so being
@@ -279,12 +291,11 @@ struct StrandiOSApp: App {
                 // supported, so this is safe on every device/simulator combination.
                 .task {
                     watch.activate()
-                    await watch.pushLatest(from: model)
-                    // Hand the briefing its model + arm tomorrow's ~06:45 run; catch up now in case
-                    // today's briefing hasn't been generated yet (first open of the day).
-                    MorningBriefing.model = model
+                    // Arm tomorrow's fallback run, catch up today's briefing if due, THEN push the
+                    // wrist (forced when a briefing was just produced so the text lands immediately).
                     MorningBriefing.scheduleNext()
-                    await MorningBriefing.generateIfDue(model: model)
+                    let fresh = await MorningBriefing.generateIfDue(model: model)
+                    await watch.pushLatest(from: model, force: fresh, wakeWatch: fresh)
                 }
         }
         // HealthKit authorization is intentionally NOT requested on launch. The system permission
@@ -329,12 +340,12 @@ struct StrandiOSApp: App {
                     )
                     // Foreground catch-up: day-guarded inside, so this exits immediately once
                     // today's briefing exists.
-                    await MorningBriefing.generateIfDue(model: model)
+                    let fresh = await MorningBriefing.generateIfDue(model: model)
                     await WidgetSnapshot.publish(from: model)
                     // Push the wrist on the SAME refresh as the Home-screen widget so the watch, the
-                    // widget and Today never disagree about which day they describe. Without this the
-                    // watch only ever holds placeholder data on a real device.
-                    await watch.pushLatest(from: model)
+                    // widget and Today never disagree about which day they describe. Forced when a
+                    // briefing was just produced so the text lands immediately.
+                    await watch.pushLatest(from: model, force: fresh, wakeWatch: fresh)
                 }
             } else if phase == .background {
                 // Re-submit on every transition because iOS may discard an old best-effort request.
