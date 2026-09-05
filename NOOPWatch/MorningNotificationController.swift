@@ -11,6 +11,11 @@ import WatchKit
 // rings in place. The system's own Dismiss button suffices — no custom actions.
 final class MorningNotificationController: WKUserNotificationHostingController<MorningMomentView> {
 
+    // The system sash (app icon + delivery time) above the content cannot be removed or recoloured:
+    // `sashColor` / `titleColor` overrides are ignored since watchOS 9 (Apple forums 713204, 719446),
+    // and on the simulator neither the app icon nor a black AccentColor changed it — it follows the
+    // watch face's tint. So the content below simply fits the first screen (rings ≤ 130 pt).
+
     override var body: MorningMomentView {
         MorningMomentView(store: WatchScoreStore.shared, celebrate: true)
     }

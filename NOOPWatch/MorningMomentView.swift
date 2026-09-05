@@ -111,9 +111,11 @@ struct MorningRingsView: View {
     let animated: Bool
     @State private var appeared = false
 
-    private let outer: CGFloat = 150
-    private let inner: CGFloat = 106
-    private let width: CGFloat = 15
+    // Sized for the long look: the Ultra screen is 205×251 pt and the system sash takes ~70 pt, so a
+    // 130 pt ring with its verdict fits the first screen without the Crown. In-app it simply has room.
+    private let outer: CGFloat = 130
+    private let inner: CGFloat = 94
+    private let width: CGFloat = 13
 
     private var recovery: Double? {
         if case .fresh(let r, _) = moment.scores { return r }
@@ -144,7 +146,7 @@ struct MorningRingsView: View {
             }
             center
         }
-        .frame(width: outer + 10, height: outer + 10)
+        .frame(width: outer + width, height: outer + width)
         .animation(animated ? .spring(response: 1.1, dampingFraction: 0.85) : nil, value: appeared)
         .onAppear {
             if animated {
@@ -173,7 +175,7 @@ struct MorningRingsView: View {
         VStack(spacing: 1) {
             if let recovery {
                 Text("\(Int(shownRecovery.rounded()))")
-                    .font(StrandFont.rounded(40, weight: .heavy))
+                    .font(StrandFont.rounded(34, weight: .heavy))
                     .foregroundStyle(StrandPalette.textPrimary)
                     .monospacedDigit()
                     .contentTransition(.numericText())
@@ -190,7 +192,7 @@ struct MorningRingsView: View {
                 }
             } else {
                 Text("–")
-                    .font(StrandFont.rounded(40, weight: .heavy))
+                    .font(StrandFont.rounded(34, weight: .heavy))
                     .foregroundStyle(StrandPalette.textTertiary)
                 Text("RECOVERY")
                     .font(StrandFont.overlineScaled(8))
