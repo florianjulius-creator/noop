@@ -21,5 +21,13 @@ struct WatchRootView: View {
         // customisation is unavailable here, so the plain page style is the right call.
         .tabViewStyle(.page)
         .background(StrandPalette.surfaceBase.ignoresSafeArea())
+        // Belt and braces for the morning schedule: the delegate re-arms at launch, but a UI start
+        // re-arms too (idempotent — same identifier replaces), and records what it found first.
+        .task {
+            if UserDefaults.standard.string(forKey: MorningDiag.launchKey) == nil {
+                await MorningDiag.recordLaunch("ui")
+            }
+            await MorningScheduler.rearm()
+        }
     }
 }

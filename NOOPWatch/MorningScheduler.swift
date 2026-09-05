@@ -55,13 +55,18 @@ enum MorningScheduler {
 
     static func scheduleNotification() async {
         let center = UNUserNotificationCenter.current()
-        center.removePendingNotificationRequests(withIdentifiers: [notificationId])
-        guard MorningSettings.enabled else { return }
+        guard MorningSettings.enabled else {
+            center.removePendingNotificationRequests(withIdentifiers: [notificationId])
+            return
+        }
         await requestAuthorizationIfNeeded(center)
         var comps = DateComponents()
         comps.hour = MorningSettings.hour
         comps.minute = MorningSettings.minute
         let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
+        // Adding under an existing identifier REPLACES the pending request, so no remove-then-add:
+        // both calls are asynchronous on the notification daemon and a remove that lands after the add
+        // would silently delete the fresh schedule.
         let request = UNNotificationRequest(identifier: notificationId, content: content(), trigger: trigger)
         try? await center.add(request)
     }
@@ -95,6 +100,47 @@ enum MorningScheduler {
         if settings.authorizationStatus == .notDetermined {
             _ = try? await center.requestAuthorization(options: [.alert, .sound])
         }
+    }
+}
+
+// MARK: - MorningDiag — what the notification daemon actually holds
+//
+// The 05-09-2026 morning did not fire and nothing on the wrist could say why. This records, at each
+// launch path and on demand, whether a MORNING request is pending, when it fires next and whether the
+// app is authorised — as one short Dutch line the settings page shows. Written BEFORE the launch
+// re-arm so it is evidence of the state the app woke up to, not of what it just scheduled.
+enum MorningDiag {
+    static let launchKey = "morning.diag.launch"
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "nl_NL")
+        f.dateFormat = "dd-MM HH:mm"
+        return f
+    }()
+
+    /// One line: "05-09 08:12 · auth ok · 1 gepland · volgende 06-09 07:00".
+    static func line(now: Date = Date()) async -> String {
+        let center = UNUserNotificationCenter.current()
+        let settings = await center.notificationSettings()
+        let auth: String
+        switch settings.authorizationStatus {
+        case .authorized, .provisional, .ephemeral: auth = "auth ok"
+        case .denied: auth = "auth GEWEIGERD"
+        case .notDetermined: auth = "auth nog niet gevraagd"
+        @unknown default: auth = "auth ?"
+        }
+        let pending = await center.pendingNotificationRequests()
+        let morning = pending.first { $0.identifier == MorningScheduler.notificationId }
+        let next = (morning?.trigger as? UNCalendarNotificationTrigger)?.nextTriggerDate()
+        let nextText = next.map { "volgende " + clock.string(from: $0) } ?? "GEEN volgende"
+        return "\(clock.string(from: now)) · \(auth) · \(pending.count) gepland · \(nextText)"
+    }
+
+    /// Persist the launch-time line (read by the settings page as "Bij start: …").
+    static func recordLaunch(_ label: String) async {
+        let text = await line()
+        UserDefaults.standard.set("\(label) \(text)", forKey: launchKey)
     }
 }
 
@@ -134,7 +180,10 @@ final class MorningRefresh {
 // MARK: - WatchAppDelegate — launch hook + background task dispatch
 final class WatchAppDelegate: NSObject, WKApplicationDelegate {
     func applicationDidFinishLaunching() {
-        Task { await MorningScheduler.rearm() }
+        Task {
+            await MorningDiag.recordLaunch("delegate")
+            await MorningScheduler.rearm()
+        }
     }
 
     func handle(_ backgroundTasks: Set<WKRefreshBackgroundTask>) {

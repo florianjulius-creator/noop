@@ -56,6 +56,7 @@ struct NOOPWatchApp: App {
         case "workout":   WatchWorkoutView()
         case "intervals": WatchIntervalView()
         case "glance":    WatchGlanceView()
+        case "morning":   MorningMomentView(store: WatchScoreStore.shared, celebrate: true)
         default:          WatchRootView()
         }
         #else

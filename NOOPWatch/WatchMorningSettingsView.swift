@@ -9,6 +9,7 @@ struct WatchMorningSettingsView: View {
     @State private var preview = false
     @State private var testArmed = false
     @State private var requesting = false
+    @State private var diagNow = "…"
 
     var body: some View {
         ScrollView {
@@ -70,6 +71,23 @@ struct WatchMorningSettingsView: View {
 
                 Button("Bekijk vandaag") { preview = true }
                     .tint(StrandPalette.chargeColor)
+
+                // Diagnostics: what the notification daemon holds now, and what the app found at
+                // its last launch (before it re-armed). The evidence line for "it did not fire".
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Planning")
+                        .font(StrandFont.footnote)
+                        .foregroundStyle(StrandPalette.textTertiary)
+                    Text("Nu: \(diagNow)")
+                    Text("Bij start: \(UserDefaults.standard.string(forKey: MorningDiag.launchKey) ?? "–")")
+                }
+                .font(StrandFont.overlineScaled(9))
+                .foregroundStyle(StrandPalette.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 6)
+                .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 12))
+                .task { diagNow = await MorningDiag.line() }
             }
             .padding(.horizontal, 4)
             .padding(.bottom, 8)
@@ -80,6 +98,9 @@ struct WatchMorningSettingsView: View {
     }
 
     private func rearm() {
-        Task { await MorningScheduler.rearm() }
+        Task {
+            await MorningScheduler.rearm()
+            diagNow = await MorningDiag.line()
+        }
     }
 }
