@@ -144,3 +144,30 @@ generates + pushes; it no longer posts a notification.
 
 Smart Stack widget, Live Activity, iPhone UI changes, evening moment, time-sensitive
 notifications, Dutch localisation of the rest of the watch app.
+
+## Addendum 05-09-2026 — freshness: the Watch pulls, the phone pushes in the background
+
+Observed: the 05-09 notification did not fire (reinstall wiped the schedule, app not relaunched) and
+the long look read "nog niet gesynct" (the iPhone app had not run since the reinstall, so no strap
+offload overnight). Two structural gaps behind that:
+
+1. The phone only pushed the Watch on its own foreground (`scenePhase == .active`); a night offloaded
+   in the background reached the widget and Health but not the wrist.
+2. The Watch never asked; it waited for a push.
+
+Changes:
+- `WatchScoreSnapshot` + `lastSyncAt`, `strapConnected` (optional); Watch page 5 shows
+  "Strap: verbonden · laatste sync dd-MM HH:mm".
+- `AppModel.watchPush` closure, called from `refreshAfterCompletedBackfill` next to the widget publish
+  and Health write-back (rate-limited in the bridge, one complication wake per day).
+- Watch root `.task` sends `requestLatest` on every UI start (WatchConnectivity launches the iPhone
+  app in the background to answer).
+- Morning wake is two-staged: `MorningSchedule.refreshStages = [T − 25 min, T − 5 min]`; past the
+  last stage the next slot is tomorrow's first (no re-arm loop). On `requestMorning` the phone first
+  runs `MorningSync.pullStrap` (`.manual` offload, bounded 150 s wait, deferred re-score), then the
+  briefing, then the forced push.
+- Scheduling diagnostics on page 5 ("Nu" / "Bij start"): auth, pending count, next fire.
+- Operational rule: after every install open the iPhone app AND the Watch app once; never force-quit
+  the iPhone app (iOS stops relaunching it for strap events).
+- The long look's system sash (icon + coloured bar) cannot be removed or recoloured on watchOS 9+;
+  rings are 130 pt so ring + verdict fit the first screen.
