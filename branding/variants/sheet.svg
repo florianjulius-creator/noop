@@ -1,0 +1,35 @@
+<svg width="2160" height="970" viewBox="0 0 2160 970" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <rect width="2160" height="970" fill="#E9EBF0"/>
+  <text x="60" y="70" font-family="Helvetica, Arial" font-size="40" font-weight="bold" fill="#17181C">The Machine — icoonvarianten (iPhone-vierkant · Watch-rondje)</text>
+  
+  <clipPath id="sq0"><rect x="60" y="110" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci0"><circle cx="550.0" cy="260.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/01-ringen.png" x="60" y="110" width="300" height="300" clip-path="url(#sq0)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/01-ringen.png" x="400" y="110" width="300" height="300" clip-path="url(#ci0)"/>
+  <text x="60" y="454" font-family="Helvetica, Arial" font-size="30" fill="#17181C">1. ringen</text>
+  <clipPath id="sq1"><rect x="780" y="110" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci1"><circle cx="1270.0" cy="260.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/02-m-puls.png" x="780" y="110" width="300" height="300" clip-path="url(#sq1)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/02-m-puls.png" x="1120" y="110" width="300" height="300" clip-path="url(#ci1)"/>
+  <text x="780" y="454" font-family="Helvetica, Arial" font-size="30" fill="#17181C">2. m-puls</text>
+  <clipPath id="sq2"><rect x="1500" y="110" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci2"><circle cx="1990.0" cy="260.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/03-gauge-m.png" x="1500" y="110" width="300" height="300" clip-path="url(#sq2)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/03-gauge-m.png" x="1840" y="110" width="300" height="300" clip-path="url(#ci2)"/>
+  <text x="1500" y="454" font-family="Helvetica, Arial" font-size="30" fill="#17181C">3. gauge-m</text>
+  <clipPath id="sq3"><rect x="60" y="530" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci3"><circle cx="550.0" cy="680.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/04-titanium.png" x="60" y="530" width="300" height="300" clip-path="url(#sq3)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/04-titanium.png" x="400" y="530" width="300" height="300" clip-path="url(#ci3)"/>
+  <text x="60" y="874" font-family="Helvetica, Arial" font-size="30" fill="#17181C">4. titanium</text>
+  <clipPath id="sq4"><rect x="780" y="530" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci4"><circle cx="1270.0" cy="680.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/05-daglicht.png" x="780" y="530" width="300" height="300" clip-path="url(#sq4)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/05-daglicht.png" x="1120" y="530" width="300" height="300" clip-path="url(#ci4)"/>
+  <text x="780" y="874" font-family="Helvetica, Arial" font-size="30" fill="#17181C">5. daglicht</text>
+  <clipPath id="sq5"><rect x="1500" y="530" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci5"><circle cx="1990.0" cy="680.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/06-een-lijn.png" x="1500" y="530" width="300" height="300" clip-path="url(#sq5)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/06-een-lijn.png" x="1840" y="530" width="300" height="300" clip-path="url(#ci5)"/>
+  <text x="1500" y="874" font-family="Helvetica, Arial" font-size="30" fill="#17181C">6. een-lijn</text>
+</svg>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- "The Machine" app icon source (v2, 05-09-2026: white M on a deep-green field, the core dot punched
+     under the middle stroke; chosen from branding/variants/). Regenerate the shipped PNGs with:
+     rsvg-convert -w 1024 -h 1024 branding/the-machine-icon.svg > StrandiOS/Resources/Assets.xcassets/AppIcon.appiconset/icon_1024.png
+     rsvg-convert -w 1024 -h 1024 branding/the-machine-icon.svg > NOOPWatch/Assets.xcassets/AppIcon.appiconset/AppIcon1024.png
+     The glyph sits inside the centre ~700px circle so the watchOS circular mask never clips it. -->
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#151b24"/><stop offset="70%" stop-color="#0b0f15"/><stop offset="100%" stop-color="#06080b"/>
+    </radialGradient>
+    <linearGradient id="mono" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/><stop offset="55%" stop-color="#2dd4bf"/><stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#B47A2B"/><stop offset="60%" stop-color="#E8B84B"/><stop offset="100%" stop-color="#F6DFA0"/>
+    </linearGradient>
+    <linearGradient id="dawn" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#E0662F"/><stop offset="55%" stop-color="#E8B84B"/><stop offset="100%" stop-color="#F6DFA0"/>
+    </linearGradient>
+    <linearGradient id="deep" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F9D62"/><stop offset="100%" stop-color="#0B6B7A"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8FD86A"/><stop offset="100%" stop-color="#03E095"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6FA8E8"/><stop offset="100%" stop-color="#3FA9C9"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#deep)"/>
+
+  <path d="M 262 740 V 300 L 512 560 L 762 300 V 740" fill="none" stroke="#F7F7FA" stroke-width="96" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="700" r="60" fill="#F7F7FA"/>
+
+</svg>

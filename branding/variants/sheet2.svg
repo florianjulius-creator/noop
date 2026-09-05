@@ -1,0 +1,35 @@
+<svg width="2160" height="970" viewBox="0 0 2160 970" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+  <rect width="2160" height="970" fill="#E9EBF0"/>
+  <text x="60" y="70" font-family="Helvetica, Arial" font-size="40" font-weight="bold" fill="#17181C">The Machine — icoonvarianten, blad 2 (iPhone-vierkant · Watch-rondje)</text>
+  
+  <clipPath id="sq0"><rect x="60" y="110" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci0"><circle cx="550.0" cy="260.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/07-zonsopkomst.png" x="60" y="110" width="300" height="300" clip-path="url(#sq0)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/07-zonsopkomst.png" x="400" y="110" width="300" height="300" clip-path="url(#ci0)"/>
+  <text x="60" y="454" font-family="Helvetica, Arial" font-size="30" fill="#17181C">07. zonsopkomst</text>
+  <clipPath id="sq1"><rect x="780" y="110" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci1"><circle cx="1270.0" cy="260.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/08-hartslagring.png" x="780" y="110" width="300" height="300" clip-path="url(#sq1)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/08-hartslagring.png" x="1120" y="110" width="300" height="300" clip-path="url(#ci1)"/>
+  <text x="780" y="454" font-family="Helvetica, Arial" font-size="30" fill="#17181C">08. hartslagring</text>
+  <clipPath id="sq2"><rect x="1500" y="110" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci2"><circle cx="1990.0" cy="260.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/09-groen-veld.png" x="1500" y="110" width="300" height="300" clip-path="url(#sq2)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/09-groen-veld.png" x="1840" y="110" width="300" height="300" clip-path="url(#ci2)"/>
+  <text x="1500" y="454" font-family="Helvetica, Arial" font-size="30" fill="#17181C">09. groen-veld</text>
+  <clipPath id="sq3"><rect x="60" y="530" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci3"><circle cx="550.0" cy="680.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/10-drie-bogen.png" x="60" y="530" width="300" height="300" clip-path="url(#sq3)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/10-drie-bogen.png" x="400" y="530" width="300" height="300" clip-path="url(#ci3)"/>
+  <text x="60" y="874" font-family="Helvetica, Arial" font-size="30" fill="#17181C">10. drie-bogen</text>
+  <clipPath id="sq4"><rect x="780" y="530" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci4"><circle cx="1270.0" cy="680.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/11-scanlijnen.png" x="780" y="530" width="300" height="300" clip-path="url(#sq4)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/11-scanlijnen.png" x="1120" y="530" width="300" height="300" clip-path="url(#ci4)"/>
+  <text x="780" y="874" font-family="Helvetica, Arial" font-size="30" fill="#17181C">11. scanlijnen</text>
+  <clipPath id="sq5"><rect x="1500" y="530" width="300" height="300" rx="66"/></clipPath>
+  <clipPath id="ci5"><circle cx="1990.0" cy="680.0" r="150.0"/></clipPath>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/12-kroon.png" x="1500" y="530" width="300" height="300" clip-path="url(#sq5)"/>
+  <image href="/Users/airflo/Documents/Trading/noop/branding/variants/12-kroon.png" x="1840" y="530" width="300" height="300" clip-path="url(#ci5)"/>
+  <text x="1500" y="874" font-family="Helvetica, Arial" font-size="30" fill="#17181C">12. kroon</text>
+</svg>

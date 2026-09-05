@@ -1,0 +1,26 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#151b24"/><stop offset="70%" stop-color="#0b0f15"/><stop offset="100%" stop-color="#06080b"/>
+    </radialGradient>
+    <linearGradient id="mono" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/><stop offset="55%" stop-color="#2dd4bf"/><stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#B47A2B"/><stop offset="60%" stop-color="#E8B84B"/><stop offset="100%" stop-color="#F6DFA0"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8FD86A"/><stop offset="100%" stop-color="#03E095"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6FA8E8"/><stop offset="100%" stop-color="#3FA9C9"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" fill="#F3F1EA"/>
+
+  <circle cx="512" cy="512" r="340" fill="none" stroke="#17181C" stroke-opacity="0.08" stroke-width="12"/>
+  <path d="M 292 716 V 332 L 512 552 L 732 332 V 716" fill="none" stroke="#17181C" stroke-width="86" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="512" cy="700" r="46" fill="#0F9D62"/>
+
+</svg>

@@ -1,0 +1,32 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bg" cx="50%" cy="42%" r="75%">
+      <stop offset="0%" stop-color="#151b24"/><stop offset="70%" stop-color="#0b0f15"/><stop offset="100%" stop-color="#06080b"/>
+    </radialGradient>
+    <linearGradient id="mono" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#22d3ee"/><stop offset="55%" stop-color="#2dd4bf"/><stop offset="100%" stop-color="#34d399"/>
+    </linearGradient>
+    <linearGradient id="gold" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#B47A2B"/><stop offset="60%" stop-color="#E8B84B"/><stop offset="100%" stop-color="#F6DFA0"/>
+    </linearGradient>
+    <linearGradient id="dawn" x1="0%" y1="100%" x2="0%" y2="0%">
+      <stop offset="0%" stop-color="#E0662F"/><stop offset="55%" stop-color="#E8B84B"/><stop offset="100%" stop-color="#F6DFA0"/>
+    </linearGradient>
+    <linearGradient id="deep" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0F9D62"/><stop offset="100%" stop-color="#0B6B7A"/>
+    </linearGradient>
+    <linearGradient id="green" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#8FD86A"/><stop offset="100%" stop-color="#03E095"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#6FA8E8"/><stop offset="100%" stop-color="#3FA9C9"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#bg)"/>
+
+  <circle cx="512" cy="512" r="300" fill="none" stroke="url(#gold)" stroke-width="40"/>
+  <path d="M 512.0 182.0 L 512.0 126.0 M 677.0 226.2 L 705.0 177.7 M 797.8 347.0 L 846.3 319.0 M 842.0 512.0 L 898.0 512.0 M 797.8 677.0 L 846.3 705.0 M 677.0 797.8 L 705.0 846.3 M 512.0 842.0 L 512.0 898.0 M 347.0 797.8 L 319.0 846.3 M 226.2 677.0 L 177.7 705.0 M 182.0 512.0 L 126.0 512.0 M 226.2 347.0 L 177.7 319.0 M 347.0 226.2 L 319.0 177.7" stroke="url(#gold)" stroke-width="30" stroke-linecap="round"/>
+  <path d="M 402 640 V 400 L 512 510 L 622 400 V 640" fill="none" stroke="#F7F7FA" stroke-width="54" stroke-linecap="round" stroke-linejoin="round"/>
+
+</svg>
