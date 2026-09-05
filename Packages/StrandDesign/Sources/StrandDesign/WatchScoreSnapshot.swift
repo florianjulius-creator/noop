@@ -61,6 +61,11 @@ public struct WatchScoreSnapshot: Codable, Equatable, Sendable {
     /// Why the iPhone did or did not produce a briefing, already phrased for the Watch settings page
     /// ("OK 06:52", "geen API-key", …). See `BriefingStatus`.
     public var briefingStatus: String?
+    /// When the strap last completed an offload to the phone (nil = unknown). Read on the Watch
+    /// settings page as "laatste sync", the tell for whether the background link is alive.
+    public var lastSyncAt: Date?
+    /// Whether the phone held a live BLE link to the strap when this snapshot was built.
+    public var strapConnected: Bool?
 
     /// A one line sleep summary for the glance (e.g. "7h 12m · 81% efficiency"), already formatted by
     /// the phone. Empty string when there is nothing to show.

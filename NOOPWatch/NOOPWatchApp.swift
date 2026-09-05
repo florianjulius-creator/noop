@@ -86,6 +86,8 @@ struct NOOPWatchApp: App {
         demo.briefing = "Je staat er goed voor: HRV boven je baseline en rustpols lager dan gemiddeld, met een volle nacht. De geplande JOIN-training kan vol."
         demo.briefingDay = today
         demo.briefingStatus = "OK 06:52"
+        demo.lastSyncAt = Date().addingTimeInterval(-1800)
+        demo.strapConnected = true
         demo.save()
     }
     #endif

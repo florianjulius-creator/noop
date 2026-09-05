@@ -611,6 +611,10 @@ final class AppModel: ObservableObject {
     /// A closure rather than a direct reference because `HealthKitBridge` owns iOS-only HealthKit state
     /// while this type is shared with macOS, and the bridge is a `@StateObject` the app scene owns.
     var healthWriteBack: (() async -> Void)?
+    /// Push the fresh snapshot to the Watch, set by `StrandiOSApp`. Same reasoning as `healthWriteBack`:
+    /// the only other watch pushes are gated on scenePhase == .active, so a night offloaded in the
+    /// background reached the wrist an app-open late. Closure for the same ownership reason.
+    var watchPush: (() async -> Void)?
     #endif
 
     /// Settle a re-score that is owed (#1538) — one an earlier attempt started and was killed partway
@@ -670,6 +674,8 @@ final class AppModel: ObservableObject {
         // raced the data it was meant to publish and last night's sleep reached Health an app-open late.
         // Set by StrandiOSApp; nil on macOS and in tests, where there is no bridge.
         await healthWriteBack?()
+        // Watch: the wrist gets the same "new data landed" push (rate-limited inside the bridge).
+        await watchPush?()
         #endif
     }
 

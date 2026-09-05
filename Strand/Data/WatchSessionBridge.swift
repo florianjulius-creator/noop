@@ -204,6 +204,9 @@ final class WatchSessionBridge: NSObject, ObservableObject {
         snap.briefing = defaults.string(forKey: MorningBriefing.lastTextKey)
         snap.briefingDay = defaults.string(forKey: MorningBriefing.lastDayKey)
         snap.briefingStatus = defaults.string(forKey: MorningBriefing.lastStatusKey)
+        // Link health for the Watch settings page: the strap's last completed offload + live link state.
+        snap.lastSyncAt = model.live.lastSyncedAt.map { Date(timeIntervalSince1970: $0) }
+        snap.strapConnected = model.live.connected
         return snap
     }
 

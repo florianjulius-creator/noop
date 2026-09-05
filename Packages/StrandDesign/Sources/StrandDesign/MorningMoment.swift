@@ -117,8 +117,13 @@ public struct MorningMoment: Equatable, Sendable {
 // MARK: - MorningSchedule
 //
 // Pure date math for the Watch scheduler: the next hour:minute strictly after `now`, and the
-// background-refresh slot ten minutes ahead of it (never in the past, never sooner than a minute).
+// background-refresh slots ahead of it. Two stages per morning: T − 25 min wakes the phone for the
+// strap offload + re-score + briefing, T − 5 min picks up whatever landed since. Past the last stage
+// the next slot is tomorrow's first, so a refresh handler that re-arms can never loop up to T.
 public enum MorningSchedule {
+    /// Seconds ahead of the fire time, in order.
+    public static let refreshStages: [TimeInterval] = [25 * 60, 5 * 60]
+
     public static func nextFire(after now: Date, hour: Int, minute: Int, calendar: Calendar = .current) -> Date {
         var comps = calendar.dateComponents([.year, .month, .day], from: now)
         comps.hour = hour
@@ -129,8 +134,14 @@ public enum MorningSchedule {
         return calendar.date(byAdding: .day, value: 1, to: today) ?? today
     }
 
-    public static func refreshDate(for fire: Date, now: Date) -> Date {
-        let preferred = fire.addingTimeInterval(-10 * 60)
-        return preferred > now ? preferred : now.addingTimeInterval(60)
+    /// The next refresh slot strictly ahead of `now` (at least 30 s out): the first of `refreshStages`
+    /// before `fire` that is still ahead, else the first stage before the following day's fire.
+    public static func refreshDate(for fire: Date, now: Date, calendar: Calendar = .current) -> Date {
+        for stage in refreshStages {
+            let slot = fire.addingTimeInterval(-stage)
+            if slot > now.addingTimeInterval(30) { return slot }
+        }
+        let tomorrow = calendar.date(byAdding: .day, value: 1, to: fire) ?? fire.addingTimeInterval(86_400)
+        return tomorrow.addingTimeInterval(-refreshStages[0])
     }
 }

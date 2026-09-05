@@ -22,11 +22,15 @@ struct WatchRootView: View {
         .tabViewStyle(.page)
         .background(StrandPalette.surfaceBase.ignoresSafeArea())
         // Belt and braces for the morning schedule: the delegate re-arms at launch, but a UI start
-        // re-arms too (idempotent — same identifier replaces), and records what it found first.
+        // re-arms too (idempotent — same identifier replaces), and records what it found first. It also
+        // ASKS the phone for its latest snapshot: the phone only pushes on its own foreground, so without
+        // this the glance shows whatever it last got until the iPhone app is opened. WatchConnectivity
+        // launches the iPhone app in the background to answer, so the reply is fresh even from a pocket.
         .task {
             if UserDefaults.standard.string(forKey: MorningDiag.launchKey) == nil {
                 await MorningDiag.recordLaunch("ui")
             }
+            WatchScoreStore.shared.requestLatest()
             await MorningScheduler.rearm()
         }
     }

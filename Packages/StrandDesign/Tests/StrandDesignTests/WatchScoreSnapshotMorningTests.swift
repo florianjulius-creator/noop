@@ -20,6 +20,8 @@ final class WatchScoreSnapshotMorningTests: XCTestCase {
         snap.briefing = "Je staat er goed voor."
         snap.briefingDay = "2026-09-04"
         snap.briefingStatus = "OK 06:52"
+        snap.lastSyncAt = Date(timeIntervalSince1970: 1_700_000_000)
+        snap.strapConnected = true
 
         let data = try JSONEncoder().encode(snap)
         let back = try JSONDecoder().decode(WatchScoreSnapshot.self, from: data)
@@ -32,6 +34,8 @@ final class WatchScoreSnapshotMorningTests: XCTestCase {
         XCTAssertEqual(back.briefing, "Je staat er goed voor.")
         XCTAssertEqual(back.briefingDay, "2026-09-04")
         XCTAssertEqual(back.briefingStatus, "OK 06:52")
+        XCTAssertEqual(back.lastSyncAt, Date(timeIntervalSince1970: 1_700_000_000))
+        XCTAssertEqual(back.strapConnected, true)
     }
 
     func testLegacyPayloadDecodesMorningFieldsAsNil() throws {
@@ -48,6 +52,8 @@ final class WatchScoreSnapshotMorningTests: XCTestCase {
         XCTAssertNil(snap.briefing)
         XCTAssertNil(snap.briefingDay)
         XCTAssertNil(snap.briefingStatus)
+        XCTAssertNil(snap.lastSyncAt)
+        XCTAssertNil(snap.strapConnected)
     }
 
     func testLocalDayKeyUsesGregorianYearMonthDay() {

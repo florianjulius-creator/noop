@@ -78,6 +78,7 @@ struct WatchMorningSettingsView: View {
                     Text("Planning")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
+                    Text("Strap: \(strapLine)")
                     Text("Nu: \(diagNow)")
                     Text("Bij start: \(UserDefaults.standard.string(forKey: MorningDiag.launchKey) ?? "–")")
                 }
@@ -96,6 +97,21 @@ struct WatchMorningSettingsView: View {
             MorningMomentView(store: store, celebrate: true)
         }
     }
+
+    /// "verbonden · laatste sync 06:12" — the tell for whether the phone's background strap link lives.
+    private var strapLine: String {
+        guard let snap = store.snapshot else { return "–" }
+        let link = snap.strapConnected.map { $0 ? "verbonden" : "niet verbonden" } ?? "?"
+        let sync = snap.lastSyncAt.map { "laatste sync " + Self.clock.string(from: $0) } ?? "geen sync bekend"
+        return "\(link) · \(sync)"
+    }
+
+    private static let clock: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "nl_NL")
+        f.dateFormat = "dd-MM HH:mm"
+        return f
+    }()
 
     private func rearm() {
         Task {

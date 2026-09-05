@@ -103,11 +103,19 @@ final class MorningMomentTests: XCTestCase {
         XCTAssertEqual(fire, cal.date(from: DateComponents(year: 2026, month: 9, day: 5, hour: 7, minute: 0))!)
     }
 
-    func testRefreshDateIsTenMinutesBeforeFireButNeverInThePast() {
+    func testRefreshDateWalksTheStagesThenRollsToTomorrow() {
         let fire = cal.date(from: DateComponents(year: 2026, month: 9, day: 5, hour: 7, minute: 0))!
-        let early = cal.date(from: DateComponents(year: 2026, month: 9, day: 4, hour: 22))!
-        XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: early), fire.addingTimeInterval(-600))
+        let evening = cal.date(from: DateComponents(year: 2026, month: 9, day: 4, hour: 22))!
+        // Long before: the first stage, T − 25.
+        XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: evening, calendar: cal),
+                       fire.addingTimeInterval(-1500))
+        // Inside the first stage's window: the second stage, T − 5.
+        let between = fire.addingTimeInterval(-1400)
+        XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: between, calendar: cal),
+                       fire.addingTimeInterval(-300))
+        // Past the last stage (even before T): tomorrow's first stage, never a slot minutes away.
         let late = fire.addingTimeInterval(-120)
-        XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: late), late.addingTimeInterval(60))
+        XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: late, calendar: cal),
+                       fire.addingTimeInterval(86_400 - 1500))
     }
 }
