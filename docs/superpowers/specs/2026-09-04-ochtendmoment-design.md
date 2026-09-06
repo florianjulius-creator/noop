@@ -171,3 +171,23 @@ Changes:
   the iPhone app (iOS stops relaunching it for strap events).
 - The long look's system sash (icon + coloured bar) cannot be removed or recoloured on watchOS 9+;
   rings are 130 pt so ring + verdict fit the first screen.
+
+## Addendum 06-09-2026 — the Sleep Focus: re-fire when it ends
+
+Observed 06-09: the 07:00 notification fired, but the Watch sat under the Sleep Focus, so it landed
+silently in Notification Center (proven by the page-5 diagnostics: "Bij start … 1 gepland · volgende
+06-09 07:00", process alive all night). The user wants the moment on the wrist as soon as the Focus ends.
+
+- Chosen mechanism: a Shortcuts personal automation "When Sleep Focus is turned off → run 'Ochtendmoment
+  naar de Watch' (immediately)". The App Intent `MorningMomentIntent` runs the iPhone app in the
+  background and calls `WatchSessionBridge.wakeWatchForMorning()`, a complication transfer with
+  `focusEnded`. The Watch's `didReceiveUserInfo` calls `MorningScheduler.fireIfMissedToday`: within
+  T…T+6 h and only when `morning.lastShownDay` ≠ today, it removes the silent delivery and fires
+  `morning-late` after 3 s (category MORNING → the long look).
+- `MorningNotificationController.didReceive` records `lastShownDay`, so a moment already viewed from
+  Notification Center is not re-fired.
+- The Focus Status API (`INShareFocusStatusIntent`, no automation needed) was implemented and reverted:
+  it requires the Communication Notifications capability in the provisioning profile, which the
+  headless build cannot add. Re-enable via Xcode GUI if wanted.
+- Page 5 keeps an event log (start / refresh / getoond / focus-einde) and refreshes "Nu" on appear and
+  every minute. Rings are 100 pt with a one-line legend so the device's first screen holds them.
