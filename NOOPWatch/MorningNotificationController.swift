@@ -1,6 +1,7 @@
 import SwiftUI
 import UserNotifications
 import WatchKit
+import StrandDesign
 
 // MARK: - MorningNotificationController — the MORNING category's custom long look
 //
@@ -21,6 +22,8 @@ final class MorningNotificationController: WKUserNotificationHostingController<M
     }
 
     override func didReceive(_ notification: UNNotification) {
+        MorningSettings.lastShownDay = WatchScoreSnapshot.localDayKey(Date())
+        MorningDiag.log("getoond (\(notification.request.identifier))")
         WatchScoreStore.shared.reloadFromAppGroup()
         WatchScoreStore.shared.requestLatest()
     }

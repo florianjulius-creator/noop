@@ -8,6 +8,14 @@ enum MorningSettings {
     static let enabledKey = "morning.enabled"
     static let hourKey = "morning.hour"
     static let minuteKey = "morning.minute"
+    static let lastShownDayKey = "morning.lastShownDay"
+
+    /// The local day the long look was last actually SHOWN (set by the notification controller). The
+    /// Focus-ended re-fire skips a day whose moment the user already saw.
+    static var lastShownDay: String? {
+        get { UserDefaults.standard.string(forKey: lastShownDayKey) }
+        set { UserDefaults.standard.set(newValue, forKey: lastShownDayKey) }
+    }
 
     static var enabled: Bool {
         get { UserDefaults.standard.object(forKey: enabledKey) as? Bool ?? true }
@@ -47,6 +55,7 @@ enum MorningScheduler {
     static let category = "MORNING"
     static let notificationId = "morning-moment"
     static let testId = "morning-test"
+    static let lateId = "morning-late"
 
     static func rearm() async {
         await scheduleNotification()
@@ -69,6 +78,31 @@ enum MorningScheduler {
         // would silently delete the fresh schedule.
         let request = UNNotificationRequest(identifier: notificationId, content: content(), trigger: trigger)
         try? await center.add(request)
+    }
+
+    /// A Focus just ended (or another late wake): when today's moment already fired but landed silently
+    /// (the Watch sat under the Sleep Focus at T) and has not been shown, fire a fresh one now so it
+    /// alerts on the wrist. Window: from T until 6 h after; outside it, or once shown, nothing.
+    static func fireIfMissedToday(reason: String, now: Date = Date()) async {
+        guard MorningSettings.enabled else { return }
+        let today = WatchScoreSnapshot.localDayKey(now)
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: now)
+        comps.hour = MorningSettings.hour
+        comps.minute = MorningSettings.minute
+        comps.second = 0
+        guard let fireToday = Calendar.current.date(from: comps) else { return }
+        let sinceFire = now.timeIntervalSince(fireToday)
+        guard sinceFire >= 0, sinceFire < 6 * 3600 else {
+            MorningDiag.log("\(reason): buiten venster"); return
+        }
+        guard MorningSettings.lastShownDay != today else {
+            MorningDiag.log("\(reason): al getoond"); return
+        }
+        let center = UNUserNotificationCenter.current()
+        center.removeDeliveredNotifications(withIdentifiers: [notificationId, lateId])
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 3, repeats: false)
+        try? await center.add(UNNotificationRequest(identifier: lateId, content: content(), trigger: trigger))
+        MorningDiag.log("\(reason): melding opnieuw")
     }
 
     static func scheduleTest() async {
@@ -141,6 +175,21 @@ enum MorningDiag {
     static func recordLaunch(_ label: String) async {
         let text = await line()
         UserDefaults.standard.set("\(label) \(text)", forKey: launchKey)
+        log("start \(label)")
+    }
+
+    // MARK: Event log — the last few things that happened, for the settings page
+    static let logKey = "morning.diag.log"
+
+    static func log(_ text: String) {
+        var lines = UserDefaults.standard.stringArray(forKey: logKey) ?? []
+        lines.append("\(clock.string(from: Date())) \(text)")
+        if lines.count > 6 { lines.removeFirst(lines.count - 6) }
+        UserDefaults.standard.set(lines, forKey: logKey)
+    }
+
+    static func recent() -> [String] {
+        UserDefaults.standard.stringArray(forKey: logKey) ?? []
     }
 }
 
@@ -172,6 +221,7 @@ final class MorningRefresh {
     private func finish() {
         guard !finished else { return }
         finished = true
+        MorningDiag.log("refresh klaar")
         MorningScheduler.scheduleRefresh()
         completion()
     }
@@ -189,6 +239,7 @@ final class WatchAppDelegate: NSObject, WKApplicationDelegate {
     func handle(_ backgroundTasks: Set<WKRefreshBackgroundTask>) {
         for task in backgroundTasks {
             if let refresh = task as? WKApplicationRefreshBackgroundTask {
+                MorningDiag.log("refresh gestart")
                 Task { @MainActor in
                     MorningRefresh.run { refresh.setTaskCompletedWithSnapshot(false) }
                 }

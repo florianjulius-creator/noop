@@ -288,6 +288,27 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     static let lastWakeDayKey = "watch.lastWakeDay"
     /// Set by the app entry: generate the briefing (day-guarded unless forced) and push the wrist.
     var onMorningRequested: ((Bool) async -> Void)?
+
+    /// The live bridge for callers outside the SwiftUI scene (the Shortcuts intent). Set by the app entry.
+    static weak var current: WatchSessionBridge?
+    /// Payload key of the "wake for the morning moment" transfer; the watch re-fires a silently-landed
+    /// morning notification.
+    static let focusEndedKey = "focusEnded"
+
+    /// Wake the watch app (complication transfer) so it can re-fire a morning moment that landed
+    /// silently under the Sleep Focus. Called by the `MorningMomentIntent` from a Shortcuts automation.
+    /// Deliberately NOT behind the once-a-day wake gate: this is the one transfer that has to arrive
+    /// now. Needs a complication on the active face, as every background wake does. Waits briefly for
+    /// session activation — a cold background launch calls this seconds after `activate()`.
+    func wakeWatchForMorning() async {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "focus.lastEndedAt")
+        guard let session else { return }
+        for _ in 0..<15 where session.activationState != .activated {
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        guard session.activationState == .activated, session.isComplicationEnabled else { return }
+        session.transferCurrentComplicationUserInfo([Self.focusEndedKey: Date().timeIntervalSince1970])
+    }
 }
 
 // MARK: - WCSessionDelegate

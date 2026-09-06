@@ -22,6 +22,7 @@ struct MorningMomentView: View {
         ScrollView {
             VStack(spacing: 10) {
                 MorningRingsView(moment: moment, animated: celebrate && !motion.poseStill(reduceMotion))
+                if case .fresh = moment.scores { legend }
                 switch moment.scores {
                 case .fresh: blocks
                 case .notScored: notScored
@@ -80,6 +81,18 @@ struct MorningMomentView: View {
         }
     }
 
+    /// One line under the rings so the first screen already says it all: "Slaap 84 · HRV 42 ms (−2%)".
+    private var legend: some View {
+        var parts: [String] = []
+        if case .fresh(_, let sleep) = moment.scores, let sleep { parts.append("Slaap \(Int(sleep.rounded()))") }
+        if let hrv = moment.hrvMs { parts.append(hrvLabel(hrv)) }
+        return Text(parts.joined(separator: " · "))
+            .font(StrandFont.caption)
+            .foregroundStyle(StrandPalette.textSecondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.8)
+    }
+
     private var notScored: some View {
         MorningBlock(title: "NACHT", accent: StrandPalette.textTertiary) {
             Text("Nog niet gesynct. Open The Machine op je iPhone.")
@@ -111,11 +124,12 @@ struct MorningRingsView: View {
     let animated: Bool
     @State private var appeared = false
 
-    // Sized for the long look: the Ultra screen is 205×251 pt and the system sash takes ~70 pt, so a
-    // 130 pt ring with its verdict fits the first screen without the Crown. In-app it simply has room.
-    private let outer: CGFloat = 130
-    private let inner: CGFloat = 94
-    private let width: CGFloat = 13
+    // Sized for the long look on the DEVICE: the Ultra screen is 205×251 pt and the system time row +
+    // sash + card inset leave ~140 pt for the first screen (the simulator shows more). A 100 pt ring with
+    // its verdict plus the one-line legend fit without the Crown. In-app it simply has room.
+    private let outer: CGFloat = 100
+    private let inner: CGFloat = 72
+    private let width: CGFloat = 11
 
     private var recovery: Double? {
         if case .fresh(let r, _) = moment.scores { return r }
@@ -175,24 +189,24 @@ struct MorningRingsView: View {
         VStack(spacing: 1) {
             if let recovery {
                 Text("\(Int(shownRecovery.rounded()))")
-                    .font(StrandFont.rounded(34, weight: .heavy))
+                    .font(StrandFont.rounded(26, weight: .heavy))
                     .foregroundStyle(StrandPalette.textPrimary)
                     .monospacedDigit()
                     .contentTransition(.numericText())
                     .animation(animated ? .easeOut(duration: 1.0) : nil, value: shownRecovery)
                 Text("RECOVERY")
-                    .font(StrandFont.overlineScaled(8))
-                    .tracking(1.2)
+                    .font(StrandFont.overlineScaled(7))
+                    .tracking(1.0)
                     .foregroundStyle(StrandPalette.textTertiary)
                 if let verdict = moment.verdict {
                     Text(verdict)
-                        .font(StrandFont.rounded(10, weight: .heavy))
+                        .font(StrandFont.rounded(9, weight: .heavy))
                         .tracking(0.6)
                         .foregroundStyle(StrandPalette.recoveryColor(recovery))
                 }
             } else {
                 Text("–")
-                    .font(StrandFont.rounded(34, weight: .heavy))
+                    .font(StrandFont.rounded(26, weight: .heavy))
                     .foregroundStyle(StrandPalette.textTertiary)
                 Text("RECOVERY")
                     .font(StrandFont.overlineScaled(8))

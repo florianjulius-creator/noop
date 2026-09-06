@@ -10,6 +10,8 @@ struct WatchMorningSettingsView: View {
     @State private var testArmed = false
     @State private var requesting = false
     @State private var diagNow = "…"
+    @State private var diagLog: [String] = []
+    private let ticker = Timer.publish(every: 60, on: .main, in: .common).autoconnect()
 
     var body: some View {
         ScrollView {
@@ -81,6 +83,7 @@ struct WatchMorningSettingsView: View {
                     Text("Strap: \(strapLine)")
                     Text("Nu: \(diagNow)")
                     Text("Bij start: \(UserDefaults.standard.string(forKey: MorningDiag.launchKey) ?? "–")")
+                    ForEach(diagLog.suffix(4), id: \.self) { Text($0) }
                 }
                 .font(StrandFont.overlineScaled(9))
                 .foregroundStyle(StrandPalette.textSecondary)
@@ -88,7 +91,8 @@ struct WatchMorningSettingsView: View {
                 .padding(.horizontal, 10)
                 .padding(.vertical, 6)
                 .background(StrandPalette.surfaceRaised, in: RoundedRectangle(cornerRadius: 12))
-                .task { diagNow = await MorningDiag.line() }
+                .onAppear { refreshDiag() }
+                .onReceive(ticker) { _ in refreshDiag() }
             }
             .padding(.horizontal, 4)
             .padding(.bottom, 8)
@@ -113,10 +117,17 @@ struct WatchMorningSettingsView: View {
         return f
     }()
 
+    private func refreshDiag() {
+        Task {
+            diagNow = await MorningDiag.line()
+            diagLog = MorningDiag.recent()
+        }
+    }
+
     private func rearm() {
         Task {
             await MorningScheduler.rearm()
-            diagNow = await MorningDiag.line()
+            refreshDiag()
         }
     }
 }

@@ -41,6 +41,8 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
     static let requestLatestKey = "requestLatest"
     static let requestMorningKey = "requestMorning"
     static let forceKey = "force"
+    /// The phone's "Focus just ended" wake (complication transfer, no snapshot attached).
+    static let focusEndedKey = "focusEnded"
 
     private typealias Pending = (message: [String: Any], completion: (WatchScoreSnapshot?) -> Void)
     /// Messages queued while WCSession is still activating (a background launch sends before the
@@ -163,10 +165,14 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
         }
     }
 
-    /// The phone's once-a-day complication transfer (the morning wake) lands here.
+    /// The phone's complication transfers land here: the once-a-day morning wake (a snapshot) and the
+    /// "Focus just ended" wake (no snapshot; re-fire today's moment if it landed silently).
     func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
         if let snap = decode(from: userInfo) {
             apply(snap)
+        }
+        if userInfo[Self.focusEndedKey] != nil {
+            Task { await MorningScheduler.fireIfMissedToday(reason: "focus-einde") }
         }
     }
 

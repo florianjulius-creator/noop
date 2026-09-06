@@ -62,6 +62,31 @@ struct BuzzStrapIntent: AppIntent {
     }
 }
 
+/// Wake the Watch for the morning moment now. Meant for a Shortcuts AUTOMATION "when the Sleep Focus
+/// turns off": the Watch then re-fires a morning notification that landed silently under the Focus
+/// (only inside the morning window, only when today's was not shown yet). Runs in the background —
+/// Shortcuts launches the app for it, which builds the watch bridge in the app entry's init. The Focus
+/// Status API would do this without an automation, but needs the Communication Notifications
+/// capability in the provisioning profile, which this fork's headless build cannot add.
+struct MorningMomentIntent: AppIntent {
+    static var title: LocalizedStringResource = "Ochtendmoment naar de Watch"
+    static var description = IntentDescription(
+        "Wekt de Watch zodat het ochtendmoment alsnog op de pols komt, bijvoorbeeld zodra de Slaap-focus uitgaat.")
+
+    @MainActor
+    func perform() async throws -> some IntentResult {
+        // The bridge is built in StrandiOSApp.init; on a cold background launch give it a moment.
+        for _ in 0..<15 {
+            if let bridge = WatchSessionBridge.current {
+                await bridge.wakeWatchForMorning()
+                return .result()
+            }
+            try? await Task.sleep(nanoseconds: 200_000_000)
+        }
+        return .result()
+    }
+}
+
 /// Surfaces NOOP's intents to Siri, Spotlight, and the Shortcuts gallery without any user setup.
 struct NOOPShortcuts: AppShortcutsProvider {
     static var appShortcuts: [AppShortcut] {
@@ -73,6 +98,10 @@ struct NOOPShortcuts: AppShortcutsProvider {
                     phrases: ["Buzz my \(.applicationName) strap"],
                     shortTitle: "Buzz Strap",
                     systemImageName: "waveform.path")
+        AppShortcut(intent: MorningMomentIntent(),
+                    phrases: ["Ochtendmoment in \(.applicationName)"],
+                    shortTitle: "Ochtendmoment",
+                    systemImageName: "sunrise")
     }
 }
 #endif
