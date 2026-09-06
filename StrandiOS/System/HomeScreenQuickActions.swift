@@ -1,4 +1,5 @@
 #if os(iOS)
+import Intents
 import StrandAnalytics
 import SwiftUI
 import UIKit
@@ -61,6 +62,14 @@ final class HomeScreenQuickActionAppDelegate: NSObject, UIApplicationDelegate {
     ) -> Bool {
         HomeScreenQuickAction.install(in: application)
         return true
+    }
+
+    /// In-app SiriKit intent handling (no Intents extension): the system launches the app in the
+    /// background to deliver `INShareFocusStatusIntent` whenever the user's Focus changes. Listed in
+    /// `INIntentsSupported` (project.yml).
+    func application(_ application: UIApplication, handlerFor intent: INIntent) -> Any? {
+        if intent is INShareFocusStatusIntent { return FocusStatusHandler() }
+        return nil
     }
 
     func application(

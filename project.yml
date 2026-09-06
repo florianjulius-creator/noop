@@ -257,6 +257,12 @@ targets:
           - UIInterfaceOrientationPortraitUpsideDown
           - UIInterfaceOrientationLandscapeLeft
           - UIInterfaceOrientationLandscapeRight
+        # Ochtendmoment: the Watch re-fires a morning notification that landed silently under the Sleep
+        # Focus. iOS tells this app about Focus changes via INShareFocusStatusIntent, handled IN-APP
+        # (application(_:handlerFor:), no Intents extension) — the app is launched in the background for it.
+        INIntentsSupported:
+          - INShareFocusStatusIntent
+        NSFocusStatusUsageDescription: "The Machine leest of je Slaap-focus aan staat, zodat het ochtendmoment op je Watch pas komt als die uit gaat."
         UIBackgroundModes:
           - bluetooth-central
           # #524: keep recording an outdoor workout's GPS route while the app is backgrounded (screen off),
@@ -317,6 +323,10 @@ targets:
         com.apple.developer.healthkit: true
         # Required by HealthKit on iOS 15+ for the observer queries registered by HealthKitBridge.
         com.apple.developer.healthkit.background-delivery: true
+        # Focus Status API (INFocusStatusCenter / INShareFocusStatusIntent) rides the Communication
+        # Notifications capability. No communication notifications are sent. Needs the capability on the
+        # App ID: xcodebuild -allowProvisioningUpdates registers it when an Apple ID is signed in to Xcode.
+        com.apple.developer.usernotifications.communication: true
         com.apple.developer.healthkit.access: []
         com.apple.security.application-groups:
           - $(APP_GROUP_ID)

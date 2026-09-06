@@ -1,4 +1,5 @@
 #if os(iOS)
+import Intents
 import SwiftUI
 import StrandDesign
 import UserNotifications
@@ -301,6 +302,11 @@ struct StrandiOSApp: App {
                 // supported, so this is safe on every device/simulator combination.
                 .task {
                     watch.activate()
+                    // Focus status (the Sleep Focus ending re-fires the Watch's morning moment). One
+                    // system prompt, once; nothing else in the app reads Focus.
+                    if INFocusStatusCenter.default.authorizationStatus == .notDetermined {
+                        INFocusStatusCenter.default.requestAuthorization { _ in }
+                    }
                     // Arm tomorrow's fallback run, catch up today's briefing if due, THEN push the
                     // wrist (forced when a briefing was just produced so the text lands immediately).
                     MorningBriefing.scheduleNext()
