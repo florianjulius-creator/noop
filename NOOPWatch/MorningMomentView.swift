@@ -13,28 +13,41 @@ import StrandDesign
 struct MorningMomentView: View {
     @ObservedObject var store: WatchScoreStore
     var celebrate: Bool = true
+    /// In the app the view scrolls itself; in the notification long look it must NOT — the long look is
+    /// already a scroll page, and a nested ScrollView gets squeezed to the leftover height and scrolls
+    /// inside it (the wrist then opened on the BOTTOM of the ring). Given its natural height the system
+    /// scrolls sash → rings → blocks → buttons as one page.
+    var scrolls: Bool = true
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var motion = NoopMotionState.shared
 
     private var moment: MorningMoment { MorningMoment(snapshot: store.snapshot) }
 
     var body: some View {
-        ScrollView {
-            VStack(spacing: 10) {
-                MorningRingsView(moment: moment, animated: celebrate && !motion.poseStill(reduceMotion))
-                if case .fresh = moment.scores { legend }
-                switch moment.scores {
-                case .fresh: blocks
-                case .notScored: notScored
-                }
+        Group {
+            if scrolls {
+                ScrollView { content }
+            } else {
+                content
             }
-            .padding(.horizontal, 6)
-            .padding(.bottom, 8)
         }
         .background(Color.black.ignoresSafeArea())
         .onAppear {
             if celebrate { WKInterfaceDevice.current().play(.notification) }
         }
+    }
+
+    private var content: some View {
+        VStack(spacing: 10) {
+            MorningRingsView(moment: moment, animated: celebrate && !motion.poseStill(reduceMotion))
+            if case .fresh = moment.scores { legend }
+            switch moment.scores {
+            case .fresh: blocks
+            case .notScored: notScored
+            }
+        }
+        .padding(.horizontal, 6)
+        .padding(.bottom, 8)
     }
 
     @ViewBuilder private var blocks: some View {

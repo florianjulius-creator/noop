@@ -18,7 +18,7 @@ final class MorningNotificationController: WKUserNotificationHostingController<M
     // watch face's tint. So the content below simply fits the first screen (rings ≤ 130 pt).
 
     override var body: MorningMomentView {
-        MorningMomentView(store: WatchScoreStore.shared, celebrate: true)
+        MorningMomentView(store: WatchScoreStore.shared, celebrate: true, scrolls: false)
     }
 
     override func didReceive(_ notification: UNNotification) {
