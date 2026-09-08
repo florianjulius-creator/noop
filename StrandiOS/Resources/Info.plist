@@ -51,6 +51,10 @@
 	</array>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>INIntentsSupported</key>
+	<array>
+		<string>INShareFocusStatusIntent</string>
+	</array>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.healthcare-fitness</string>
 	<key>LSSupportsOpeningDocumentsInPlace</key>
@@ -62,6 +66,8 @@
 	</dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>NOOP connects directly to your WHOOP strap over Bluetooth to read heart rate, R-R intervals, battery, and sensor data locally on your iPhone. Nothing leaves your device.</string>
+	<key>NSFocusStatusUsageDescription</key>
+	<string>The Machine leest of je Slaap-focus aan staat, zodat het ochtendmoment op je Watch pas komt als die uit gaat.</string>
 	<key>NSHealthShareUsageDescription</key>
 	<string>NOOP reads your own Apple Health data on-device to compute recovery, strain, and sleep. Nothing leaves your device.</string>
 	<key>NSHealthUpdateUsageDescription</key>
