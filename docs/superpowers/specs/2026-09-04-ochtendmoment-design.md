@@ -191,3 +191,21 @@ silently in Notification Center (proven by the page-5 diagnostics: "Bij start �
   headless build cannot add. Re-enable via Xcode GUI if wanted.
 - Page 5 keeps an event log (start / refresh / getoond / focus-einde) and refreshes "Nu" on appear and
   every minute. Rings are 100 pt with a one-line legend so the device's first screen holds them.
+
+## Addendum 08-09-2026 — the moment is data-driven
+
+Observed 08-09: the 07:00 alert did reach the wrist (Focus allow-list), but read "Nog niet gesynct":
+the night was not scored yet at 07:00 — it cannot be before the user is up, the strap has offloaded
+the finished sleep and the phone has scored it. A fixed time can never guarantee content.
+
+- `MorningPlan.decide(scored:now:fire:shownToday:firedToday:)` (StrandDesign, tested): today's
+  score on the Watch and T passed → fire now; score before T → one-shot at T; no score → nothing at
+  T, fallback notice "Nog geen score van vannacht" at T + 90 min; fired or seen → done.
+- `MorningScheduler.reconcile(reason:)` is the single entry point (launch, settings change, every
+  snapshot that lands via `WatchScoreStore.apply`). No repeating calendar trigger any more.
+- Refresh stages now `[T−25, T−5, T+10, T+25, T+45]` so the Watch keeps asking the phone after wake;
+  `MorningRefresh` skips the ask once today's moment fired or was seen.
+- Phone: the first push of the day that carries today's recovery bypasses the 30-min gate and spends
+  the once-a-day complication wake; unscored pushes never spend it.
+- "Seen" (`lastShownDay`) only counts when the long look showed today's score, so a viewed fallback
+  notice does not block the real moment.
