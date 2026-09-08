@@ -89,14 +89,29 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
     private func apply(_ snap: WatchScoreSnapshot) {
         DispatchQueue.main.async {
             if let current = self.snapshot, snap.asOf < current.asOf { return }
+            let displayChanged = !Self.sameDisplay(self.snapshot, snap)
             self.persist(snap)
             self.snapshot = snap
-            // The phone just pushed new scores, so pull the complication timelines forward now rather
-            // than waiting for WidgetKit's own cadence.
-            WidgetCenter.shared.reloadAllTimelines()
+            // Pull the complication timelines forward ONLY when what they draw actually changed. WidgetKit
+            // budgets reloads per day (a few dozen); since the Watch asks the phone on every UI start and
+            // around the morning, reloading on every identical reply burned that budget and the face froze
+            // on an old number (08-09-2026). The 30-minute timeline backstop covers the rest.
+            if displayChanged {
+                WidgetCenter.shared.reloadAllTimelines()
+            }
             // The morning moment is data-driven: a snapshot carrying today's score is what fires it.
             Task { await MorningScheduler.reconcile(reason: "snapshot") }
         }
+    }
+
+    /// Whether two snapshots draw the same complication (scores, flags, HRV, sleep line, anchor day).
+    /// `asOf` differs on every phone build and `hr` ticks, so neither counts.
+    private static func sameDisplay(_ a: WatchScoreSnapshot?, _ b: WatchScoreSnapshot) -> Bool {
+        guard let a else { return false }
+        return a.charge == b.charge && a.chargeCalibrating == b.chargeCalibrating
+            && a.effort == b.effort && a.effortCalibrating == b.effortCalibrating
+            && a.rest == b.rest && a.restCalibrating == b.restCalibrating
+            && a.hrvMs == b.hrvMs && a.sleepSummary == b.sleepSummary && a.scoreDay == b.scoreDay
     }
 
     /// Re-read the app group (a background wake may have persisted a newer snapshot from another
