@@ -22,7 +22,12 @@ final class MorningNotificationController: WKUserNotificationHostingController<M
     }
 
     override func didReceive(_ notification: UNNotification) {
-        MorningSettings.lastShownDay = WatchScoreSnapshot.localDayKey(Date())
+        // "Seen" only counts when the wrist actually got today's score; a fallback notice viewed without
+        // one must not stop the real moment from firing when the score lands later.
+        let moment = MorningMoment(snapshot: WatchScoreStore.shared.snapshot)
+        if case .fresh(let recovery, _) = moment.scores, recovery != nil {
+            MorningSettings.lastShownDay = WatchScoreSnapshot.localDayKey(Date())
+        }
         MorningDiag.log("getoond (\(notification.request.identifier))")
         WatchScoreStore.shared.reloadFromAppGroup()
         WatchScoreStore.shared.requestLatest()

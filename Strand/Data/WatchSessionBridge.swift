@@ -82,10 +82,15 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             && snap.rest == nil && snap.sleepSummary.isEmpty
         if contentless { return }
         let now = Date()
+        // The FIRST snapshot of the day that carries today's recovery is what fires the Watch's morning
+        // moment: it goes out at once (no spacing gate) and wakes the watch app (complication transfer).
+        let today = WatchScoreSnapshot.localDayKey(now)
+        let todayScored = snap.scoreDay == today && snap.charge != nil
+        let newlyScored = todayScored && !(lastSent.map { $0.scoreDay == today && $0.charge != nil } ?? false)
         // `force` (the morning path only) skips the 30-minute spacing gate but still requires substance.
-        guard force ? Self.headlineChanged(from: lastSent, to: snap) : shouldPush(snap, now: now) else { return }
+        guard (force || newlyScored) ? Self.headlineChanged(from: lastSent, to: snap) : shouldPush(snap, now: now) else { return }
         lastPushedAt = now
-        send(snap, wakeWatch: wakeWatch)
+        send(snap, wakeWatch: wakeWatch || newlyScored)
     }
 
     /// Build the latest snapshot off `model` and push it to the watch. The entrypoint the iOS app entry
@@ -263,10 +268,12 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             // the latest snapshot and never a queued backlog.
             try session.updateApplicationContext([Self.contextKey: data])
             // The morning wake: ONE complication transfer per local day launches the watch app in the
-            // background so it persists today's snapshot before the wrist notification fires. Only
-            // meaningful (and only budgeted) while a complication is on the active face.
+            // background so it can fire the moment off today's score. Spent only on a snapshot that
+            // actually carries today's recovery, so an early (unscored) push never burns the day's wake.
+            // Only meaningful (and only budgeted) while a complication is on the active face.
             let today = WatchScoreSnapshot.localDayKey(Date())
-            if wakeWatch, session.isComplicationEnabled,
+            let todayScored = snap.scoreDay == today && snap.charge != nil
+            if wakeWatch, todayScored, session.isComplicationEnabled,
                UserDefaults.standard.string(forKey: Self.lastWakeDayKey) != today {
                 UserDefaults.standard.set(today, forKey: Self.lastWakeDayKey)
                 session.transferCurrentComplicationUserInfo([Self.contextKey: data])

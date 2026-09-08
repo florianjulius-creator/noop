@@ -94,6 +94,8 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
             // The phone just pushed new scores, so pull the complication timelines forward now rather
             // than waiting for WidgetKit's own cadence.
             WidgetCenter.shared.reloadAllTimelines()
+            // The morning moment is data-driven: a snapshot carrying today's score is what fires it.
+            Task { await MorningScheduler.reconcile(reason: "snapshot") }
         }
     }
 

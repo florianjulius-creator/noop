@@ -113,9 +113,46 @@ final class MorningMomentTests: XCTestCase {
         let between = fire.addingTimeInterval(-1400)
         XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: between, calendar: cal),
                        fire.addingTimeInterval(-300))
-        // Past the last stage (even before T): tomorrow's first stage, never a slot minutes away.
+        // Just before T: the first slot AFTER T (the night is scored once the user is up).
         let late = fire.addingTimeInterval(-120)
         XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: late, calendar: cal),
+                       fire.addingTimeInterval(600))
+        // After the last post-T stage: tomorrow's first stage, never a slot minutes away.
+        let afternoon = fire.addingTimeInterval(4 * 3600)
+        XCTAssertEqual(MorningSchedule.refreshDate(for: fire, now: afternoon, calendar: cal),
                        fire.addingTimeInterval(86_400 - 1500))
+    }
+
+    func testFireTodayIsTodaysTimeEvenWhenPassed() {
+        let at = cal.date(from: DateComponents(year: 2026, month: 9, day: 5, hour: 9, minute: 30))!
+        XCTAssertEqual(MorningSchedule.fireToday(now: at, hour: 7, minute: 0, calendar: cal),
+                       cal.date(from: DateComponents(year: 2026, month: 9, day: 5, hour: 7, minute: 0))!)
+    }
+
+    // MARK: plan
+
+    func testPlanFiresNowWhenScoredAfterT() {
+        let fire = cal.date(from: DateComponents(year: 2026, month: 9, day: 8, hour: 7, minute: 0))!
+        XCTAssertEqual(MorningPlan.decide(scored: true, now: fire.addingTimeInterval(900), fire: fire,
+                                          shownToday: false, firedToday: false), .fireNow)
+    }
+
+    func testPlanSchedulesAtTWhenScoredEarly() {
+        let fire = cal.date(from: DateComponents(year: 2026, month: 9, day: 8, hour: 7, minute: 0))!
+        XCTAssertEqual(MorningPlan.decide(scored: true, now: fire.addingTimeInterval(-1200), fire: fire,
+                                          shownToday: false, firedToday: false), .scheduleAt(fire))
+    }
+
+    func testPlanWaitsWithFallbackWhenNotScored() {
+        let fire = cal.date(from: DateComponents(year: 2026, month: 9, day: 8, hour: 7, minute: 0))!
+        XCTAssertEqual(MorningPlan.decide(scored: false, now: fire.addingTimeInterval(60), fire: fire,
+                                          shownToday: false, firedToday: false),
+                       .waitForScore(fallbackAt: fire.addingTimeInterval(5400)))
+    }
+
+    func testPlanIsDoneOnceFiredOrShown() {
+        let fire = cal.date(from: DateComponents(year: 2026, month: 9, day: 8, hour: 7, minute: 0))!
+        XCTAssertEqual(MorningPlan.decide(scored: true, now: fire, fire: fire, shownToday: false, firedToday: true), .done)
+        XCTAssertEqual(MorningPlan.decide(scored: false, now: fire, fire: fire, shownToday: true, firedToday: false), .done)
     }
 }

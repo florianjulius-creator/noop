@@ -116,13 +116,24 @@ public struct MorningMoment: Equatable, Sendable {
 
 // MARK: - MorningSchedule
 //
-// Pure date math for the Watch scheduler: the next hour:minute strictly after `now`, and the
-// background-refresh slots ahead of it. Two stages per morning: T − 25 min wakes the phone for the
-// strap offload + re-score + briefing, T − 5 min picks up whatever landed since. Past the last stage
-// the next slot is tomorrow's first, so a refresh handler that re-arms can never loop up to T.
+// Pure date math for the Watch scheduler: the next hour:minute strictly after `now`, today's T, and the
+// background-refresh slots around it. Five stages per morning: T − 25 and T − 5 wake the phone for the
+// strap offload + re-score before T; T + 10, T + 25 and T + 45 keep pulling AFTER T, because the night
+// is only scorable once the user is up (the strap offloads the finished sleep, the phone scores it) and
+// the moment fires when that score lands. Past the last stage the next slot is tomorrow's first, so a
+// refresh handler that re-arms can never loop.
 public enum MorningSchedule {
-    /// Seconds ahead of the fire time, in order.
-    public static let refreshStages: [TimeInterval] = [25 * 60, 5 * 60]
+    /// Seconds AHEAD of the fire time, in order; negative = after it.
+    public static let refreshStages: [TimeInterval] = [25 * 60, 5 * 60, -10 * 60, -25 * 60, -45 * 60]
+
+    /// Today's hour:minute, whether or not it has passed.
+    public static func fireToday(now: Date, hour: Int, minute: Int, calendar: Calendar = .current) -> Date {
+        var comps = calendar.dateComponents([.year, .month, .day], from: now)
+        comps.hour = hour
+        comps.minute = minute
+        comps.second = 0
+        return calendar.date(from: comps) ?? now
+    }
 
     public static func nextFire(after now: Date, hour: Int, minute: Int, calendar: Calendar = .current) -> Date {
         var comps = calendar.dateComponents([.year, .month, .day], from: now)
@@ -135,7 +146,7 @@ public enum MorningSchedule {
     }
 
     /// The next refresh slot strictly ahead of `now` (at least 30 s out): the first of `refreshStages`
-    /// before `fire` that is still ahead, else the first stage before the following day's fire.
+    /// around `fire` (today's T) that is still ahead, else the first stage before the following day's fire.
     public static func refreshDate(for fire: Date, now: Date, calendar: Calendar = .current) -> Date {
         for stage in refreshStages {
             let slot = fire.addingTimeInterval(-stage)
@@ -143,5 +154,33 @@ public enum MorningSchedule {
         }
         let tomorrow = calendar.date(byAdding: .day, value: 1, to: fire) ?? fire.addingTimeInterval(86_400)
         return tomorrow.addingTimeInterval(-refreshStages[0])
+    }
+}
+
+// MARK: - MorningPlan
+//
+// The moment is DATA-driven: it fires when today's recovery has landed on the Watch, never before the
+// user's chosen time T, and never with empty content (07-09-2026: a fixed 07:00 alert read "nog niet
+// gesynct" because the night had not been scored yet — useless on the wrist). When nothing has landed by
+// T, the Watch waits; a fallback notice at T + 90 min says so honestly if it is still waiting then.
+public enum MorningPlan {
+    public enum Decision: Equatable, Sendable {
+        /// Today's score is here and T has passed: alert now.
+        case fireNow
+        /// Today's score is here before T: alert at T.
+        case scheduleAt(Date)
+        /// No score yet: keep nothing at T, arm the fallback notice for `fallbackAt`.
+        case waitForScore(fallbackAt: Date)
+        /// Today's moment already fired or was seen: nothing more today.
+        case done
+    }
+
+    public static let fallbackDelay: TimeInterval = 90 * 60
+
+    public static func decide(scored: Bool, now: Date, fire: Date,
+                              shownToday: Bool, firedToday: Bool) -> Decision {
+        if shownToday || firedToday { return .done }
+        if scored { return now >= fire ? .fireNow : .scheduleAt(fire) }
+        return .waitForScore(fallbackAt: fire.addingTimeInterval(fallbackDelay))
     }
 }

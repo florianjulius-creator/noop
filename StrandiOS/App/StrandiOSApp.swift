@@ -82,8 +82,8 @@ struct StrandiOSApp: App {
             // Stage 1: pull the night off the strap and score it (bounded; a no-op without a link).
             await MorningSync.pullStrap(model: model)
             // Stage 2: the briefing on the fresh scores, then the wrist.
-            let fresh = await MorningBriefing.generateIfDue(model: model, force: force)
-            await watchBridge.pushLatest(from: model, force: true, wakeWatch: fresh || force)
+            _ = await MorningBriefing.generateIfDue(model: model, force: force)
+            await watchBridge.pushLatest(from: model, force: true, wakeWatch: true)
         }
         // A background offload (the app stays alive as a bluetooth-central) reaches the wrist too, not
         // only the widget and Health — rate-limited inside the bridge, one complication wake per day.

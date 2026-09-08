@@ -9,12 +9,19 @@ enum MorningSettings {
     static let hourKey = "morning.hour"
     static let minuteKey = "morning.minute"
     static let lastShownDayKey = "morning.lastShownDay"
+    static let lastFiredDayKey = "morning.lastFiredDay"
 
-    /// The local day the long look was last actually SHOWN (set by the notification controller). The
-    /// Focus-ended re-fire skips a day whose moment the user already saw.
+    /// The local day the long look was last actually SHOWN with today's score (set by the notification
+    /// controller). The Focus-ended re-fire skips a day whose moment the user already saw.
     static var lastShownDay: String? {
         get { UserDefaults.standard.string(forKey: lastShownDayKey) }
         set { UserDefaults.standard.set(newValue, forKey: lastShownDayKey) }
+    }
+    /// The local day the moment was last fired or armed for its time (so a later score push never
+    /// fires a second one).
+    static var lastFiredDay: String? {
+        get { UserDefaults.standard.string(forKey: lastFiredDayKey) }
+        set { UserDefaults.standard.set(newValue, forKey: lastFiredDayKey) }
     }
 
     static var enabled: Bool {
@@ -45,52 +52,78 @@ enum MorningSettings {
     }
 }
 
-// MARK: - MorningScheduler — the notification + the background refresh ahead of it
+// MARK: - MorningScheduler — the notification + the background refreshes around it
 //
-// The Watch owns the morning clock. Two things are armed from here, idempotently, on launch and after
-// every settings change: the repeating calendar notification at T (category MORNING → the custom long
-// look), and a background app refresh at T − 10 min whose only job is to wake the phone for today's
-// scores + briefing (MorningRefresh). "Test nu" arms a one-shot copy 10 s out.
+// The Watch owns the morning clock, and the moment is DATA-driven (MorningPlan): it fires when today's
+// recovery has landed here, not before the user's time T, never with empty content. `reconcile` is the
+// one entry point — called on launch, on every settings change, and on every snapshot that arrives —
+// and it (re)arms exactly what the plan says: a one-shot alert at T or right now, or nothing at T plus
+// a fallback notice at T + 90 min. The background refreshes (T − 25 … T + 45) keep asking the phone
+// for the night (MorningRefresh). "Test nu" arms a one-shot copy 10 s out.
 enum MorningScheduler {
     static let category = "MORNING"
     static let notificationId = "morning-moment"
     static let testId = "morning-test"
     static let lateId = "morning-late"
+    static let fallbackId = "morning-fallback"
 
     static func rearm() async {
-        await scheduleNotification()
-        scheduleRefresh()
+        await reconcile(reason: "rearm")
     }
 
-    static func scheduleNotification() async {
+    /// Apply MorningPlan to the notification daemon for today. Idempotent.
+    static func reconcile(reason: String, now: Date = Date()) async {
+        scheduleRefresh(now: now)
         let center = UNUserNotificationCenter.current()
         guard MorningSettings.enabled else {
-            center.removePendingNotificationRequests(withIdentifiers: [notificationId])
+            center.removePendingNotificationRequests(withIdentifiers: [notificationId, fallbackId])
             return
         }
         await requestAuthorizationIfNeeded(center)
-        var comps = DateComponents()
-        comps.hour = MorningSettings.hour
-        comps.minute = MorningSettings.minute
-        let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: true)
-        // Adding under an existing identifier REPLACES the pending request, so no remove-then-add:
-        // both calls are asynchronous on the notification daemon and a remove that lands after the add
-        // would silently delete the fresh schedule.
-        let request = UNNotificationRequest(identifier: notificationId, content: content(), trigger: trigger)
-        try? await center.add(request)
+        let today = WatchScoreSnapshot.localDayKey(now)
+        let fire = MorningSchedule.fireToday(now: now, hour: MorningSettings.hour, minute: MorningSettings.minute)
+        let moment = MorningMoment(snapshot: WatchScoreStore.shared.snapshot, now: now)
+        var scored = false
+        if case .fresh(let recovery, _) = moment.scores, recovery != nil { scored = true }
+
+        switch MorningPlan.decide(scored: scored, now: now, fire: fire,
+                                  shownToday: MorningSettings.lastShownDay == today,
+                                  firedToday: MorningSettings.lastFiredDay == today) {
+        case .done:
+            center.removePendingNotificationRequests(withIdentifiers: [fallbackId])
+        case .fireNow:
+            MorningSettings.lastFiredDay = today
+            center.removePendingNotificationRequests(withIdentifiers: [notificationId, fallbackId])
+            center.removeDeliveredNotifications(withIdentifiers: [fallbackId])
+            let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 3, repeats: false)
+            try? await center.add(UNNotificationRequest(identifier: notificationId, content: content(), trigger: trigger))
+            MorningDiag.log("\(reason): score binnen → melding nu")
+        case .scheduleAt(let at):
+            MorningSettings.lastFiredDay = today
+            center.removePendingNotificationRequests(withIdentifiers: [fallbackId])
+            let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: at)
+            let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+            try? await center.add(UNNotificationRequest(identifier: notificationId, content: content(), trigger: trigger))
+            MorningDiag.log("\(reason): score binnen → melding \(MorningDiag.hhmm(at))")
+        case .waitForScore(let fallbackAt):
+            center.removePendingNotificationRequests(withIdentifiers: [notificationId])
+            if fallbackAt > now {
+                let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: fallbackAt)
+                let trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
+                try? await center.add(UNNotificationRequest(identifier: fallbackId, content: fallbackContent(), trigger: trigger))
+            }
+            MorningDiag.log("\(reason): wacht op score (vangnet \(MorningDiag.hhmm(fallbackAt)))")
+        }
     }
 
-    /// A Focus just ended (or another late wake): when today's moment already fired but landed silently
-    /// (the Watch sat under the Sleep Focus at T) and has not been shown, fire a fresh one now so it
-    /// alerts on the wrist. Window: from T until 6 h after; outside it, or once shown, nothing.
+    /// A Focus just ended: when today's moment already fired but landed silently (the Watch sat under
+    /// the Sleep Focus) and has not been shown, fire a fresh one now so it alerts on the wrist. Only with
+    /// today's score on board — without it a later score push fires the moment anyway (Focus is off by
+    /// then). Window: from T until 6 h after.
     static func fireIfMissedToday(reason: String, now: Date = Date()) async {
         guard MorningSettings.enabled else { return }
         let today = WatchScoreSnapshot.localDayKey(now)
-        var comps = Calendar.current.dateComponents([.year, .month, .day], from: now)
-        comps.hour = MorningSettings.hour
-        comps.minute = MorningSettings.minute
-        comps.second = 0
-        guard let fireToday = Calendar.current.date(from: comps) else { return }
+        let fireToday = MorningSchedule.fireToday(now: now, hour: MorningSettings.hour, minute: MorningSettings.minute)
         let sinceFire = now.timeIntervalSince(fireToday)
         guard sinceFire >= 0, sinceFire < 6 * 3600 else {
             MorningDiag.log("\(reason): buiten venster"); return
@@ -98,8 +131,14 @@ enum MorningScheduler {
         guard MorningSettings.lastShownDay != today else {
             MorningDiag.log("\(reason): al getoond"); return
         }
+        let moment = MorningMoment(snapshot: WatchScoreStore.shared.snapshot, now: now)
+        guard case .fresh(let recovery, _) = moment.scores, recovery != nil else {
+            MorningDiag.log("\(reason): nog geen score, wacht"); return
+        }
+        MorningSettings.lastFiredDay = today
         let center = UNUserNotificationCenter.current()
-        center.removeDeliveredNotifications(withIdentifiers: [notificationId, lateId])
+        center.removePendingNotificationRequests(withIdentifiers: [notificationId, fallbackId])
+        center.removeDeliveredNotifications(withIdentifiers: [notificationId, lateId, fallbackId])
         let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 3, repeats: false)
         try? await center.add(UNNotificationRequest(identifier: lateId, content: content(), trigger: trigger))
         MorningDiag.log("\(reason): melding opnieuw")
@@ -115,7 +154,7 @@ enum MorningScheduler {
 
     static func scheduleRefresh(now: Date = Date()) {
         guard MorningSettings.enabled else { return }
-        let fire = MorningSchedule.nextFire(after: now, hour: MorningSettings.hour, minute: MorningSettings.minute)
+        let fire = MorningSchedule.fireToday(now: now, hour: MorningSettings.hour, minute: MorningSettings.minute)
         let preferred = MorningSchedule.refreshDate(for: fire, now: now)
         WKApplication.shared().scheduleBackgroundRefresh(withPreferredDate: preferred, userInfo: nil) { _ in }
     }
@@ -124,6 +163,16 @@ enum MorningScheduler {
         let c = UNMutableNotificationContent()
         c.title = String(localized: "Goedemorgen")
         c.body = String(localized: "Je ochtendrapport staat klaar")
+        c.categoryIdentifier = category
+        c.sound = .default
+        return c
+    }
+
+    /// The honest notice when nothing landed by T + 90 min (same long look, which then reads "nog niet").
+    private static func fallbackContent() -> UNMutableNotificationContent {
+        let c = UNMutableNotificationContent()
+        c.title = String(localized: "Goedemorgen")
+        c.body = String(localized: "Nog geen score van vannacht")
         c.categoryIdentifier = category
         c.sound = .default
         return c
@@ -153,6 +202,15 @@ enum MorningDiag {
         return f
     }()
 
+    private static let short: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "nl_NL")
+        f.dateFormat = "HH:mm"
+        return f
+    }()
+
+    static func hhmm(_ date: Date) -> String { short.string(from: date) }
+
     /// One line: "05-09 08:12 · auth ok · 1 gepland · volgende 06-09 07:00".
     static func line(now: Date = Date()) async -> String {
         let center = UNUserNotificationCenter.current()
@@ -166,8 +224,12 @@ enum MorningDiag {
         }
         let pending = await center.pendingNotificationRequests()
         let morning = pending.first { $0.identifier == MorningScheduler.notificationId }
+        let fallback = pending.first { $0.identifier == MorningScheduler.fallbackId }
         let next = (morning?.trigger as? UNCalendarNotificationTrigger)?.nextTriggerDate()
-        let nextText = next.map { "volgende " + clock.string(from: $0) } ?? "GEEN volgende"
+        let fallbackAt = (fallback?.trigger as? UNCalendarNotificationTrigger)?.nextTriggerDate()
+        let nextText = next.map { "melding " + clock.string(from: $0) }
+            ?? fallbackAt.map { "wacht op score, vangnet " + clock.string(from: $0) }
+            ?? "wacht op score"
         return "\(clock.string(from: now)) · \(auth) · \(pending.count) gepland · \(nextText)"
     }
 
@@ -209,6 +271,12 @@ final class MorningRefresh {
 
     static func run(completion: @escaping () -> Void) {
         let run = MorningRefresh(completion: completion)
+        // Today's moment already fired or was seen: nothing left to pull for, just re-arm the slots.
+        if MorningSettings.lastFiredDay == WatchScoreSnapshot.localDayKey(Date())
+            || MorningSettings.lastShownDay == WatchScoreSnapshot.localDayKey(Date()) {
+            run.finish()
+            return
+        }
         WatchScoreStore.shared.requestMorning(force: false) { _ in
             Task { @MainActor in run.finish() }
         }
