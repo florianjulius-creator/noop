@@ -145,6 +145,19 @@ enum MorningScheduler {
         MorningDiag.log("\(reason): melding opnieuw")
     }
 
+    /// The wrist's "Rapport nu" test: post the real morning alert right now with whatever the store
+    /// holds, ignoring the once-a-day and before-T guards. Always posted BY THE WATCH, so it renders
+    /// with our long look (a notification forwarded from the iPhone gets the plain system UI instead).
+    static func forceAlertNow() async {
+        let center = UNUserNotificationCenter.current()
+        await requestAuthorizationIfNeeded(center)
+        center.removePendingNotificationRequests(withIdentifiers: [notificationId, fallbackId])
+        center.removeDeliveredNotifications(withIdentifiers: [notificationId, fallbackId, lateId])
+        let trigger = UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)
+        try? await center.add(UNNotificationRequest(identifier: notificationId, content: content(), trigger: trigger))
+        MorningDiag.log("test: melding nu")
+    }
+
     static func scheduleTest() async {
         let center = UNUserNotificationCenter.current()
         await requestAuthorizationIfNeeded(center)

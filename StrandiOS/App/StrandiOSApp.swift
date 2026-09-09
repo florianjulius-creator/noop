@@ -43,9 +43,6 @@ struct StrandiOSApp: App {
     @MainActor
     private func runLaunchTasks() async {
         watch.activate()
-        // The morning alert is sent BY THE PHONE and mirrored to the wrist, so the phone needs
-        // notification permission. One prompt, once.
-        await MorningAlertSender.requestAuthorizationIfNeeded()
         // Focus status (the Sleep Focus ending re-fires the Watch's morning moment). One system prompt,
         // once; nothing else in the app reads Focus.
         if INFocusStatusCenter.default.authorizationStatus == .notDetermined {
@@ -103,9 +100,7 @@ struct StrandiOSApp: App {
             await MorningSync.pullStrap(model: model)
             // Stage 2: the briefing on the fresh scores, then the wrist.
             _ = await MorningBriefing.generateIfDue(model: model, force: force)
-            // A forced request is the wrist's "Rapport nu" test: alert straight away so the whole
-            // phone → mirror → long look path can be checked without waiting for tomorrow.
-            await watchBridge.pushLatest(from: model, force: true, wakeWatch: true, alertForce: force)
+            await watchBridge.pushLatest(from: model, force: true, wakeWatch: true)
         }
         // A background offload (the app stays alive as a bluetooth-central) reaches the wrist too, not
         // only the widget and Health — rate-limited inside the bridge, one complication wake per day.

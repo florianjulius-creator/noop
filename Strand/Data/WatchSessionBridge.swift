@@ -72,8 +72,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     ///
     /// `async` because Rest (sleep_performance) lives in a computed metric series rather than a
     /// `DailyMetric` column, so it needs an `exploreSeries` read (mirrors `WidgetSnapshot.publish`).
-    func sendLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false,
-                    alertForce: Bool = false) async {
+    func sendLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false) async {
         let snap = await Self.buildSnapshot(from: model)
         // A contentless snapshot (a cold launch races the first repo refresh, so `days` is still empty)
         // must NOT push: it would stomp the watch's last REAL data with the empty state AND burn the
@@ -91,10 +90,12 @@ final class WatchSessionBridge: NSObject, ObservableObject {
         // `force` (the morning path only) skips the 30-minute spacing gate but still requires substance.
         guard (force || newlyScored) ? Self.headlineChanged(from: lastSent, to: snap) : shouldPush(snap, now: now) else { return }
         lastPushedAt = now
-        send(snap, wakeWatch: wakeWatch || newlyScored)
-        // The PHONE owns the morning alert: it knows the score first and does not depend on watchOS
-        // granting the watch app background time. Idempotent per local day.
-        await MorningAlertSender.maybeSend(snap, now: now, force: alertForce)
+        // ALWAYS wake the watch app on a push that actually goes out. Two things depend on the watch
+        // app running: the morning alert (it must be the WATCH that posts it — a notification forwarded
+        // from the iPhone is shown with the plain system UI, not our long look) and the complication,
+        // which reads the watch's own App Group copy. The push itself is already throttled to once per
+        // 30 minutes and only on changed headline values, so this stays far inside the transfer budget.
+        send(snap, wakeWatch: true)
     }
 
     /// Build the latest snapshot off `model` and push it to the watch. The entrypoint the iOS app entry
@@ -102,9 +103,8 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     /// Health sync, and on an active-phase refreshSeq bump), so the wrist updates in lockstep with the
     /// widget instead of only ever showing placeholder data. Thin alias over `sendLatest` and therefore
     /// self-throttled the same way; named for the app-entry call site to read clearly.
-    func pushLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false,
-                    alertForce: Bool = false) async {
-        await sendLatest(from: model, force: force, wakeWatch: wakeWatch, alertForce: alertForce)
+    func pushLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false) async {
+        await sendLatest(from: model, force: force, wakeWatch: wakeWatch)
     }
 
     /// The budget gate: complication/context transfers share a ~50/day system budget, so a push must
@@ -272,16 +272,21 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             // updateApplicationContext replaces any previous context, so the watch always gets exactly
             // the latest snapshot and never a queued backlog.
             try session.updateApplicationContext([Self.contextKey: data])
-            // The morning wake: ONE complication transfer per local day launches the watch app in the
-            // background so it can fire the moment off today's score. Spent only on a snapshot that
-            // actually carries today's recovery, so an early (unscored) push never burns the day's wake.
-            // Only meaningful (and only budgeted) while a complication is on the active face.
-            let today = WatchScoreSnapshot.localDayKey(Date())
-            let todayScored = snap.scoreDay == today && snap.charge != nil
-            if wakeWatch, todayScored, session.isComplicationEnabled,
-               UserDefaults.standard.string(forKey: Self.lastWakeDayKey) != today {
-                UserDefaults.standard.set(today, forKey: Self.lastWakeDayKey)
-                session.transferCurrentComplicationUserInfo([Self.contextKey: data])
+            // Wake the watch app so it can post the morning alert itself and refresh its complication.
+            // A complication transfer is the one delivery that launches the watch app in the background;
+            // `updateApplicationContext` above only lands when it next runs. Budget is ~50/day and the
+            // caller is throttled well below that, but keep a 20-minute floor as a backstop.
+            let lastWake = UserDefaults.standard.object(forKey: Self.lastWakeAtKey) as? Double ?? 0
+            let spacedEnough = Date().timeIntervalSince1970 - lastWake > 20 * 60
+            if wakeWatch, spacedEnough {
+                UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastWakeAtKey)
+                if session.isComplicationEnabled {
+                    session.transferCurrentComplicationUserInfo([Self.contextKey: data])
+                } else {
+                    // No complication on the active face: a plain user-info transfer still wakes the
+                    // watch app in the background, just without the complication budget.
+                    session.transferUserInfo([Self.contextKey: data])
+                }
             }
         } catch {
             // A failed context update is non-fatal: the app-group mirror above still carries the latest
@@ -296,8 +301,8 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     /// The watch's "make this morning's briefing now" request (background refresh or the settings page).
     static let requestMorningKey = "requestMorning"
     static let forceKey = "force"
-    /// The local day the once-a-day complication wake was last sent on.
-    static let lastWakeDayKey = "watch.lastWakeDay"
+    /// When the last complication wake was sent (spacing floor, not a daily cap).
+    static let lastWakeAtKey = "watch.lastWakeAt"
     /// Set by the app entry: generate the briefing (day-guarded unless forced) and push the wrist.
     var onMorningRequested: ((Bool) async -> Void)?
 

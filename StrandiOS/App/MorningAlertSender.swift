@@ -37,54 +37,10 @@ enum MorningAlertSender {
         if let e = message[MorningPlan.enabledKey] as? Bool { d.set(e, forKey: enabledKey) }
     }
 
-    /// Ask once; without this the phone cannot alert at all (and so cannot mirror to the wrist).
-    static func requestAuthorizationIfNeeded() async {
-        let center = UNUserNotificationCenter.current()
-        let settings = await center.notificationSettings()
-        if settings.authorizationStatus == .notDetermined {
-            _ = try? await center.requestAuthorization(options: [.alert, .sound])
-        }
-    }
-
-    /// Send (or schedule) today's morning alert if this snapshot earns it. Idempotent: once sent for a
-    /// local day, later snapshots do nothing, so a score that arrives in pieces alerts exactly once.
-    /// - Parameter force: the wrist's "Rapport nu" test — send within seconds regardless of the
-    ///   once-a-day guard and of whether T has passed, so the whole path can be verified on demand.
-    static func maybeSend(_ snap: WatchScoreSnapshot, now: Date = Date(), force: Bool = false) async {
-        guard enabled || force else { return }
-        let today = WatchScoreSnapshot.localDayKey(now)
-        let defaults = UserDefaults.standard
-        if !force {
-            guard defaults.string(forKey: lastDayKey) != today else { return }
-            // Only a real score for TODAY earns the alert — never yesterday's numbers carried over.
-            guard MorningAlert.isScored(snap, now: now) else { return }
-        }
-
-        let fire = force ? now : MorningSchedule.fireToday(now: now, hour: hour, minute: minute)
-        let content = UNMutableNotificationContent()
-        content.title = "Goedemorgen"
-        content.body = MorningAlert.body(for: snap)
-        content.categoryIdentifier = MorningAlert.category
-        content.userInfo = MorningAlert.userInfo(for: snap)
-        content.sound = .default
-        // Break through the Sleep Focus: without this the alert lands silently in Notification Center,
-        // which skips the short look and therefore the full-screen long look entirely.
-        content.interruptionLevel = .timeSensitive
-        content.relevanceScore = 1.0
-
-        // Before T: schedule for T with the numbers as they are now (a later, better snapshot replaces
-        // this request under the same identifier). At or after T: send within seconds.
-        let trigger: UNNotificationTrigger
-        if fire > now.addingTimeInterval(30) {
-            let comps = Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: fire)
-            trigger = UNCalendarNotificationTrigger(dateMatching: comps, repeats: false)
-        } else {
-            trigger = UNTimeIntervalNotificationTrigger(timeInterval: 2, repeats: false)
-            defaults.set(today, forKey: lastDayKey)
-        }
-        let request = UNNotificationRequest(identifier: MorningAlert.identifier,
-                                            content: content, trigger: trigger)
-        try? await UNUserNotificationCenter.current().add(request)
-    }
+    /// The phone no longer posts the morning notification itself. A notification forwarded from the
+    /// iPhone is rendered with the plain system UI on the wrist — no rings, no numbers — because
+    /// watchOS only uses the watch app's `WKNotificationScene` for a notification the WATCH posted.
+    /// So the phone wakes the watch (a complication transfer in `WatchSessionBridge.send`) and the
+    /// watch posts the alert. This type stays for the settings the wrist mirrors over.
 }
 #endif

@@ -49,8 +49,15 @@ struct WatchMorningSettingsView: View {
                     Spacer()
                     Button(requesting ? "…" : "Nu") {
                         requesting = true
+                        // Ask the phone for a fresh score + briefing, then post the real alert HERE so
+                        // the whole morning screen can be checked on demand.
                         store.requestMorning(force: true) { _ in
-                            DispatchQueue.main.async { requesting = false }
+                            Task { @MainActor in
+                                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                                await MorningScheduler.forceAlertNow()
+                                requesting = false
+                                refreshDiag()
+                            }
                         }
                     }
                     .buttonStyle(.bordered)
