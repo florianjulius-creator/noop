@@ -81,6 +81,11 @@ struct WatchMorningSettingsView: View {
                 Button("Bekijk vandaag") { preview = true }
                     .tint(StrandPalette.chargeColor)
 
+                Button("Wijzerplaat verversen") {
+                    store.forceComplicationReload()
+                    refreshDiag()
+                }
+
                 // Diagnostics: what the notification daemon holds now, and what the app found at
                 // its last launch (before it re-armed). The evidence line for "it did not fire".
                 VStack(alignment: .leading, spacing: 2) {
@@ -88,6 +93,7 @@ struct WatchMorningSettingsView: View {
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                     Text("Strap: \(strapLine)")
+                    Text("Wijzerplaat: \(complicationLine)")
                     Text("Nu: \(diagNow)")
                     Text("Bij start: \(UserDefaults.standard.string(forKey: MorningDiag.launchKey) ?? "–")")
                     ForEach(diagLog.suffix(4), id: \.self) { Text($0) }
@@ -107,6 +113,17 @@ struct WatchMorningSettingsView: View {
         .sheet(isPresented: $preview) {
             MorningMomentView(store: store, celebrate: true)
         }
+    }
+
+    /// What the complication reads from the App Group, versus what this app holds. Different values mean
+    /// the shared copy is stale; equal values with a stale face mean WidgetKit did not reload.
+    private var complicationLine: String {
+        let shared = WatchScoreStore.complicationSees()
+        let sharedCharge = shared?.charge.map { String(Int($0.rounded())) } ?? "–"
+        let appCharge = store.snapshot?.charge.map { String(Int($0.rounded())) } ?? "–"
+        let at = UserDefaults.standard.object(forKey: "complication.lastReloadAt") as? Double
+        let when = at.map { " · ververst " + Self.clock.string(from: Date(timeIntervalSince1970: $0)) } ?? ""
+        return "gedeeld \(sharedCharge) · app \(appCharge)\(when)"
     }
 
     /// "verbonden · laatste sync 06:12" — the tell for whether the phone's background strap link lives.

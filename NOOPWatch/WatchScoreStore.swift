@@ -122,6 +122,19 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
             && a.hrvMs == b.hrvMs && a.sleepSummary == b.sleepSummary && a.scoreDay == b.scoreDay
     }
 
+    /// What the COMPLICATION reads: the App Group copy, loaded exactly the way the extension loads it.
+    /// The settings page shows this next to the app's own value, so "app right, face stale" can be told
+    /// apart from "the App Group itself is stale" without guessing.
+    static func complicationSees() -> WatchScoreSnapshot? { loadPersisted() }
+
+    /// Force the complication timelines to reload and note when. WidgetKit budgets reloads per day, so
+    /// a forced one can be ignored; the settings page shows the attempt time either way.
+    func forceComplicationReload() {
+        UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: "complication.lastReloadAt")
+        if let snap = snapshot { persist(snap) }
+        WidgetCenter.shared.reloadAllTimelines()
+    }
+
     /// Re-read the app group (a background wake may have persisted a newer snapshot from another
     /// launch of this process). Safe to call anytime.
     func reloadFromAppGroup() {
