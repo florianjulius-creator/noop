@@ -67,6 +67,10 @@ enum MorningAlertSender {
         content.categoryIdentifier = MorningAlert.category
         content.userInfo = MorningAlert.userInfo(for: snap)
         content.sound = .default
+        // Break through the Sleep Focus: without this the alert lands silently in Notification Center,
+        // which skips the short look and therefore the full-screen long look entirely.
+        content.interruptionLevel = .timeSensitive
+        content.relevanceScore = 1.0
 
         // Before T: schedule for T with the numbers as they are now (a later, better snapshot replaces
         // this request under the same identifier). At or after T: send within seconds.

@@ -37,12 +37,16 @@ struct MorningMomentView: View {
         }
     }
 
-    /// The notification screen: rings + one line of numbers, top-aligned, nothing that can overflow.
+    /// The notification screen. The system's long look is ALREADY a scrolling page (sash · content ·
+    /// dismiss button), so this view must simply keep its NATURAL height and let the system scroll
+    /// around it. The two things that broke it before: `.frame(maxHeight: .infinity)` pinned it to the
+    /// small proposed height and clipped the ring at both ends, and a `GeometryReader` collapsed to
+    /// almost nothing inside that same scroll container (a 46 pt ring). No height modifiers here.
     private var compactContent: some View {
-        VStack(spacing: 4) {
+        VStack(spacing: 6) {
             MorningRingsView(moment: moment,
                              animated: celebrate && !motion.poseStill(reduceMotion),
-                             diameter: 88)
+                             diameter: 96)
             switch moment.scores {
             case .fresh:
                 legend
@@ -51,10 +55,13 @@ struct MorningMomentView: View {
                     .font(StrandFont.caption)
                     .foregroundStyle(StrandPalette.textSecondary)
                     .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .minimumScaleFactor(0.7)
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .frame(maxWidth: .infinity)
         .padding(.horizontal, 4)
+        .padding(.vertical, 2)
     }
 
     private var content: some View {

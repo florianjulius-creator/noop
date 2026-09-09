@@ -187,9 +187,20 @@ public enum MorningAlert {
         return [snapshotKey: data]
     }
 
-    /// Decode the snapshot a notification carries, if any.
+    /// Decode the snapshot a notification carries, if any. A local notification carries real `Data`;
+    /// a pushed one (an `.apns` file through `simctl push`, which is how the morning screen is tested
+    /// without waiting for a morning) carries the same bytes base64-encoded in a string.
     public static func snapshot(from userInfo: [AnyHashable: Any]) -> WatchScoreSnapshot? {
-        guard let data = userInfo[snapshotKey] as? Data else { return nil }
+        let raw = userInfo[snapshotKey]
+        let data: Data?
+        if let d = raw as? Data {
+            data = d
+        } else if let s = raw as? String {
+            data = Data(base64Encoded: s)
+        } else {
+            data = nil
+        }
+        guard let data else { return nil }
         return try? JSONDecoder().decode(WatchScoreSnapshot.self, from: data)
     }
 

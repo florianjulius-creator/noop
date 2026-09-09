@@ -327,6 +327,10 @@ targets:
         # Notifications capability. No communication notifications are sent. Needs the capability on the
         # App ID: xcodebuild -allowProvisioningUpdates registers it when an Apple ID is signed in to Xcode.
         com.apple.developer.usernotifications.communication: true
+        # The morning alert is the one notification that must reach the wrist through the Sleep Focus —
+        # the whole point is to see the night's numbers on waking. Time Sensitive is exactly the level
+        # Apple's own Activity alerts use for this. Same provisioning note as above.
+        com.apple.developer.usernotifications.time-sensitive: true
         com.apple.developer.healthkit.access: []
         com.apple.security.application-groups:
           - $(APP_GROUP_ID)
@@ -442,6 +446,8 @@ targets:
       properties:
         com.apple.developer.healthkit: true
         com.apple.developer.healthkit.access: []
+        # The watch's own morning alert is the fallback route and must break through the Sleep Focus too.
+        com.apple.developer.usernotifications.time-sensitive: true
         com.apple.security.application-groups:
           - $(APP_GROUP_ID)
     settings:

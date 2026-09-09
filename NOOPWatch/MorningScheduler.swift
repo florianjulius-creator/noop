@@ -166,6 +166,8 @@ enum MorningScheduler {
         c.body = String(localized: "Je ochtendoverzicht staat klaar")
         c.categoryIdentifier = category
         c.sound = .default
+        c.interruptionLevel = .timeSensitive
+        c.relevanceScore = 1.0
         // Carry the numbers, exactly like the phone's alert does: the long look then shows what was
         // true when the alert was made, even if the store moves on before it is opened.
         if let snap = WatchScoreStore.shared.snapshot {
@@ -182,6 +184,7 @@ enum MorningScheduler {
         c.body = String(localized: "Nog geen score van vannacht")
         c.categoryIdentifier = category
         c.sound = .default
+        c.interruptionLevel = .timeSensitive
         return c
     }
 
