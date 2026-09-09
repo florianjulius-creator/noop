@@ -42,6 +42,21 @@ enum WatchSnapshotAccess {
               let snap = try? JSONDecoder().decode(WatchScoreSnapshot.self, from: data) else { return nil }
         return snap
     }
+
+    /// Key the extension stamps every time WidgetKit asks it to build a timeline, with the value it read.
+    /// The app shows this on the settings page: it is the only way to tell "WidgetKit never asked us"
+    /// (a refresh-budget problem) from "we were asked and read the wrong thing" (a data problem).
+    static let heartbeatKey = "complication.lastTimeline"
+
+    /// Stamp "the extension ran at <time> and saw <charge>" into the shared group.
+    static func noteTimelineBuild(_ snap: WatchScoreSnapshot?) {
+        guard let defaults = UserDefaults(suiteName: suiteName) else { return }
+        let charge = snap?.charge.map { String(Int($0.rounded())) } ?? "–"
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "nl_NL")
+        f.dateFormat = "dd-MM HH:mm"
+        defaults.set("\(f.string(from: Date())) zag \(charge)", forKey: heartbeatKey)
+    }
 }
 
 // MARK: - Timeline
@@ -68,6 +83,7 @@ struct ChargeProvider: TimelineProvider {
 
     func getTimeline(in context: Context, completion: @escaping (Timeline<ChargeEntry>) -> Void) {
         let snap = WatchSnapshotAccess.load()
+        WatchSnapshotAccess.noteTimelineBuild(snap)
         // The phone forces a reload (WidgetCenter.reloadAllTimelines) whenever it pushes a fresh
         // snapshot, so this periodic refresh is just a backstop. Roughly every 30 minutes keeps the
         // "as of …" age honest without burning the watch's complication budget.

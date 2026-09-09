@@ -123,7 +123,10 @@ struct WatchMorningSettingsView: View {
         let appCharge = store.snapshot?.charge.map { String(Int($0.rounded())) } ?? "–"
         let at = UserDefaults.standard.object(forKey: "complication.lastReloadAt") as? Double
         let when = at.map { " · ververst " + Self.clock.string(from: Date(timeIntervalSince1970: $0)) } ?? ""
-        return "gedeeld \(sharedCharge) · app \(appCharge)\(when)"
+        // The extension's own stamp, written from inside getTimeline — proof of whether WidgetKit asked.
+        let beat = UserDefaults(suiteName: WatchScoreSnapshot.appGroupId)?
+            .string(forKey: "complication.lastTimeline") ?? "nooit gedraaid"
+        return "gedeeld \(sharedCharge) · app \(appCharge)\(when)\n  extensie: \(beat)"
     }
 
     /// "verbonden · laatste sync 06:12" — the tell for whether the phone's background strap link lives.
