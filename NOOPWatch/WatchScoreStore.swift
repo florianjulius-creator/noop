@@ -86,9 +86,17 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
     /// Apply a snapshot unless it is OLDER than the one we hold (a late reply must never roll back a
     /// fresher context). Persists, publishes, reloads the complication. Hops to the main actor because
     /// it touches @Published state and WidgetCenter.
+    /// Adopt a snapshot that arrived outside WatchConnectivity (the morning notification carries one).
+    func adopt(_ snap: WatchScoreSnapshot) { apply(snap) }
+
     private func apply(_ snap: WatchScoreSnapshot) {
         DispatchQueue.main.async {
             if let current = self.snapshot, snap.asOf < current.asOf { return }
+            // Never let a newer-but-emptier snapshot take today's score away: on 09-09 a post-sync push
+            // arrived with today's row not yet scored, and the morning screen went from numbers to
+            // "nog niet gesynct" for the rest of the morning. Keeping the earned score is not a lie —
+            // it is the same day's number the phone already computed.
+            if MorningAlert.isScored(self.snapshot) && !MorningAlert.isScored(snap) { return }
             let displayChanged = !Self.sameDisplay(self.snapshot, snap)
             self.persist(snap)
             self.snapshot = snap
@@ -131,13 +139,24 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
 
     /// Ask for the phone's latest mirrored snapshot (cheap; the reply applies itself).
     func requestLatest() {
-        send([Self.requestLatestKey: true]) { _ in }
+        send(Self.withMorningSettings([Self.requestLatestKey: true])) { _ in }
+    }
+
+    /// Every message tells the phone when this wrist's morning is: the PHONE sends the alert (it knows
+    /// the score first and is not at the mercy of watchOS background time), so it must know T.
+    private static func withMorningSettings(_ message: [String: Any]) -> [String: Any] {
+        var out = message
+        out[MorningPlan.hourKey] = MorningSettings.hour
+        out[MorningPlan.minuteKey] = MorningSettings.minute
+        out[MorningPlan.enabledKey] = MorningSettings.enabled
+        return out
     }
 
     /// Ask the phone to make this morning's briefing now (day-guarded there unless `force`) and push.
     /// `completion` always runs exactly once: with the reply snapshot, or nil when unreachable/failed.
     func requestMorning(force: Bool, completion: @escaping (WatchScoreSnapshot?) -> Void) {
-        send([Self.requestMorningKey: true, Self.forceKey: force], completion: completion)
+        send(Self.withMorningSettings([Self.requestMorningKey: true, Self.forceKey: force]),
+             completion: completion)
     }
 
     private func send(_ message: [String: Any], completion: @escaping (WatchScoreSnapshot?) -> Void) {

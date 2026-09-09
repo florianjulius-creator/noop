@@ -18,10 +18,15 @@ final class MorningNotificationController: WKUserNotificationHostingController<M
     // watch face's tint. So the content below simply fits the first screen (rings ≤ 130 pt).
 
     override var body: MorningMomentView {
-        MorningMomentView(store: WatchScoreStore.shared, celebrate: true, scrolls: false)
+        MorningMomentView(store: WatchScoreStore.shared, celebrate: true, compact: true)
     }
 
     override func didReceive(_ notification: UNNotification) {
+        // The alert carries the numbers that were true when it was made (the phone puts them there), so
+        // the wrist shows THOSE — never an empty screen because the store moved on in the meantime.
+        if let carried = MorningAlert.snapshot(from: notification.request.content.userInfo) {
+            WatchScoreStore.shared.adopt(carried)
+        }
         // "Seen" only counts when the wrist actually got today's score; a fallback notice viewed without
         // one must not stop the real moment from firing when the score lands later.
         let moment = MorningMoment(snapshot: WatchScoreStore.shared.snapshot)

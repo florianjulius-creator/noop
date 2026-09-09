@@ -72,7 +72,8 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     ///
     /// `async` because Rest (sleep_performance) lives in a computed metric series rather than a
     /// `DailyMetric` column, so it needs an `exploreSeries` read (mirrors `WidgetSnapshot.publish`).
-    func sendLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false) async {
+    func sendLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false,
+                    alertForce: Bool = false) async {
         let snap = await Self.buildSnapshot(from: model)
         // A contentless snapshot (a cold launch races the first repo refresh, so `days` is still empty)
         // must NOT push: it would stomp the watch's last REAL data with the empty state AND burn the
@@ -91,6 +92,9 @@ final class WatchSessionBridge: NSObject, ObservableObject {
         guard (force || newlyScored) ? Self.headlineChanged(from: lastSent, to: snap) : shouldPush(snap, now: now) else { return }
         lastPushedAt = now
         send(snap, wakeWatch: wakeWatch || newlyScored)
+        // The PHONE owns the morning alert: it knows the score first and does not depend on watchOS
+        // granting the watch app background time. Idempotent per local day.
+        await MorningAlertSender.maybeSend(snap, now: now, force: alertForce)
     }
 
     /// Build the latest snapshot off `model` and push it to the watch. The entrypoint the iOS app entry
@@ -98,8 +102,9 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     /// Health sync, and on an active-phase refreshSeq bump), so the wrist updates in lockstep with the
     /// widget instead of only ever showing placeholder data. Thin alias over `sendLatest` and therefore
     /// self-throttled the same way; named for the app-entry call site to read clearly.
-    func pushLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false) async {
-        await sendLatest(from: model, force: force, wakeWatch: wakeWatch)
+    func pushLatest(from model: AppModel, force: Bool = false, wakeWatch: Bool = false,
+                    alertForce: Bool = false) async {
+        await sendLatest(from: model, force: force, wakeWatch: wakeWatch, alertForce: alertForce)
     }
 
     /// The budget gate: complication/context transfers share a ~50/day system budget, so a push must
@@ -367,6 +372,8 @@ extension WatchSessionBridge: WCSessionDelegate {
                              replyHandler: @escaping ([String: Any]) -> Void) {
         let wantsLatest = message[Self.requestLatestKey] != nil
         let wantsMorning = message[Self.requestMorningKey] != nil
+        // Every watch message carries the wrist's morning settings; the phone alerts on that schedule.
+        Task { @MainActor in MorningAlertSender.adoptSettings(from: message) }
         guard wantsLatest || wantsMorning else {
             replyHandler([:])
             return

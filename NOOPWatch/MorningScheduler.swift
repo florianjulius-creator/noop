@@ -61,8 +61,9 @@ enum MorningSettings {
 // a fallback notice at T + 90 min. The background refreshes (T − 25 … T + 45) keep asking the phone
 // for the night (MorningRefresh). "Test nu" arms a one-shot copy 10 s out.
 enum MorningScheduler {
-    static let category = "MORNING"
-    static let notificationId = "morning-moment"
+    static let category = MorningAlert.category
+    /// Same identifier the phone uses, so watchOS dedupes the two instead of alerting twice.
+    static let notificationId = MorningAlert.identifier
     static let testId = "morning-test"
     static let lateId = "morning-late"
     static let fallbackId = "morning-fallback"
@@ -162,9 +163,15 @@ enum MorningScheduler {
     private static func content() -> UNMutableNotificationContent {
         let c = UNMutableNotificationContent()
         c.title = String(localized: "Goedemorgen")
-        c.body = String(localized: "Je ochtendrapport staat klaar")
+        c.body = String(localized: "Je ochtendoverzicht staat klaar")
         c.categoryIdentifier = category
         c.sound = .default
+        // Carry the numbers, exactly like the phone's alert does: the long look then shows what was
+        // true when the alert was made, even if the store moves on before it is opened.
+        if let snap = WatchScoreStore.shared.snapshot {
+            c.body = MorningAlert.body(for: snap)
+            c.userInfo = MorningAlert.userInfo(for: snap)
+        }
         return c
     }
 

@@ -13,11 +13,11 @@ import StrandDesign
 struct MorningMomentView: View {
     @ObservedObject var store: WatchScoreStore
     var celebrate: Bool = true
-    /// In the app the view scrolls itself; in the notification long look it must NOT — the long look is
-    /// already a scroll page, and a nested ScrollView gets squeezed to the leftover height and scrolls
-    /// inside it (the wrist then opened on the BOTTOM of the ring). Given its natural height the system
-    /// scrolls sash → rings → blocks → buttons as one page.
-    var scrolls: Bool = true
+    /// COMPACT is the notification long look: a fixed, small layout that always fits the one screen the
+    /// system leaves between its sash and the dismiss button, pinned to the TOP. Anything taller was
+    /// clipped at both ends (centred content in too little room, 09-09-2026), and a nested ScrollView
+    /// opened halfway down the ring. Full detail lives in the app, which scrolls freely.
+    var compact: Bool = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @ObservedObject private var motion = NoopMotionState.shared
 
@@ -25,16 +25,36 @@ struct MorningMomentView: View {
 
     var body: some View {
         Group {
-            if scrolls {
-                ScrollView { content }
+            if compact {
+                compactContent
             } else {
-                content
+                ScrollView { content }
             }
         }
         .background(Color.black.ignoresSafeArea())
         .onAppear {
             if celebrate { WKInterfaceDevice.current().play(.notification) }
         }
+    }
+
+    /// The notification screen: rings + one line of numbers, top-aligned, nothing that can overflow.
+    private var compactContent: some View {
+        VStack(spacing: 4) {
+            MorningRingsView(moment: moment,
+                             animated: celebrate && !motion.poseStill(reduceMotion),
+                             diameter: 88)
+            switch moment.scores {
+            case .fresh:
+                legend
+            case .notScored:
+                Text("Nog geen score van vannacht")
+                    .font(StrandFont.caption)
+                    .foregroundStyle(StrandPalette.textSecondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+        .padding(.horizontal, 4)
     }
 
     private var content: some View {
@@ -94,16 +114,18 @@ struct MorningMomentView: View {
         }
     }
 
-    /// One line under the rings so the first screen already says it all: "Slaap 84 · HRV 42 ms (−2%)".
+    /// One line under the rings so the screen already says it all: "Slaap 84 · HRV 42 ms · Pols 49".
     private var legend: some View {
         var parts: [String] = []
         if case .fresh(_, let sleep) = moment.scores, let sleep { parts.append("Slaap \(Int(sleep.rounded()))") }
         if let hrv = moment.hrvMs { parts.append(hrvLabel(hrv)) }
+        if let rhr = moment.restingHr { parts.append("Pols \(rhr)") }
         return Text(parts.joined(separator: " · "))
             .font(StrandFont.caption)
             .foregroundStyle(StrandPalette.textSecondary)
-            .lineLimit(1)
-            .minimumScaleFactor(0.8)
+            .lineLimit(2)
+            .multilineTextAlignment(.center)
+            .minimumScaleFactor(0.7)
     }
 
     private var notScored: some View {
@@ -135,14 +157,14 @@ struct MorningMomentView: View {
 struct MorningRingsView: View {
     let moment: MorningMoment
     let animated: Bool
+    /// Outer ring diameter. 88 pt in the notification (the system leaves ~140 pt between its sash and
+    /// the dismiss button on an Ultra), 100 pt in the app where the page scrolls.
+    var diameter: CGFloat = 100
     @State private var appeared = false
 
-    // Sized for the long look on the DEVICE: the Ultra screen is 205×251 pt and the system time row +
-    // sash + card inset leave ~140 pt for the first screen (the simulator shows more). A 100 pt ring with
-    // its verdict plus the one-line legend fit without the Crown. In-app it simply has room.
-    private let outer: CGFloat = 100
-    private let inner: CGFloat = 72
-    private let width: CGFloat = 11
+    private var outer: CGFloat { diameter }
+    private var inner: CGFloat { diameter * 0.72 }
+    private var width: CGFloat { diameter * 0.11 }
 
     private var recovery: Double? {
         if case .fresh(let r, _) = moment.scores { return r }
@@ -202,7 +224,7 @@ struct MorningRingsView: View {
         VStack(spacing: 1) {
             if let recovery {
                 Text("\(Int(shownRecovery.rounded()))")
-                    .font(StrandFont.rounded(26, weight: .heavy))
+                    .font(StrandFont.rounded(diameter * 0.26, weight: .heavy))
                     .foregroundStyle(StrandPalette.textPrimary)
                     .monospacedDigit()
                     .contentTransition(.numericText())
@@ -219,7 +241,7 @@ struct MorningRingsView: View {
                 }
             } else {
                 Text("–")
-                    .font(StrandFont.rounded(26, weight: .heavy))
+                    .font(StrandFont.rounded(diameter * 0.26, weight: .heavy))
                     .foregroundStyle(StrandPalette.textTertiary)
                 Text("RECOVERY")
                     .font(StrandFont.overlineScaled(8))

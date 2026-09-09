@@ -38,6 +38,26 @@ struct StrandiOSApp: App {
     /// Settings change gets one accurate full rebuild instead of waiting for an unrelated repo refresh.
     @AppStorage(UnitPrefs.effortScaleKey) private var effortScaleRaw = EffortScale.hundred.rawValue
 
+    /// Launch-time work, in a method rather than inline in `.task`: the scene body had grown past what
+    /// the type-checker will chew through in one expression ("unable to type-check in reasonable time").
+    @MainActor
+    private func runLaunchTasks() async {
+        watch.activate()
+        // The morning alert is sent BY THE PHONE and mirrored to the wrist, so the phone needs
+        // notification permission. One prompt, once.
+        await MorningAlertSender.requestAuthorizationIfNeeded()
+        // Focus status (the Sleep Focus ending re-fires the Watch's morning moment). One system prompt,
+        // once; nothing else in the app reads Focus.
+        if INFocusStatusCenter.default.authorizationStatus == .notDetermined {
+            INFocusStatusCenter.default.requestAuthorization { _ in }
+        }
+        // Arm tomorrow's fallback run, catch up today's briefing if due, THEN push the wrist (forced
+        // when a briefing was just produced so the text lands immediately).
+        MorningBriefing.scheduleNext()
+        let fresh = await MorningBriefing.generateIfDue(model: model)
+        await watch.pushLatest(from: model, force: fresh, wakeWatch: fresh)
+    }
+
     init() {
         // #1008: pin the pre-change Overnight-only default for existing installs before
         // anything reads it. Idempotent; a no-op on fresh installs and after the first launch.
@@ -83,7 +103,9 @@ struct StrandiOSApp: App {
             await MorningSync.pullStrap(model: model)
             // Stage 2: the briefing on the fresh scores, then the wrist.
             _ = await MorningBriefing.generateIfDue(model: model, force: force)
-            await watchBridge.pushLatest(from: model, force: true, wakeWatch: true)
+            // A forced request is the wrist's "Rapport nu" test: alert straight away so the whole
+            // phone → mirror → long look path can be checked without waiting for tomorrow.
+            await watchBridge.pushLatest(from: model, force: true, wakeWatch: true, alertForce: force)
         }
         // A background offload (the app stays alive as a bluetooth-central) reaches the wrist too, not
         // only the widget and Health — rate-limited inside the bridge, one complication wake per day.
@@ -300,19 +322,7 @@ struct StrandiOSApp: App {
                 // push the first snapshot so a watch that's already on-wrist gets current scores without
                 // waiting for the next foreground. activate() is idempotent + a no-op where WC isn't
                 // supported, so this is safe on every device/simulator combination.
-                .task {
-                    watch.activate()
-                    // Focus status (the Sleep Focus ending re-fires the Watch's morning moment). One
-                    // system prompt, once; nothing else in the app reads Focus.
-                    if INFocusStatusCenter.default.authorizationStatus == .notDetermined {
-                        INFocusStatusCenter.default.requestAuthorization { _ in }
-                    }
-                    // Arm tomorrow's fallback run, catch up today's briefing if due, THEN push the
-                    // wrist (forced when a briefing was just produced so the text lands immediately).
-                    MorningBriefing.scheduleNext()
-                    let fresh = await MorningBriefing.generateIfDue(model: model)
-                    await watch.pushLatest(from: model, force: fresh, wakeWatch: fresh)
-                }
+                .task { await runLaunchTasks() }
         }
         // HealthKit authorization is intentionally NOT requested on launch. The system permission
         // dialog without prior in-app rationale violates Apple HIG / App Review guidance — the user

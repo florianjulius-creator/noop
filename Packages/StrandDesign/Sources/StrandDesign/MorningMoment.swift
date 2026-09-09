@@ -157,6 +157,49 @@ public enum MorningSchedule {
     }
 }
 
+// MARK: - MorningAlert — the notification contract both devices share
+//
+// The morning notification is sent by whichever device knows the score first (the iPhone computes it,
+// so normally the iPhone; the Watch keeps its own path as a second route). Both use THIS identifier
+// and category, so watchOS deduplicates them instead of alerting twice, and both carry the snapshot in
+// `userInfo` — the long look then renders today's numbers even when the watch app's own store has not
+// caught up yet, which is exactly the "nog niet gesynct" screen this removes.
+public enum MorningAlert {
+    /// Same on both devices: watchOS dedupes a mirrored iPhone notification against the watch's own.
+    public static let identifier = "morning-moment"
+    public static let category = "MORNING"
+    /// userInfo key carrying the JSON-encoded `WatchScoreSnapshot`.
+    public static let snapshotKey = "snapshot"
+
+    /// The one-line body, so the numbers are readable even in the short look / on the phone.
+    /// "Recovery 72 · Slaap 83 · HRV 31 ms"
+    public static func body(for snap: WatchScoreSnapshot) -> String {
+        var parts: [String] = []
+        if let charge = snap.charge { parts.append("Recovery \(Int(charge.rounded()))") }
+        if let rest = snap.rest { parts.append("Slaap \(Int(rest.rounded()))") }
+        if let hrv = snap.hrvMs { parts.append("HRV \(hrv) ms") }
+        return parts.isEmpty ? "Je ochtendoverzicht staat klaar" : parts.joined(separator: " · ")
+    }
+
+    /// Encode a snapshot for `UNMutableNotificationContent.userInfo` (property-list safe).
+    public static func userInfo(for snap: WatchScoreSnapshot) -> [String: Any] {
+        guard let data = try? JSONEncoder().encode(snap) else { return [:] }
+        return [snapshotKey: data]
+    }
+
+    /// Decode the snapshot a notification carries, if any.
+    public static func snapshot(from userInfo: [AnyHashable: Any]) -> WatchScoreSnapshot? {
+        guard let data = userInfo[snapshotKey] as? Data else { return nil }
+        return try? JSONDecoder().decode(WatchScoreSnapshot.self, from: data)
+    }
+
+    /// Whether `snap` carries a usable recovery score for the local day of `now`.
+    public static func isScored(_ snap: WatchScoreSnapshot?, now: Date = Date()) -> Bool {
+        guard let snap, let day = snap.scoreDay, day == WatchScoreSnapshot.localDayKey(now) else { return false }
+        return snap.charge != nil
+    }
+}
+
 // MARK: - MorningPlan
 //
 // The moment is DATA-driven: it fires when today's recovery has landed on the Watch, never before the
@@ -164,6 +207,11 @@ public enum MorningSchedule {
 // gesynct" because the night had not been scored yet — useless on the wrist). When nothing has landed by
 // T, the Watch waits; a fallback notice at T + 90 min says so honestly if it is still waiting then.
 public enum MorningPlan {
+    /// Message keys the Watch uses to tell the phone when its morning is (the phone owns the alert).
+    public static let hourKey = "morningHour"
+    public static let minuteKey = "morningMinute"
+    public static let enabledKey = "morningEnabled"
+
     public enum Decision: Equatable, Sendable {
         /// Today's score is here and T has passed: alert now.
         case fireNow
