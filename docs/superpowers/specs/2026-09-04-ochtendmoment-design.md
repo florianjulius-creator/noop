@@ -209,3 +209,28 @@ the finished sleep and the phone has scored it. A fixed time can never guarantee
   the once-a-day complication wake; unscored pushes never spend it.
 - "Seen" (`lastShownDay`) only counts when the long look showed today's score, so a viewed fallback
   notice does not block the real moment.
+
+## Addendum 09-09-2026 — the phone sends it, and the alert carries its own data
+
+The page-5 log settled it: the watch app was awake at 06:43, had a score, armed 07:00, and the alert
+did fire — but by 08:28 the store read "0 gepland · wacht op score", so the card opened on the
+not-scored screen. Three separate faults:
+
+1. **The alert's data did not travel with it.** `MorningAlert` (StrandDesign) now defines one
+   identifier, one category, and a `userInfo` payload carrying the JSON snapshot. Both senders attach
+   it; `MorningNotificationController.didReceive` adopts it before the view renders.
+2. **A newer-but-emptier snapshot removed today's score.** `WatchScoreStore.apply` refuses a snapshot
+   that drops today's recovery when we already had it.
+3. **The alert depended on watch background time.** `MorningAlertSender` (iOS) sends it: the phone
+   computes the score, so it knows first, and watchOS mirrors a phone notification to the wrist,
+   rendering it with the watch app's long look for the same category. Both sides use
+   `MorningAlert.identifier`, so watchOS dedupes rather than alerting twice. The Watch sends its
+   morning time with every WC message (`MorningPlan.hourKey/minuteKey/enabledKey`).
+
+Layout: the notification uses `MorningMomentView(compact: true)` — an 88 pt ring plus one line
+("Slaap 83 · HRV 31 ms · Pols 49"), top-aligned, no ScrollView. The system leaves ~140 pt between its
+sash and the dismiss button; centred taller content was clipped at both ends.
+
+Testing without waiting for tomorrow: "Rapport nu" on page 5 forces the phone to send the real alert
+(`alertForce`), bypassing the once-a-day and before-T guards. The iPhone must be locked or set aside,
+or iOS shows the alert on the phone instead of mirroring it.
