@@ -92,7 +92,11 @@ enum MorningBriefing {
     private static func handle(_ task: BGAppRefreshTask) {
         scheduleNext()   // always re-arm tomorrow, whatever happens below
         let work = Task { @MainActor in
-            if let model { await generateIfDue(model: model) }
+            if let model {
+                await generateIfDue(model: model)
+                // Whatever this run found, the wrist gets it now rather than at the next app-open.
+                await model.watchPush?()
+            }
             if !Task.isCancelled { task.setTaskCompleted(success: true) }
         }
         task.expirationHandler = {

@@ -24,7 +24,11 @@ enum MorningSync {
         while model.live.backfilling, Date().timeIntervalSince(start) < timeout {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
-        await model.runDeferredRescoreIfOwed()
+        // Score what just landed, unconditionally. `runDeferredRescoreIfOwed` only resumes a pass an
+        // earlier attempt started; a night whose data arrived in THIS offload was never "owed" and
+        // stayed unscored until the next foreground — which is why the wrist kept waiting at 07:23
+        // while the phone, once opened, showed the night at once (10-09-2026).
+        await model.intelligence.analyzeRecent()
     }
 }
 #endif

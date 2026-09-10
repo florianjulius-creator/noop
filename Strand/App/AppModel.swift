@@ -635,6 +635,10 @@ final class AppModel: ObservableObject {
         // The deferred pass is the one that finally produces today's score, and it runs with no UI
         // attached — so publish the snapshot here too, for the same reason the post-offload path does.
         await WidgetSnapshot.publish(from: self)
+        // And the wrist. Until 10-09-2026 this pass published only the widget, so a night scored in
+        // the background reached the Watch only when the user next opened the phone app — the exact
+        // "no morning report until I pick up my phone" complaint.
+        await watchPush?()
         #endif
     }
 
