@@ -234,3 +234,25 @@ sash and the dismiss button; centred taller content was clipped at both ends.
 Testing without waiting for tomorrow: "Rapport nu" on page 5 forces the phone to send the real alert
 (`alertForce`), bypassing the once-a-day and before-T guards. The iPhone must be locked or set aside,
 or iOS shows the alert on the phone instead of mirroring it.
+
+## Addendum 10-09-2026 — root cause: the background score never reached the wrist
+
+Decisive observation: at 07:23 the iPhone's Today screen showed the night's recovery, the Watch still
+showed yesterday's ("wacht op score"). The score existed; it was not pushed. Three background paths
+scored (or could score) without pushing the Watch:
+
+1. `AppModel.runDeferredRescoreIfOwed` published the widget only → now also `watchPush?()`.
+2. `MorningBriefing.handle` (the 06:45 BGAppRefresh) generated and stopped → now `model.watchPush?()`.
+3. `MorningSync.pullStrap` ran `runDeferredRescoreIfOwed`, which only resumes a pass an earlier attempt
+   started; a night whose data landed in that very offload was never "owed" → now
+   `intelligence.analyzeRecent()` unconditionally after the offload.
+
+Also reverted on 09-09 (evening): the phone-sent alert. A notification forwarded from the iPhone is
+rendered with the plain system UI on the wrist (no `WKNotificationScene`), and narrowing the wake to
+once a day starved the complication, which reads the Watch's own App Group copy. The phone now wakes
+the Watch on every push that goes out (20-minute floor, `transferUserInfo` fallback) and the Watch
+posts the alert. Time Sensitive is set on both senders.
+
+Layout is verified on watchOS 26.5 and 27.0 simulators with a full pushed payload: 96 pt ring + one
+line, natural height (the long look is itself a scroll page); no `maxHeight` frame, no GeometryReader.
+Page 5 shows the complication extension's own heartbeat ("extensie: <time> zag <charge>").
