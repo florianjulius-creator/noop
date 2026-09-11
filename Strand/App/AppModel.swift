@@ -661,7 +661,19 @@ final class AppModel: ObservableObject {
         // the #1538 report while never producing a score. Decide first whether this pass can finish here,
         // and hand it to a background-processing task when it cannot. A no-op on macOS, and on iOS a
         // foreground pass is never deferred.
-        await RescoreBackgroundScheduler.run(log: { [live] line in live.append(log: line) }) {
+        // 11-09-2026: in the morning window the pass runs NOW even while backgrounded. The diag log of
+        // that morning showed four offloads (07:32…08:02) each "deferred to a background task — a
+        // re-score is already outstanding": once the debt is marked, every background offload defers
+        // again and the processing task never came, so the night was scored only when the app was
+        // opened. The bluetooth-central link keeps the process alive; the assertion covers the rest.
+        #if os(iOS)
+        let morning = MorningSync.inWindow()
+        if morning { live.append(log: "re-score: morning window — running now despite background") }
+        #else
+        let morning = false
+        #endif
+        await RescoreBackgroundScheduler.run(isBackground: morning ? false : nil,
+                                             log: { [live] line in live.append(log: line) }) {
             await intelligence.analyzeRecent(skipIfUnchanged: true)
         }
         await refreshV5Signals()

@@ -57,13 +57,28 @@ enum MorningSync {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         let synced = (model.live.lastSyncedAt ?? 0) > syncBefore
-        // 3. Score what landed, unconditionally (a night that arrived in this offload was never "owed").
-        await model.intelligence.analyzeRecent()
+        // 3. Score what landed, unconditionally (a night that arrived in this offload was never "owed"),
+        //    under a background assertion so a backgrounded pass is not cut short.
+        await RescoreBackgroundScheduler.run(isBackground: false,
+                                             log: { [live = model.live] line in live.append(log: line) }) {
+            await model.intelligence.analyzeRecent()
+        }
         let day = Repository.widgetAnchor(days: model.repo.days, now: Date())
         let scored = day?.day == Repository.localDayKey(Date()) && day?.recovery != nil
         let offload = synced ? "offload \(clock.string(from: Date()))" : "geen nieuwe offload"
         record("\(offload) · \(scored ? "gescoord" : "nog geen score")")
         dumpStrapLog(live: model.live, label: "pull")
+    }
+
+    /// Whether `now` lies in the morning window [T − 45 min, T + 3 h] of the wrist's morning time.
+    /// Inside it, background scoring runs immediately instead of deferring (see AppModel).
+    static func inWindow(now: Date = Date()) -> Bool {
+        guard MorningAlertSender.enabled else { return false }
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: now)
+        comps.hour = MorningAlertSender.hour
+        comps.minute = MorningAlertSender.minute
+        guard let morning = Calendar.current.date(from: comps) else { return false }
+        return now >= morning.addingTimeInterval(-45 * 60) && now <= morning.addingTimeInterval(3 * 3600)
     }
 
     // MARK: - Standalone: the phone kicks its own morning offload
@@ -85,13 +100,12 @@ enum MorningSync {
     }
 
     private static func kick(ble: BLEManager, live: LiveState, now: Date) {
-        guard MorningAlertSender.enabled, live.connected, live.bonded, !live.backfilling else { return }
+        guard inWindow(now: now), live.connected, live.bonded, !live.backfilling else { return }
         var comps = Calendar.current.dateComponents([.year, .month, .day], from: now)
         comps.hour = MorningAlertSender.hour
         comps.minute = MorningAlertSender.minute
         guard let morning = Calendar.current.date(from: comps) else { return }
         let windowStart = morning.addingTimeInterval(-45 * 60)
-        guard now >= windowStart, now <= morning.addingTimeInterval(3 * 3600) else { return }
         if let last = live.lastSyncedAt, last >= windowStart.timeIntervalSince1970 { return }
         let lastKick = UserDefaults.standard.double(forKey: kickKey)
         guard now.timeIntervalSince1970 - lastKick >= 20 * 60 else { return }

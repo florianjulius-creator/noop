@@ -56,6 +56,8 @@ enum DiagSink {
             "lastSyncAt": snap.lastSyncAt.map { stamp.string(from: $0) } ?? "-",
             "strapConnected": snap.strapConnected ?? false,
             "syncStatus": snap.syncStatus ?? "-", "briefingStatus": snap.briefingStatus ?? "-",
+            "rescoreOwed": RescoreBackgroundScheduler.isRescoreOwed,
+            "lastPassSeconds": RescoreBackgroundScheduler.lastCompletedPassSeconds ?? -1,
         ])
     }
 

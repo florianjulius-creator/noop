@@ -288,6 +288,17 @@ Decisions:
 4. **The Watch app is two pages:** the glance (last night's stats) and the morning settings with its
    diagnostics. Breathe / Workout / Intervals were removed (files deleted, deck + DEBUG demo cases).
 
+5. **The night is scored in the background during the morning window.** The first `diag-pull`
+   (08:22) answered the deeper question: offloads DID land in the background (07:32, 07:42, 07:52,
+   08:02, 08:15 — "rows landed on 2026-09-11"), but each post-offload pass logged "re-score: deferred
+   to a background task — a re-score is already outstanding from an earlier trigger".
+   `RescoreBackgroundPolicy` defers a backgrounded pass once a debt is owed or the last pass took
+   over 20 s, and the `BGProcessingTask` it schedules does not come in the morning — so the score
+   existed only after the app was opened. Now `AppModel.refreshAfterCompletedBackfill` passes
+   `isBackground: false` while `MorningSync.inWindow()` (T − 45 min … T + 3 h): the pass runs
+   immediately under the scheduler's background assertion, and `pullStrap` scores through the same
+   assertion. The push record in `phone.jsonl` carries `rescoreOwed` and `lastPassSeconds`.
+
 Considered and not chosen: a cloud relay (iPhone uploads the snapshot, the Watch fetches it with a
 `WKURLSessionRefreshBackgroundTask`). It only helps when the phone is out of Bluetooth range at
 night, needs a server and network on the wrist, and does nothing for the failure that actually
