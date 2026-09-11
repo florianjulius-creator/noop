@@ -90,6 +90,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
         // `force` (the morning path only) skips the 30-minute spacing gate but still requires substance.
         guard (force || newlyScored) ? Self.headlineChanged(from: lastSent, to: snap) : shouldPush(snap, now: now) else { return }
         lastPushedAt = now
+        DiagSink.phone("push", snapshot: snap, extra: force ? "forced" : (newlyScored ? "newlyScored" : "gated-ok"))
         // ALWAYS wake the watch app on a push that actually goes out. Two things depend on the watch
         // app running: the morning alert (it must be the WATCH that posts it — a notification forwarded
         // from the iPhone is shown with the plain system UI, not our long look) and the complication,
@@ -217,6 +218,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
         // Link health for the Watch settings page: the strap's last completed offload + live link state.
         snap.lastSyncAt = model.live.lastSyncedAt.map { Date(timeIntervalSince1970: $0) }
         snap.strapConnected = model.live.connected
+        snap.syncStatus = MorningSync.lastStatus
         return snap
     }
 
@@ -280,6 +282,7 @@ final class WatchSessionBridge: NSObject, ObservableObject {
             let spacedEnough = Date().timeIntervalSince1970 - lastWake > 20 * 60
             if wakeWatch, spacedEnough {
                 UserDefaults.standard.set(Date().timeIntervalSince1970, forKey: Self.lastWakeAtKey)
+                DiagSink.phone("wake", session.isComplicationEnabled ? "complication transfer" : "userInfo transfer")
                 if session.isComplicationEnabled {
                     session.transferCurrentComplicationUserInfo([Self.contextKey: data])
                 } else {
@@ -300,6 +303,8 @@ final class WatchSessionBridge: NSObject, ObservableObject {
     static let requestLatestKey = "requestLatest"
     /// The watch's "make this morning's briefing now" request (background refresh or the settings page).
     static let requestMorningKey = "requestMorning"
+    /// The wrist's self-report (its page-5 lines), attached to messages and sent as userInfo.
+    static let watchDiagKey = "watchDiag"
     static let forceKey = "force"
     /// When the last complication wake was sent (spacing floor, not a daily cap).
     static let lastWakeAtKey = "watch.lastWakeAt"
@@ -341,6 +346,14 @@ extension WatchSessionBridge: WCSessionDelegate {
 
     // The watch can re-pair to a different phone; iOS requires both of these to be present, and a
     // re-activate so the link stays live for the new pairing.
+    /// The Watch queues its self-report as userInfo after every morning event; it lands whenever this
+    /// app next runs (a WatchConnectivity delivery launches it in the background if needed).
+    nonisolated func session(_ session: WCSession, didReceiveUserInfo userInfo: [String: Any] = [:]) {
+        if let report = userInfo[Self.watchDiagKey] as? [String: Any] {
+            DiagSink.watch(report)
+        }
+    }
+
     nonisolated func sessionDidBecomeInactive(_ session: WCSession) {}
     nonisolated func sessionDidDeactivate(_ session: WCSession) {
         session.activate()
@@ -379,6 +392,11 @@ extension WatchSessionBridge: WCSessionDelegate {
         let wantsMorning = message[Self.requestMorningKey] != nil
         // Every watch message carries the wrist's morning settings; the phone alerts on that schedule.
         Task { @MainActor in MorningAlertSender.adoptSettings(from: message) }
+        // …and the wrist's own diagnostics, into the paper trail the Mac can pull.
+        if let report = message[Self.watchDiagKey] as? [String: Any] {
+            DiagSink.watch(report)
+        }
+        DiagSink.phone("message", wantsMorning ? "requestMorning" : (wantsLatest ? "requestLatest" : "other"))
         guard wantsLatest || wantsMorning else {
             replyHandler([:])
             return

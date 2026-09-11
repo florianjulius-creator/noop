@@ -52,9 +52,6 @@ struct NOOPWatchApp: App {
     @ViewBuilder private var rootView: some View {
         #if DEBUG
         switch ProcessInfo.processInfo.environment["NOOP_DEMO_SCREEN"] {
-        case "breathe":   WatchBreatheView()
-        case "workout":   WatchWorkoutView()
-        case "intervals": WatchIntervalView()
         case "glance":    WatchGlanceView()
         case "morning":   MorningMomentView(store: WatchScoreStore.shared, celebrate: true)
         default:          WatchRootView()

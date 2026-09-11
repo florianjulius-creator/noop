@@ -3,18 +3,13 @@ import StrandDesign
 
 // MARK: - WatchRootView — the swipeable page deck
 //
-// The watch app is a deck of full-screen pages you swipe (or turn the Digital Crown) between, each sized to
-// exactly ONE screen so nothing ever needs scrolling: the glance (today's synced scores) first, then the
-// three on-watch active features, then the morning-moment settings. A page-style TabView with the dots showing replaces the old push-nav, so
-// every screen is one swipe away and the page indicator makes that obvious. The phone stays the brain for
-// the SCORES on the glance; Breathe / Workout / Intervals run on the watch's own sensors + haptics.
+// Two pages, swiped (or turned with the Digital Crown): the glance (last night's synced scores) and the
+// morning-moment settings with its diagnostics. Nothing else — the watch shows the stats and posts the
+// morning alert; the phone stays the brain. (Breathe / Workout / Intervals were dropped on 11-09-2026.)
 struct WatchRootView: View {
     var body: some View {
         TabView {
             WatchGlanceView()
-            WatchBreatheView()
-            WatchWorkoutView()
-            WatchIntervalView()
             WatchMorningSettingsView()
         }
         // watchOS page TabView shows the page-indicator dots by default; the iOS background-display-mode

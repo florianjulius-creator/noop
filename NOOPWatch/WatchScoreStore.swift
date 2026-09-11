@@ -40,6 +40,7 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
     static let contextKey = "snapshot"
     static let requestLatestKey = "requestLatest"
     static let requestMorningKey = "requestMorning"
+    static let watchDiagKey = "watchDiag"
     static let forceKey = "force"
     /// The phone's "Focus just ended" wake (complication transfer, no snapshot attached).
     static let focusEndedKey = "focusEnded"
@@ -162,7 +163,17 @@ final class WatchScoreStore: NSObject, ObservableObject, WCSessionDelegate {
         out[MorningPlan.hourKey] = MorningSettings.hour
         out[MorningPlan.minuteKey] = MorningSettings.minute
         out[MorningPlan.enabledKey] = MorningSettings.enabled
+        if !MorningDiag.lastReport.isEmpty { out[Self.watchDiagKey] = MorningDiag.lastReport }
         return out
+    }
+
+    /// The wrist's self-report, queued as userInfo: it lands in the phone's Documents/diag/watch.jsonl
+    /// whenever the iPhone app next runs (a delivery launches it in the background if needed).
+    func sendDiag(_ report: [String: Any]) {
+        guard WCSession.isSupported() else { return }
+        let session = WCSession.default
+        guard session.activationState == .activated else { return }
+        session.transferUserInfo([Self.watchDiagKey: report])
     }
 
     /// Ask the phone to make this morning's briefing now (day-guarded there unless `force`) and push.

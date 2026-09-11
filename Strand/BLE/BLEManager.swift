@@ -6414,6 +6414,9 @@ extension BLEManager: @preconcurrency CBPeripheralDelegate {
         guard let data = characteristic.value else { return }
         let bytes = [UInt8](data)
         lastDataAt = Date()   // feed the liveness watchdog on every notification
+        #if os(iOS)
+        MorningSync.kickIfDue(ble: self, live: state)   // the morning offload's clock (see MorningSync)
+        #endif
         // #1809: count BEFORE the per-characteristic switch below, so the tally covers every inbound
         // frame including ones no branch consumes - the epitaph must answer "did anything arrive at all".
         inboundFrames += 1

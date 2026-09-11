@@ -271,6 +271,37 @@ enum MorningDiag {
         lines.append("\(clock.string(from: Date())) \(text)")
         if lines.count > 6 { lines.removeFirst(lines.count - 6) }
         UserDefaults.standard.set(lines, forKey: logKey)
+        // Every event also goes to the phone's paper trail (Documents/diag/watch.jsonl), so the wrist's
+        // state can be read from the Mac instead of photographed.
+        Task { @MainActor in
+            WatchScoreStore.shared.sendDiag(await report())
+        }
+    }
+
+    /// The settings page's diagnostic lines as one dictionary — what the Watch knows about itself.
+    /// The last one built is also attached to every message the Watch sends the phone.
+    nonisolated(unsafe) static var lastReport: [String: Any] = [:]
+
+    @MainActor
+    static func report() async -> [String: Any] {
+        let snap = WatchScoreStore.shared.snapshot
+        let beat = UserDefaults(suiteName: WatchScoreSnapshot.appGroupId)?
+            .string(forKey: "complication.lastTimeline") ?? "nooit gedraaid"
+        let report: [String: Any] = [
+            "nu": await line(),
+            "start": UserDefaults.standard.string(forKey: launchKey) ?? "-",
+            "log": recent(),
+            "lastFiredDay": MorningSettings.lastFiredDay ?? "-",
+            "lastShownDay": MorningSettings.lastShownDay ?? "-",
+            "scoreDay": snap?.scoreDay ?? "-",
+            "charge": snap?.charge ?? -1,
+            "briefingStatus": snap?.briefingStatus ?? "-",
+            "syncStatus": snap?.syncStatus ?? "-",
+            "complicationTimeline": beat,
+            "morning": "\(MorningSettings.hour):\(MorningSettings.minute) \(MorningSettings.enabled ? "aan" : "uit")",
+        ]
+        lastReport = report
+        return report
     }
 
     static func recent() -> [String] {

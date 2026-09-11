@@ -66,6 +66,9 @@ public struct WatchScoreSnapshot: Codable, Equatable, Sendable {
     public var lastSyncAt: Date?
     /// Whether the phone held a live BLE link to the strap when this snapshot was built.
     public var strapConnected: Bool?
+    /// What the phone's last morning pull did ("offload 07:26 · gescoord", "geen strap binnen 90 s",
+    /// …), Dutch, for the Watch settings page. The 11-09 morning failed silently inside this step.
+    public var syncStatus: String?
 
     /// A one line sleep summary for the glance (e.g. "7h 12m · 81% efficiency"), already formatted by
     /// the phone. Empty string when there is nothing to show.

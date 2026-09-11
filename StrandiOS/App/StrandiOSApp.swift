@@ -96,7 +96,8 @@ struct StrandiOSApp: App {
         watchBridge.activate()
         watchBridge.onMorningRequested = { [weak model, weak watchBridge] force in
             guard let model, let watchBridge else { return }
-            // Stage 1: pull the night off the strap and score it (bounded; a no-op without a link).
+            DiagSink.phone("morning", force ? "requestMorning force" : "requestMorning")
+            // Stage 1: pull the night off the strap and score it (waits for the link first).
             await MorningSync.pullStrap(model: model)
             // Stage 2: the briefing on the fresh scores, then the wrist.
             _ = await MorningBriefing.generateIfDue(model: model, force: force)

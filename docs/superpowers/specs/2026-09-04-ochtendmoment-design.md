@@ -256,3 +256,40 @@ posts the alert. Time Sensitive is set on both senders.
 Layout is verified on watchOS 26.5 and 27.0 simulators with a full pushed payload: 96 pt ring + one
 line, natural height (the long look is itself a scroll page); no `maxHeight` frame, no GeometryReader.
 Page 5 shows the complication extension's own heartbeat ("extensie: <time> zag <charge>").
+
+## Addendum 11-09-2026 — the strap pull waits, the phone kicks itself, the Mac can read the wrist
+
+Morning of 11-09: no alert again. Page 5 read "Strap: verbonden · laatste sync 00:51"; the Watch's
+refreshes at 07:25 and 07:45 did reach the phone (`requestMorning`), but the phone had been launched
+COLD in the background and `MorningSync.pullStrap` started with `guard live.connected, live.bonded` —
+false in the first second, before CoreBluetooth had restored the link — so it returned without an
+offload and the night was never scored. Transport (WatchConnectivity) was fine; the data was missing.
+
+Decisions:
+
+1. **The pull waits for the link.** `MorningSync.pullStrap` polls `connected && bonded` for up to
+   90 s, then forces an offload (`.manual`, no rate floor), waits for it (≤150 s), scores
+   (`analyzeRecent`) and pushes. Every outcome is written to `syncStatus` in the snapshot and shown on
+   page 5 as "Sync: offload 07:26 · gescoord" / "geen strap binnen 90 s" — no more silent step.
+2. **The phone kicks its own morning offload (standalone path).** Every strap packet wakes the app in
+   the background, so the BLE notify path is the one clock that ticks overnight.
+   `MorningSync.kickIfDue` (called from `didUpdateValueFor`, one comparison per packet, real check
+   once a minute) forces an offload from T − 45 min when the last offload predates that window, at
+   most once per 20 min. The completed offload scores and pushes the wrist by itself
+   (`refreshAfterCompletedBackfill` → `watchPush`). The Watch's wake at T − 25 is now the second path,
+   not the only one.
+3. **Self-readable diagnostics.** `DiagSink` (iOS) appends JSON lines to `Documents/diag/`:
+   `phone.jsonl` (message received, pull outcome, push, wake), `watch.jsonl` (the Watch's page-5
+   lines, attached to every message and queued as `transferUserInfo` after every `MorningDiag.log`),
+   `ble-<day>.log` (the strap log tail — previous process's rolled tail + live ring — at every pull and
+   kick, which is where "why no offload since 00:51" will be answered). `Tools/diag-pull.sh` copies
+   the folder off the phone with `devicectl device copy from … --domain-type appDataContainer` and
+   prints the tails. No more photographs of the wrist.
+4. **The Watch app is two pages:** the glance (last night's stats) and the morning settings with its
+   diagnostics. Breathe / Workout / Intervals were removed (files deleted, deck + DEBUG demo cases).
+
+Considered and not chosen: a cloud relay (iPhone uploads the snapshot, the Watch fetches it with a
+`WKURLSessionRefreshBackgroundTask`). It only helps when the phone is out of Bluetooth range at
+night, needs a server and network on the wrist, and does nothing for the failure that actually
+occurred (no night on the phone). Apple Health has no type for a recovery score and its iPhone→Watch
+sync timing cannot be driven. Both stay fallbacks if the diag shows WatchConnectivity itself failing.

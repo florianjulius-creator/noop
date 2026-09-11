@@ -93,6 +93,7 @@ struct WatchMorningSettingsView: View {
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
                     Text("Strap: \(strapLine)")
+                    Text("Sync: \(store.snapshot?.syncStatus ?? "–")")
                     Text("Wijzerplaat: \(complicationLine)")
                     Text("Nu: \(diagNow)")
                     Text("Bij start: \(UserDefaults.standard.string(forKey: MorningDiag.launchKey) ?? "–")")
