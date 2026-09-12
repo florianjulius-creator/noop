@@ -1,5 +1,6 @@
 #if os(iOS)
 import Foundation
+import UIKit
 import StrandDesign
 
 // MARK: - MorningSync — pull the night off the strap before the briefing
@@ -35,17 +36,27 @@ enum MorningSync {
     }
 
     static func pullStrap(model: AppModel) async {
+        // Hold the process open: without this the 90 s wait below only advanced between the Watch's
+        // wakes (12-09: "wacht op strap 07:37" … "geen strap binnen 90 s" stamped 07:55). Once the strap
+        // connects, the bluetooth-central link keeps the process alive on its own.
+        let task = UIApplication.shared.beginBackgroundTask(withName: "noop.morningPull")
+        defer { if task != .invalid { UIApplication.shared.endBackgroundTask(task) } }
         let start = Date()
         record("wacht op strap \(clock.string(from: start))")
-        // 1. Wait for the link. `willRestoreState` marks an already-connected strap within a second;
-        //    a strap that dropped overnight reconnects when it is in range — both well inside 90 s.
+        // 1. Wait for the link. A strap that is reachable but unclaimed (bond-loop pause, or a standing
+        //    connect that went missing) gets one bounded reconnect; a restoring link needs only seconds.
+        if !model.live.connected { model.ble.reconnectForMorning() }
         while !(model.live.connected && model.live.bonded),
               Date().timeIntervalSince(start) < linkTimeout {
             try? await Task.sleep(nanoseconds: 1_000_000_000)
         }
         guard model.live.connected, model.live.bonded else {
             record("geen strap binnen \(Int(linkTimeout)) s")
-            await model.intelligence.analyzeRecent()
+            dumpStrapLog(live: model.live, label: "pull-nolink")
+            await RescoreBackgroundScheduler.run(isBackground: false,
+                                                 log: { [live = model.live] line in live.append(log: line) }) {
+                await model.intelligence.analyzeRecent()
+            }
             return
         }
         // 2. Ask for the offload and wait for it.
@@ -117,10 +128,12 @@ enum MorningSync {
 
     /// The strap log's tail into the diag folder — the only place "why no offload since 00:51" lives.
     /// Includes the previous process's rolled tail, so a cold background launch still shows the night.
+    /// Generous: the strap's own console lines are most of the ring, and the one line that matters (a
+    /// pause tripping at midday) fell outside a 400-line tail on 12-09.
     static func dumpStrapLog(live: LiveState, label: String) {
         let previous = LiveState.persistedLogGenerations().last ?? []
         DiagSink.file("ble-\(Repository.localDayKey(Date())).log",
-                      header: label, lines: Array(previous.suffix(300)) + Array(live.log.suffix(400)))
+                      header: label, lines: Array(previous.suffix(1000)) + Array(live.log.suffix(2500)))
     }
 }
 #endif

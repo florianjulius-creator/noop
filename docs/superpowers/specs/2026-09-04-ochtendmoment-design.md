@@ -304,3 +304,31 @@ Considered and not chosen: a cloud relay (iPhone uploads the snapshot, the Watch
 night, needs a server and network on the wrist, and does nothing for the failure that actually
 occurred (no night on the phone). Apple Health has no type for a recovery score and its iPhone→Watch
 sync timing cannot be driven. Both stay fallbacks if the diag shows WatchConnectivity itself failing.
+
+## Addendum 12-09-2026 — the phone had given up on the strap
+
+Read from `Tools/diag-pull.sh`, no photo needed. Yesterday's chain did work once the data arrived:
+11:24 "snapshot: score binnen → melding nu", 11:24 "getoond (morning-moment)". Last night:
+
+- 11:54 last offload; the link dropped and a **bond-loop pause** latched (`autoReconnectPausedForBondLoop`,
+  #617/#1635): auto-reconnect off, only the foreground salvage probe (#78 hole-4) can end it.
+- 00:00, 07:03 (BGTask), 07:37 and 07:55 (Watch wakes): every push said `strapConnected: false`.
+- `pullStrap` ran at 07:37 but its 90 s wait only advanced between wakes — "geen strap binnen 90 s"
+  was stamped at 07:55, then again at 08:03: the process was suspended in between.
+- 08:03:27 the phone was picked up → foreground → "Bond-loop pause: one salvage probe" →
+  "connect handshake done" one second later. The strap was reachable all night; nobody asked.
+- The trip line itself fell outside the 400-line dump (the strap's console is most of the ring).
+
+Decisions:
+
+6. **`BLEManager.reconnectForMorning()`**: a paused strap gets the same one bounded salvage probe the
+   foreground gives it (floors unchanged, give-up stays latched); an unpaused one gets its standing
+   connect re-parked (idempotent). Called from `pullStrap` when there is no link, and from the 06:45
+   BGTask. `pullStrap` now holds a `beginBackgroundTask` assertion so its wait actually elapses; once
+   the strap connects, the bluetooth-central link keeps the process alive for the offload and the pass.
+7. The strap-log dump grows to the previous generation's last 1000 lines + the live ring's last 2500,
+   and is also written on the no-link branch (`pull-nolink`), so a pause tripping at midday is readable
+   the next morning.
+
+Measured on this phone: a full re-score pass takes 225–239 s (`lastPassSeconds`), which is why every
+backgrounded pass outside the morning window defers (decision 5 covers the window).

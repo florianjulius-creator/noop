@@ -93,6 +93,8 @@ enum MorningBriefing {
         scheduleNext()   // always re-arm tomorrow, whatever happens below
         let work = Task { @MainActor in
             if let model {
+                // A wake is a chance to reclaim a strap the phone lost overnight (see reconnectForMorning).
+                if !model.live.connected { model.ble.reconnectForMorning() }
                 await generateIfDue(model: model)
                 // Whatever this run found, the wrist gets it now rather than at the next app-open.
                 await model.watchPush?()

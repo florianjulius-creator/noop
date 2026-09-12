@@ -1770,6 +1770,21 @@ public final class BLEManager: NSObject, ObservableObject {
         issueStandingConnect(whilePausedForBondLoop: true)
     }
 
+    /// The morning pull found no link (12-09-2026: the bond-loop pause had latched at midday, the phone
+    /// lay untouched all night, and the foreground-only salvage probe first ran when the user picked the
+    /// phone up at 08:03 — and connected within a second). A paused strap gets that same one bounded
+    /// probe here; an unpaused one gets its standing connect re-parked, which is idempotent for
+    /// CoreBluetooth. Nothing else changes: the give-up stays latched, the floors still apply.
+    public func reconnectForMorning() {
+        guard !state.connected, !intentionalDisconnect else { return }
+        if autoReconnectPausedForBondLoop {
+            salvageProbeIfBondLoopPaused()
+        } else {
+            log("Morning pull: no link — re-parking the standing connect")
+            issueStandingConnect()
+        }
+    }
+
     /// Observe the app-foreground notification and run the salvage probe. Installed once per manager from
     /// init; self-contained here so the probe needs no per-target scene wiring. iOS and macOS only (the
     /// watch never builds this file).
