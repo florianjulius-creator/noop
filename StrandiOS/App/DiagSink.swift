@@ -48,7 +48,9 @@ enum DiagSink {
         append("phone.jsonl", ["event": event, "detail": detail])
     }
 
-    /// A snapshot summary alongside an event, so the log says WHAT was pushed.
+    /// A snapshot summary alongside an event, so the log says WHAT was pushed. MainActor because the
+    /// re-score debt it reads is: the callers (the watch bridge) are on the main actor anyway.
+    @MainActor
     static func phone(_ event: String, snapshot snap: WatchScoreSnapshot, extra: String = "") {
         append("phone.jsonl", [
             "event": event, "detail": extra,

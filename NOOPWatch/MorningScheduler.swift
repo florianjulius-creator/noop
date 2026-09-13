@@ -256,6 +256,30 @@ enum MorningDiag {
         return "\(clock.string(from: now)) · \(auth) · \(pending.count) gepland · \(nextText)"
     }
 
+    /// Which build is actually ON THIS WRIST. A watch app embedded in the iOS bundle propagates from
+    /// the phone on its own schedule, so a change installed on the phone can be minutes — or an
+    /// "Installeer" tap — away from the wrist. On 13-09-2026 two rounds of wrist photos were read as
+    /// "no difference" while the Watch was still running the previous build. The executable's
+    /// modification date IS the build time, so this line settles it without guessing.
+    static var buildStamp: String {
+        let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+        let build = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+        var built = ""
+        if let url = Bundle.main.executableURL,
+           let date = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                              .contentModificationDate {
+            built = " · " + stamp.string(from: date)
+        }
+        return "\(version) (\(build))\(built)"
+    }
+
+    private static let stamp: DateFormatter = {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "nl_NL")
+        f.dateFormat = "dd-MM HH:mm"
+        return f
+    }()
+
     /// Persist the launch-time line (read by the settings page as "Bij start: …").
     static func recordLaunch(_ label: String) async {
         let text = await line()
@@ -300,6 +324,7 @@ enum MorningDiag {
             "complicationTimeline": beat,
             "morning": "\(MorningSettings.hour):\(MorningSettings.minute) \(MorningSettings.enabled ? "aan" : "uit")",
             // The wrist's text size: the long look is laid out for the default, larger sizes wrap.
+            "build": buildStamp,
             "textSize": WKInterfaceDevice.current().preferredContentSizeCategory,
             "screen": "\(Int(WKInterfaceDevice.current().screenBounds.width))x\(Int(WKInterfaceDevice.current().screenBounds.height))",
         ]

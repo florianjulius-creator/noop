@@ -27,7 +27,8 @@ cd "$REPO_ROOT"
 
 DERIVED="build"
 PRODUCTS="$DERIVED/Build/Products/Release-iphoneos"
-APP="$PRODUCTS/NOOP Staging.app"
+PRODUCT_NAME="NOOP Staging"
+APP="$PRODUCTS/$PRODUCT_NAME.app"
 
 BUILD_ONLY=0
 DEVICE=""
@@ -64,6 +65,19 @@ xcodebuild -project Strand.xcodeproj -scheme NOOPiOS -configuration Release \
 # future edit changes the configuration or product name and we would otherwise install whatever
 # happens to be lying around from an earlier run.
 [ -d "$APP" ] || { echo "expected Release bundle missing: $APP" >&2; exit 1; }
+
+# 13-09-2026: a compile error made this script exit non-zero for two days, but the failure was read
+# through a pipe (`install-device.sh | grep ...` reports grep's status, not the script's), so every
+# "install" silently re-installed a bundle from 11-09 and two days of watch fixes were judged on code
+# that never shipped. Freshness is therefore asserted here, where no wrapper can hide it: the bundle
+# must be newer than every source file that goes into it.
+STALE=$(find Strand StrandiOS NOOPWatch NOOPWatchComplications Packages \
+          -name '*.swift' -newer "$APP/$PRODUCT_NAME" -print 2>/dev/null | head -3 || true)
+if [ -n "$STALE" ]; then
+  echo "REFUSING TO INSTALL: the built bundle is older than its sources — the build did not run." >&2
+  echo "$STALE" | sed 's/^/  newer: /' >&2
+  exit 1
+fi
 [ -d "$APP/Watch/NOOPWatch.app" ] || echo "WARNING: no embedded watch app in the bundle" >&2
 [ -d "$APP/PlugIns/NOOPWidgets.appex" ] || echo "WARNING: no embedded widget extension in the bundle" >&2
 

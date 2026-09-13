@@ -92,6 +92,7 @@ struct WatchMorningSettingsView: View {
                     Text("Planning")
                         .font(StrandFont.footnote)
                         .foregroundStyle(StrandPalette.textTertiary)
+                    Text("Versie: \(MorningDiag.buildStamp)")
                     Text("Strap: \(strapLine)")
                     Text("Sync: \(store.snapshot?.syncStatus ?? "–")")
                     Text("Wijzerplaat: \(complicationLine)")
