@@ -381,3 +381,41 @@ recovery score en verder niets."
     small line under it — "RECOVERY · KLAAR", or "NOG GEEN SCORE" when there is nothing earned (never
     a fabricated number). No rings, no legend. It cannot be clipped, cannot wrap, and reads at arm's
     length. The rings live on in the app: the glance page and the "Bekijk vandaag" sheet.
+
+## Addendum 13-09-2026, middag — why none of it reached the wrist
+
+Everything above from 12-09 onward was judged on code that was never on the device. Two independent
+faults, each silent, each enough on its own:
+
+**1. The build had been failing for two days.** `DiagSink.phone(_:snapshot:extra:)` read
+`RescoreBackgroundScheduler.lastCompletedPassSeconds` — main-actor isolated — from a nonisolated
+context. Every Release build since 11-09 08:17 ended in `** BUILD FAILED **`, `set -e` aborted
+`install-device.sh` before it installed anything, and the phone kept the 11-09 bundle. It stayed
+invisible because the script was invoked as `install-device.sh … | grep …`: **a pipeline's exit
+status is the last command's**, so "exited with code 0" was grep's, not the script's.
+
+**2. The build number never changed.** `project.yml` pinned `CURRENT_PROJECT_VERSION: "316"`.
+`devicectl` force-replaces the iPhone app regardless of version, but watchOS only copies the embedded
+watch app to the wrist when its `CFBundleVersion` is **higher**. At 316 every time, the Watch kept
+running whatever it first installed — for weeks. This is the deeper answer to "my changes never reach
+the watch", and it means the rings were probably fine all along: the wrist had never seen a change.
+
+Fixes, all verified:
+
+12. `DiagSink.phone(_:snapshot:extra:)` is `@MainActor`.
+13. `install-device.sh` refuses to install a stale bundle: if any `.swift` file is newer than the
+    built binary it aborts and names the file. Proven by touching a source and watching it refuse.
+14. `install-device.sh` stamps `CURRENT_PROJECT_VERSION` with `yymmddHHMM` — always higher than the
+    last, always inside CFBundleVersion's integer limit; `NOOP_BUILD_NUMBER` overrides. The phone now
+    reports 11.1.1 (2609131121) where it reported 316 all week, and the watch app followed.
+15. `MorningDiag.buildStamp` (version, build number, executable mtime) shows on Watch page 2 as
+    "Versie: …" and travels in the diag report, so which build is on the wrist is a fact.
+16. `Tools/install-watch.sh` installs the watch app straight onto the Watch with `devicectl`. Developer
+    Mode is on, but the CoreDevice tunnel times out on watchOS 27 beta ("developer disk image could
+    not be mounted", "tunnel was interrupted", NWError 60). Phone-to-watch propagation remains the
+    path; the iPhone's Watch app → the app → Installeer forces it.
+
+Working rules from this: never read a build or install exit code through a pipe (log to a file, read
+`$?` separately); make install scripts assert freshness themselves; ship a build stamp in any app that
+is tested by looking at it; and read the diagnostics before treating a photo of the device as
+disproof of a change.
