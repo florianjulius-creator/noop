@@ -56,10 +56,17 @@ if [ ! -d Strand.xcodeproj ] || [ project.yml -nt Strand.xcodeproj ]; then
   xcodegen generate
 fi
 
-echo "==> building NOOPiOS, configuration Release"
+# 13-09-2026: the build number was pinned at 316 in project.yml, so every build produced the SAME
+# CFBundleVersion. devicectl force-replaces the iPhone app regardless, but watchOS only copies the
+# embedded watch app to the wrist when its version is NEWER — with 316 every time, the Watch kept
+# running whatever it installed first, for days. A minute-resolution stamp (yymmddHHMM) is always
+# larger than the last one and stays inside CFBundleVersion's integer limit. Override an exact value
+# with NOOP_BUILD_NUMBER when a specific number is needed.
+BUILD_NUMBER="${NOOP_BUILD_NUMBER:-$(date +%y%m%d%H%M)}"
+echo "==> building NOOPiOS, configuration Release, build $BUILD_NUMBER"
 xcodebuild -project Strand.xcodeproj -scheme NOOPiOS -configuration Release \
   -destination 'generic/platform=iOS' -derivedDataPath "$DERIVED" \
-  -allowProvisioningUpdates build
+  -allowProvisioningUpdates CURRENT_PROJECT_VERSION="$BUILD_NUMBER" build
 
 # xcodebuild's own exit status already gated the build; this catches the subtler failure where a
 # future edit changes the configuration or product name and we would otherwise install whatever
