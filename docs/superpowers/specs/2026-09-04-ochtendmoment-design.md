@@ -353,6 +353,14 @@ clip, at both ends, which is exactly what the 09-09 photo showed and what came b
 9. The Watch's diag report gains `textSize` (`preferredContentSizeCategory`) and `screen`, so the next
    report says what the wrist's own text size actually is instead of it being inferred.
 
-Verified on the watchOS 27.0 Ultra 3 simulator with the full pushed payload: sash + 88 pt ring +
-"RECOVERY / KLAAR" + the two-line legend, complete, top and bottom, at the default text size and again
-with `UICTContentSizeCategoryAccessibilityL` set.
+The wrist photo an hour later showed why that was not enough: **watchOS 27 floats a Sluit and a Negeer
+button OVER the bottom of the long look.** A card that merely fits the screen still has its last line
+under them, and the scroll container does not help — the user reads "afgesneden", correctly. So the
+card is now short by construction rather than scrollable:
+
+10. Ring 88 → 76 pt; the notification gets its own `compactLegend` — one line, no "ms", no HRV delta,
+    `lineLimit(1)` with `minimumScaleFactor(0.6)` so it scales instead of wrapping; and 52 pt of bottom
+    padding reserves the button strip. Ring + line end ~110 pt below the sash, on a ~150 pt page.
+
+Verified on the watchOS 27.0 Ultra 3 simulator with the full pushed payload: sash + 76 pt ring +
+"RECOVERY / KLAAR" + one line "Slaap 84 · HRV 62 · Pols 49", complete, with room to spare.

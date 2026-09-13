@@ -52,10 +52,10 @@ struct MorningMomentView: View {
         VStack(spacing: 6) {
             MorningRingsView(moment: moment,
                              animated: celebrate && !motion.poseStill(reduceMotion),
-                             diameter: 88)
+                             diameter: 76)
             switch moment.scores {
             case .fresh:
-                legend
+                compactLegend
             case .notScored:
                 Text("Nog geen score van vannacht")
                     .font(StrandFont.caption)
@@ -67,11 +67,29 @@ struct MorningMomentView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 4)
-        .padding(.vertical, 2)
-        // The long look has one screen; a larger wrist text size wraps the legend and grows the ring's
-        // number until the page no longer fits above the fold ("afgesneden", 13-09-2026). Clamp it —
-        // the in-app page scrolls and keeps the user's size.
+        .padding(.top, 2)
+        // watchOS 27 floats a Sluit and a Negeer button OVER the bottom of the long look, so the last
+        // line of a card that merely "fits the screen" still sits under them — which is what the 13-09
+        // photo showed. Reserve their strip; the ring + one line end well above it.
+        .padding(.bottom, 52)
+        // A larger wrist text size wraps the legend and grows the ring's number until the card no longer
+        // fits above the fold. Clamp it — the in-app page scrolls and keeps the user's own size.
         .dynamicTypeSize(...DynamicTypeSize.large)
+    }
+
+    /// The notification's single line. Deliberately shorter than the in-app `legend`: no "ms", no HRV
+    /// delta, one line that scales rather than wrapping — a second line is what kept falling under the
+    /// system's button strip.
+    private var compactLegend: some View {
+        var parts: [String] = []
+        if case .fresh(_, let sleep) = moment.scores, let sleep { parts.append("Slaap \(Int(sleep.rounded()))") }
+        if let hrv = moment.hrvMs { parts.append("HRV \(hrv)") }
+        if let rhr = moment.restingHr { parts.append("Pols \(rhr)") }
+        return Text(parts.joined(separator: " · "))
+            .font(StrandFont.caption)
+            .foregroundStyle(StrandPalette.textSecondary)
+            .lineLimit(1)
+            .minimumScaleFactor(0.6)
     }
 
     private var content: some View {
@@ -174,8 +192,8 @@ struct MorningMomentView: View {
 struct MorningRingsView: View {
     let moment: MorningMoment
     let animated: Bool
-    /// Outer ring diameter. 88 pt in the notification (the system leaves ~140 pt between its sash and
-    /// the dismiss button on an Ultra), 100 pt in the app where the page scrolls.
+    /// Outer ring diameter. 76 pt in the notification (an Ultra's long look leaves ~150 pt between the
+    /// sash and the floating button strip), 100 pt in the app where the page scrolls.
     var diameter: CGFloat = 100
     @State private var appeared = false
 
