@@ -364,3 +364,20 @@ card is now short by construction rather than scrollable:
 
 Verified on the watchOS 27.0 Ultra 3 simulator with the full pushed payload: sash + 76 pt ring +
 "RECOVERY / KLAAR" + one line "Slaap 84 · HRV 62 · Pols 49", complete, with room to spare.
+
+### 13-09-2026, later — the card is the score
+
+Two things went wrong at once. The photos that came back after the 76 pt build still showed the old
+two-line card, because **the Watch had not received the new build yet**: its diag report at 09:01 was
+missing `textSize`/`screen`, the two fields that only exist in it. A watch app embedded in the iOS
+bundle propagates from the phone over minutes; `devicectl device install app` straight to the watch
+fails with "Failed to allocate RSD device" unless the watch is reachable on the network. So the
+verification loop has a hole: **read the diag before believing a device photo disproves a change.**
+
+And the design question resolved itself. Florian: "Anders geef je mij alleen in het groot mijn
+recovery score en verder niets."
+
+11. The notification long look is now the number: recovery at 96 pt in its recovery colour, with one
+    small line under it — "RECOVERY · KLAAR", or "NOG GEEN SCORE" when there is nothing earned (never
+    a fabricated number). No rings, no legend. It cannot be clipped, cannot wrap, and reads at arm's
+    length. The rings live on in the app: the glance page and the "Bekijk vandaag" sheet.

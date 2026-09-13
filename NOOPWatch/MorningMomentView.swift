@@ -49,32 +49,41 @@ struct MorningMomentView: View {
     /// small proposed height and clipped the ring at both ends, and a `GeometryReader` collapsed to
     /// almost nothing inside that same scroll container (a 46 pt ring). No height modifiers here.
     private var compactContent: some View {
-        VStack(spacing: 6) {
-            MorningRingsView(moment: moment,
-                             animated: celebrate && !motion.poseStill(reduceMotion),
-                             diameter: 76)
-            switch moment.scores {
-            case .fresh:
-                compactLegend
-            case .notScored:
-                Text("Nog geen score van vannacht")
-                    .font(StrandFont.caption)
-                    .foregroundStyle(StrandPalette.textSecondary)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .minimumScaleFactor(0.7)
-            }
+        VStack(spacing: 0) {
+            Text(bigScore)
+                .font(.system(size: 96, weight: .bold, design: .rounded))
+                .foregroundStyle(recoveryColor)
+                .minimumScaleFactor(0.5)
+                .lineLimit(1)
+            Text(bigCaption)
+                .font(StrandFont.overlineScaled(11))
+                .foregroundStyle(StrandPalette.textTertiary)
+                .lineLimit(1)
+                .minimumScaleFactor(0.6)
         }
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 4)
-        .padding(.top, 2)
-        // watchOS 27 floats a Sluit and a Negeer button OVER the bottom of the long look, so the last
-        // line of a card that merely "fits the screen" still sits under them — which is what the 13-09
-        // photo showed. Reserve their strip; the ring + one line end well above it.
+        // watchOS 27 floats a Sluit and a Negeer button OVER the bottom of the long look, so anything
+        // in that strip reads as cut off however tall the card is. Reserve it.
         .padding(.bottom, 52)
-        // A larger wrist text size wraps the legend and grows the ring's number until the card no longer
-        // fits above the fold. Clamp it — the in-app page scrolls and keeps the user's own size.
         .dynamicTypeSize(...DynamicTypeSize.large)
+    }
+
+    /// The number, or a dash when there is nothing earned to show (never a fabricated score).
+    private var bigScore: String {
+        if case .fresh(let recovery, _) = moment.scores, let recovery {
+            return String(Int(recovery.rounded()))
+        }
+        return "–"
+    }
+
+    /// One word under it: the verdict when there is a score, else why there is none.
+    private var bigCaption: String {
+        if case .fresh(let recovery, _) = moment.scores, recovery != nil {
+            guard let verdict = moment.verdict, !verdict.isEmpty else { return "RECOVERY" }
+            return "RECOVERY · \(verdict)"
+        }
+        return "NOG GEEN SCORE"
     }
 
     /// The notification's single line. Deliberately shorter than the in-app `legend`: no "ms", no HRV
