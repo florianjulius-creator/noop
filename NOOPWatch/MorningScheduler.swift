@@ -299,6 +299,9 @@ enum MorningDiag {
             "syncStatus": snap?.syncStatus ?? "-",
             "complicationTimeline": beat,
             "morning": "\(MorningSettings.hour):\(MorningSettings.minute) \(MorningSettings.enabled ? "aan" : "uit")",
+            // The wrist's text size: the long look is laid out for the default, larger sizes wrap.
+            "textSize": WKInterfaceDevice.current().preferredContentSizeCategory,
+            "screen": "\(Int(WKInterfaceDevice.current().screenBounds.width))x\(Int(WKInterfaceDevice.current().screenBounds.height))",
         ]
         lastReport = report
         return report

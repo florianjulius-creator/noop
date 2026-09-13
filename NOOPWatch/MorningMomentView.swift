@@ -26,7 +26,13 @@ struct MorningMomentView: View {
     var body: some View {
         Group {
             if compact {
-                compactContent
+                // 13-09-2026: "weer afgesneden". A view with no scroll container can only be CLIPPED when
+                // the system's long-look page gives it less room than its natural height (a larger wrist
+                // text size, a taller sash). Its own ScrollView cannot clip — but a plain one opened
+                // halfway down the ring (09-09), so pin the anchor to the top. Both failure modes gone.
+                ScrollView { compactContent }
+                    .defaultScrollAnchor(.top)
+                    .scrollIndicators(.hidden)
             } else {
                 ScrollView { content }
             }
@@ -46,7 +52,7 @@ struct MorningMomentView: View {
         VStack(spacing: 6) {
             MorningRingsView(moment: moment,
                              animated: celebrate && !motion.poseStill(reduceMotion),
-                             diameter: 96)
+                             diameter: 88)
             switch moment.scores {
             case .fresh:
                 legend
@@ -62,6 +68,10 @@ struct MorningMomentView: View {
         .frame(maxWidth: .infinity)
         .padding(.horizontal, 4)
         .padding(.vertical, 2)
+        // The long look has one screen; a larger wrist text size wraps the legend and grows the ring's
+        // number until the page no longer fits above the fold ("afgesneden", 13-09-2026). Clamp it —
+        // the in-app page scrolls and keeps the user's size.
+        .dynamicTypeSize(...DynamicTypeSize.large)
     }
 
     private var content: some View {

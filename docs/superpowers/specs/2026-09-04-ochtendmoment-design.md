@@ -332,3 +332,27 @@ Decisions:
 
 Measured on this phone: a full re-score pass takes 225–239 s (`lastPassSeconds`), which is why every
 backgrounded pass outside the morning window defers (decision 5 covers the window).
+
+## Addendum 13-09-2026 — the morning ran by itself; the long look could still clip
+
+The chain finally completed with the phone untouched: `phone.jsonl` shows pushes through the night
+(01:56, 04:33, 05:55, 06:35, 07:06) with `strapConnected: true` and `scoreDay` flipping to 2026-09-13
+at 04:33; the Watch log reads "08:00 getoond (morning-moment)". So decisions 1–7 hold — no more
+"wacht op score", no more dead strap link.
+
+What was still wrong: "weer afgesneden". The compact long look kept its natural height with no scroll
+container of its own, which is correct only while the system's page is at least that tall. Give it
+less — a larger wrist text size, a taller sash — and the only thing a non-scrolling view can do is
+clip, at both ends, which is exactly what the 09-09 photo showed and what came back on 13-09.
+
+8. The compact view now lives in its own `ScrollView` with `.defaultScrollAnchor(.top)`. A scroll
+   container cannot clip, and the top anchor fixes the other half of the old bug (a plain nested
+   `ScrollView` opened halfway down the ring on 09-09). Ring 96 → 88 pt and
+   `.dynamicTypeSize(...large)` on the compact content keep it to one screen in the normal case, so
+   the scroll is a safety net rather than something to use every morning.
+9. The Watch's diag report gains `textSize` (`preferredContentSizeCategory`) and `screen`, so the next
+   report says what the wrist's own text size actually is instead of it being inferred.
+
+Verified on the watchOS 27.0 Ultra 3 simulator with the full pushed payload: sash + 88 pt ring +
+"RECOVERY / KLAAR" + the two-line legend, complete, top and bottom, at the default text size and again
+with `UICTContentSizeCategoryAccessibilityL` set.
